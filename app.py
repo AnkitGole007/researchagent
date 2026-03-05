@@ -1760,25 +1760,34 @@ These scores are heuristic and should be used as a guide for exploration rather 
 
     df = pd.DataFrame(table_rows)
 
-    if not df.empty:
-        st.dataframe(
-            df,
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "arXiv": st.column_config.LinkColumn(
-                    label="arXiv",
-                    help="Open arXiv page",
-                    validate="^https?://.*",
-                    max_chars=100,
-                    display_text="arXiv link"
-                ),
-                "Citation impact score (1y)": st.column_config.TextColumn(
-                    label="Citation impact score (1y)",
-                    help="Score or 'Too new to rate'"
-                )
-            }
-        )
+ 
+    # --- CSV Export ---
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download ranked results (CSV)",
+        data=csv_bytes,
+        file_name=f"ranked_papers_{timestamp}.csv",
+        mime="text/csv",
+    )
+
+    st.dataframe(
+        df,
+        width='stretch',
+        hide_index=True,
+        column_config={
+            "arXiv": st.column_config.LinkColumn(
+                label="arXiv",
+                help="Open arXiv page",
+                validate="^https?://.*",
+                max_chars=100,
+                display_text="arXiv link"
+            ),
+            "Citation impact score (1y)": st.column_config.TextColumn(
+                label="Citation impact score (1y)",
+                help="Score or 'Too new to rate'"
+            )
+        }
+    )
 
     # 8. Top N highlighted
     top_n_effective = min(top_n, len(ranked_papers))

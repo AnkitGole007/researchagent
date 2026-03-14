@@ -948,18 +948,6 @@ These scores are heuristic impact signals and are best used for ranking within t
 The agent ranks papers, always showing **primary** papers first, then secondary ones. For the top N that you choose, it shows metadata, relevance signals, and links to arXiv and the PDF. In LLM API mode it also adds plain English summaries. All artifacts and a markdown report are saved in a project folder under `~/arxiv_ai_digest_projects/project_<timestamp>`, and you can download everything as a ZIP.
 """
 
-# footer
-
-def render_footer():
-    st.markdown(
-        """
-        <div class="custom-footer">
-            © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
-            Built with ❤️ for humanity
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 def main():
     st.set_page_config(
@@ -967,32 +955,6 @@ def main():
         layout="wide",
     )
 
-# Footer layout fix
-    st.markdown("""
-    <style>
-
-    [data-testid="stAppViewContainer"] {
-        display: flex;
-        flex-direction: column;
-        min-height: 100vh;
-    }
-
-    [data-testid="stAppViewContainer"] > .main {
-        flex: 1;
-    }
-
-    .custom-footer {
-        text-align: center;
-        color: #6b7280;
-        font-size: 0.85rem;
-        padding: 18px 0 8px 0;
-        border-top: 1px solid #e5e7eb;
-    }
-
-    </style>
-    """, unsafe_allow_html=True)
-
-    st.title("🔎 Research Agent")
     st.title("🔎 Research Agent")
 
     
@@ -1345,8 +1307,6 @@ def main():
 
     if not run_clicked and "ranked_papers" not in st.session_state:
         st.info("Fill in your research brief and settings in the sidebar, then click **Run Pipeline**.")
-        # adding footer render:
-        render_footer()
         return
 
     # 1. Project setup
@@ -1976,9 +1936,18 @@ These scores are heuristic and should be used as a guide for exploration rather 
         file_name=f"research_agent_{timestamp}.zip",
         mime="application/zip",
     )
-    
-# footer:
-    render_footer()
+
+# Adding footer
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style="text-align: center; color: gray; font-size: 0.9rem; padding: 1rem 0;">
+            © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
+            Built with ❤️ for humanity
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 if __name__ == "__main__":
     main()

@@ -1937,6 +1937,17 @@ These scores are heuristic and should be used as a guide for exploration rather 
         mime="application/zip",
     )
 
+# Adding footer
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style="text-align: center; color: gray; font-size: 0.9rem; padding: 1rem 0;">
+            © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
+            Built with ❤️ for humanity
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 if __name__ == "__main__":
     main()

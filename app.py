@@ -955,42 +955,53 @@ def main():
         layout="wide",
     )
 
-    # ===== STICKY FOOTER (always visible, injected early so no early return can skip it) =====
+    # ===== FOOTER (injected early so no early return can skip it) =====
+    # Uses CSS to push itself to the bottom of the viewport when content is short,
+    # and sits naturally at the end of content when the page is long.
     st.markdown(
         """
         <style>
-        .sticky-footer {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            width: 100%;
-            background-color: #0e1117;
+        /* Make the main Streamlit container fill at least the full viewport height */
+        .stMainBlockContainer {
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+        }
+        /* Push footer to the bottom by giving the content area above it flex-grow */
+        .block-container {
+            flex-grow: 1;
+        }
+        .page-footer {
             text-align: center;
             color: gray;
             font-size: 0.85rem;
-            padding: 0.6rem 0;
-            z-index: 9999;
+            padding: 2rem 0 1rem 0;
             border-top: 1px solid #333;
-        }
-        @media (prefers-color-scheme: light) {
-            .sticky-footer {
-                background-color: #ffffff;
-                border-top: 1px solid #ddd;
-            }
-        }
-        .block-container {
-            padding-bottom: 4rem !important;
+            margin-top: auto;
         }
         </style>
-        <div class="sticky-footer">
-            &copy; The Benevolent Bandwidth Foundation, Inc. &middot; Massachusetts Nonprofit Corporation. All rights reserved.<br>
-            Built with ❤️ for humanity
-        </div>
         """,
         unsafe_allow_html=True,
     )
-    # ===== END STICKY FOOTER =====
+    # We define a function to call at every exit point
+    def render_footer():
+        st.markdown("---")
+        st.markdown(
+            """
+            <div class="page-footer">
+                &copy; The Benevolent Bandwidth Foundation, Inc. &middot; Massachusetts Nonprofit Corporation. All rights reserved.<br>
+                Built with ❤️ for humanity
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    # ===== END FOOTER SETUP =====
 
+    _main_body()
+    render_footer()
+
+
+def _main_body():
     st.title("🔎 Research Agent")
 
     

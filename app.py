@@ -1937,17 +1937,45 @@ These scores are heuristic and should be used as a guide for exploration rather 
         mime="application/zip",
     )
 
-# Adding footer
-    st.markdown("---")
+# # Footer starts:
+#     st.markdown("---")
+#     st.markdown(
+#         """
+#         <div style="text-align: center; color: gray; font-size: 0.9rem; padding: 1rem 0;">
+#             © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
+#             Built with ❤️ for humanity
+#         </div>
+#         """,
+#         unsafe_allow_html=True,
+#     )
+
     st.markdown(
         """
-        <div style="text-align: center; color: gray; font-size: 0.9rem; padding: 1rem 0;">
+        <style>
+        .app-footer {
+            position: fixed;
+            left: 0;
+            bottom: 0;
+            width: 100%;
+            background-color: white;
+            color: gray;
+            text-align: center;
+            padding: 10px 0;
+            font-size: 0.9rem;
+            border-top: 1px solid #e6e6e6;
+            z-index: 999;
+        }
+        </style>
+
+        <div class="app-footer">
             © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
             Built with ❤️ for humanity
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+# Footer ends
 
 if __name__ == "__main__":
     main()

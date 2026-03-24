@@ -49,7 +49,7 @@ except ImportError:
 
 MIN_FOR_PREDICTION = 20
 OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-large"
-GEMINI_EMBEDDING_MODEL_NAME = "text-embedding-004"
+GEMINI_EMBEDDING_MODEL_NAME = "gemini-embedding-001"
 
 # MONEYBALL DEFAULTS
 DEFAULT_MONEYBALL_WEIGHTS = {
@@ -1505,11 +1505,11 @@ def _main_body():
 
             # Updated Gemini models list including Gemini 3 Preview
             gemini_models = [
-                "gemini-3-pro-preview",
+                "gemini-3.1-pro-preview",
+                "gemini-3.1-flash-lite-preview",
                 "gemini-3-flash-preview",
-                "gemini-2.5-flash",
                 "gemini-2.5-pro",
-                "gemini-2.0-flash-exp",
+                "gemini-2.5-flash",
             ]
             gemini_choice = st.selectbox(
                 "Gemini Chat model (for classification & citation impact scoring)",
@@ -1519,8 +1519,8 @@ def _main_body():
             if gemini_choice == "Custom":
                 model_name = st.text_input(
                     "Custom Gemini model name",
-                    value="gemini-3-pro-preview",
-                    help="Use the model identifier shown in Google AI Studio, for example `gemini-3-pro-preview`."
+                    value="gemini-3.1-pro-preview",
+                    help="Use the model identifier shown in Google AI Studio, for example `gemini-3.1-pro-preview`."
                 )
             else:
                 model_name = gemini_choice

@@ -11,3 +11,4 @@ faiss-cpu>=1.7.4
 bm25s>=0.2.0
 tenacity>=8.2.3
 python-dotenv>=1.0.0
+boto3>=1.26.0

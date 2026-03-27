@@ -32,4 +32,4 @@ jobs:
     - name: Run unit tests
       run: |
         # Only run unit tests, skip integration tests that require API keys/R2
-        pytest tests/ -m "not integration" -x -q
+        python -m pytest tests/ -m "not integration" -x -q

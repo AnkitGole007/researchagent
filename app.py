@@ -1190,7 +1190,7 @@ You write a short research brief in natural language about the kind of work you 
 
 #### 2. The agent searches a curated local corpus
 
-Instead of fetching papers live, the agent queries a pre-built local library of 40,000+ papers harvested from arXiv and Semantic Scholar. This library is automatically refreshed daily via a scheduled pipeline and synced from cloud storage (Cloudflare R2) on startup — so you always get fast, up-to-date results without depending on external API availability at search time.
+Instead of fetching papers live, the agent queries a pre-built local library of 40,000+ papers harvested from arXiv and Semantic Scholar. This library is refreshed on a schedule via a pipeline and, when configured, synced from cloud storage (Cloudflare R2) on startup — so you always get fast, up-to-date results without depending on external API availability at search time.
 
 #### 3. The agent picks candidate papers using 3-stage hybrid search
 

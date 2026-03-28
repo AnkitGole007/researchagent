@@ -207,7 +207,7 @@ def download_corpus_artifacts():
     corpus_dir = get_corpus_dir()
     corpus_dir.mkdir(parents=True, exist_ok=True)
     meta_path = corpus_dir / "build_meta.json"
-
+    status_placeholder = st.empty()
     try:
         s2_client = boto3.client(
             "s3",
@@ -217,29 +217,29 @@ def download_corpus_artifacts():
         )
 
         # 2. Freshness Check
-        with st.spinner("Checking for fresh corpus updates on R2..."):
-            local_meta = {}
-            if meta_path.exists():
-                try:
-                    local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
-                except:
-                    pass
+        status_placeholder.info("Checking for fresh corpus updates on R2...")
+        local_meta = {}
+        if meta_path.exists():
+            try:
+                local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
+            except:
+                pass
 
-            # Download remote build_meta.json to a temp buffer
-            remote_meta_obj = s2_client.get_object(Bucket=bucket, Key="corpus/build_meta.json")
-            remote_meta = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
+        # Download remote build_meta.json to a temp buffer
+        remote_meta_obj = s2_client.get_object(Bucket=bucket, Key="corpus/build_meta.json")
+        remote_meta = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
 
-            remote_ts = remote_meta.get("built_at", "")
-            local_ts = local_meta.get("built_at", "")
-            remote_ver = remote_meta.get("schema_version", 1)
-            local_ver = local_meta.get("schema_version", 0)
+        remote_ts = remote_meta.get("built_at", "")
+        local_ts = local_meta.get("built_at", "")
+        remote_ver = remote_meta.get("schema_version", 1)
+        local_ver = local_meta.get("schema_version", 0)
 
-            if remote_ts == local_ts and remote_ver == local_ver:
-                # No update needed
-                return
+        if remote_ts == local_ts and remote_ver == local_ver:
+            # No update needed
+            return
 
         # 3. Full Download
-        st.info("🔄 Downloading fresh corpus artifacts from R2...")
+        status_placeholder.info("🔄 Downloading fresh corpus artifacts from R2...")
         
         # Files to download (prefix 'corpus/' removed from bucket key during sync to app local)
         # Note: scheduler.py pushes with prefix 'corpus/'. 
@@ -274,10 +274,12 @@ def download_corpus_artifacts():
             if filename:
                 s2_client.download_file(bucket, key, str(bm25_dir / filename))
 
-        st.success("✅ Corpus artifacts updated successfully!")
+        status_placeholder.success("✅ Corpus artifacts updated successfully!")
+        time.sleep(1)
+        status_placeholder.empty()
 
     except Exception as e:
-        st.warning(f"⚠️ Remote corpus sync failed: {e}. Falling back to local data.")
+        status_placeholder.warning(f"⚠️ Remote corpus sync failed: {e}. Falling back to local data.")
 
 
 def build_query_brief(research_brief: str, not_looking_for: str) -> str:

@@ -130,6 +130,60 @@ def get_corpus_dir() -> pathlib.Path:
     return local_dir
 
 
+def _check_corpus_freshness():
+    """Lightweight per-search freshness check that reloads data in-place without restart."""
+    import time
+    import boto3
+    from botocore.exceptions import ClientError
+
+    # 1. Throttle: check R2 at most every 30 minutes per session to save egress/API calls
+    now = time.time()
+    last_check = st.session_state.get("_freshness_checked_at", 0)
+    if now - last_check < 1800: # 1800s = 30 min
+        return
+
+    # 2. Get credentials
+    access_key = st.secrets.get("R2_ACCESS_KEY_ID") or os.environ.get("R2_ACCESS_KEY_ID")
+    secret_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.environ.get("R2_SECRET_ACCESS_KEY")
+    endpoint = st.secrets.get("R2_ENDPOINT") or os.environ.get("R2_ENDPOINT")
+    bucket_name = st.secrets.get("R2_BUCKET") or os.environ.get("R2_BUCKET")
+
+    if not all([access_key, secret_key, endpoint, bucket_name]):
+        return
+
+    try:
+        s3 = boto3.client(
+            's3',
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
+        
+        # 3. HEAD request to check ETag of the metadata file
+        response = s3.head_object(Bucket=bucket_name, Key="corpus/build_meta.json")
+        new_etag = response.get('ETag', '').strip('"')
+        old_etag = st.session_state.get("_corpus_etag")
+
+        if old_etag and new_etag == old_etag:
+            st.session_state["_freshness_checked_at"] = now
+            return
+
+        # 4. If ETag differs, refresh cached resources
+        if old_etag:
+            # We only show this if it's an actual update detected since session start
+            msg = st.info("New corpus data available — refreshing index (this takes ~20 seconds)...")
+            st.cache_resource.clear()
+            download_corpus_artifacts()
+            msg.empty()
+
+        st.session_state["_corpus_etag"] = new_etag
+        st.session_state["_freshness_checked_at"] = now
+
+    except Exception:
+        # Fail silently: data refresh is non-critical, we don't want to block the search
+        pass
+
+
 @st.cache_resource(show_spinner=False)
 def download_corpus_artifacts():
     """
@@ -153,7 +207,7 @@ def download_corpus_artifacts():
     corpus_dir = get_corpus_dir()
     corpus_dir.mkdir(parents=True, exist_ok=True)
     meta_path = corpus_dir / "build_meta.json"
-
+    status_placeholder = st.empty()
     try:
         s2_client = boto3.client(
             "s3",
@@ -163,29 +217,29 @@ def download_corpus_artifacts():
         )
 
         # 2. Freshness Check
-        with st.spinner("Checking for fresh corpus updates on R2..."):
-            local_meta = {}
-            if meta_path.exists():
-                try:
-                    local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
-                except:
-                    pass
+        status_placeholder.info("Checking for fresh corpus updates on R2...")
+        local_meta = {}
+        if meta_path.exists():
+            try:
+                local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
+            except:
+                pass
 
-            # Download remote build_meta.json to a temp buffer
-            remote_meta_obj = s2_client.get_object(Bucket=bucket, Key="corpus/build_meta.json")
-            remote_meta = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
+        # Download remote build_meta.json to a temp buffer
+        remote_meta_obj = s2_client.get_object(Bucket=bucket, Key="corpus/build_meta.json")
+        remote_meta = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
 
-            remote_ts = remote_meta.get("built_at", "")
-            local_ts = local_meta.get("built_at", "")
-            remote_ver = remote_meta.get("schema_version", 1)
-            local_ver = local_meta.get("schema_version", 0)
+        remote_ts = remote_meta.get("built_at", "")
+        local_ts = local_meta.get("built_at", "")
+        remote_ver = remote_meta.get("schema_version", 1)
+        local_ver = local_meta.get("schema_version", 0)
 
-            if remote_ts == local_ts and remote_ver == local_ver:
-                # No update needed
-                return
+        if remote_ts == local_ts and remote_ver == local_ver:
+            # No update needed
+            return
 
         # 3. Full Download
-        st.info("🔄 Downloading fresh corpus artifacts from R2...")
+        status_placeholder.info("🔄 Downloading fresh corpus artifacts from R2...")
         
         # Files to download (prefix 'corpus/' removed from bucket key during sync to app local)
         # Note: scheduler.py pushes with prefix 'corpus/'. 
@@ -220,10 +274,12 @@ def download_corpus_artifacts():
             if filename:
                 s2_client.download_file(bucket, key, str(bm25_dir / filename))
 
-        st.success("✅ Corpus artifacts updated successfully!")
+        status_placeholder.success("✅ Corpus artifacts updated successfully!")
+        time.sleep(1)
+        status_placeholder.empty()
 
     except Exception as e:
-        st.warning(f"⚠️ Remote corpus sync failed: {e}. Falling back to local data.")
+        status_placeholder.warning(f"⚠️ Remote corpus sync failed: {e}. Falling back to local data.")
 
 
 def build_query_brief(research_brief: str, not_looking_for: str) -> str:
@@ -1570,6 +1626,7 @@ def _main_body():
         run_clicked = st.button("🚀 Run Pipeline")
 
     if run_clicked:
+        _check_corpus_freshness()
         st.session_state["hide_pipeline_description"] = True
 
     hide_desc = st.session_state.get("hide_pipeline_description", False)

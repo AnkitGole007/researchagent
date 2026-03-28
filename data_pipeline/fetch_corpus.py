@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import random
+import argparse
 from datetime import datetime, timedelta
 from typing import List, Optional
 
@@ -350,43 +351,75 @@ def run_ingestion(
     db_path: str = "data_pipeline/corpus.db",
     max_papers: int = MAX_PAPERS_TO_FETCH,
     incremental: bool = True,
+    arxiv_only: bool = False,
+    s2_only: bool = False,
+    days: int = 15,
 ) -> int:
     """
-    End-to-end ingestion: fetch papers from S2, upsert into SQLite.
-    Returns the number of papers upserted.
+    End-to-end ingestion: fetch papers from arXiv (Scout) and/or S2 (Analyzer), upsert into SQLite.
+    Returns total papers processed.
     """
     conn = create_db(db_path)
+    total = 0
+
+    # Determine what to run
+    run_all = not (arxiv_only or s2_only)
 
     # ----------------------------------------------------
     # Stage 1: The 'Scout' (Instant arXiv fetching)
     # ----------------------------------------------------
-    try:
-        arxiv_papers = fetch_fresh_arxiv_papers(days=30)
-        for i, paper in enumerate(arxiv_papers):
-            upsert_paper(conn, paper)
-            if i % 1_000 == 0:
-                conn.commit()
-        conn.commit()
-        logger.info("Stage 1 Complete: %d recent ArXiv papers upserted.", len(arxiv_papers))
-    except Exception as e:
-        logger.error("Stage 1 ArXiv fetching failed: %s", e)
+    if arxiv_only or run_all:
+        try:
+            # If not incremental, fetch a large window (e.g. 1 year)
+            scout_days = days if incremental else 365
+            arxiv_papers = fetch_fresh_arxiv_papers(days=scout_days)
+            for i, paper in enumerate(arxiv_papers):
+                upsert_paper(conn, paper)
+                if i % 1_000 == 0:
+                    conn.commit()
+            conn.commit()
+            logger.info("Stage 1 Complete: %d recent ArXiv papers upserted.", len(arxiv_papers))
+            total += len(arxiv_papers)
+        except Exception as e:
+            logger.error("Stage 1 ArXiv fetching failed: %s", e)
 
     # ----------------------------------------------------
     # Stage 2: The 'Analyzer' (S2 semantic enrichment)
     # ----------------------------------------------------
-    papers = fetch_papers_bulk(max_papers=max_papers)
-    for i, paper in enumerate(papers):
-        upsert_paper(conn, paper)
-        if i % 1_000 == 0:
+    if s2_only or run_all:
+        try:
+            # For incremental S2, we might restrict the volume or rely on the 90-day filter in fetch_papers_bulk
+            papers = fetch_papers_bulk(max_papers=max_papers)
+            for i, paper in enumerate(papers):
+                upsert_paper(conn, paper)
+                if i % 1_000 == 0:
+                    conn.commit()
             conn.commit()
-    conn.commit()
+            logger.info("Stage 2 Complete: %d enriched papers upserted.", len(papers))
+            total += len(papers)
+        except Exception as e:
+            logger.error("Stage 2 S2 fetching failed: %s", e)
     
-    logger.info("Ingestion strictly complete. SQLite DB updated at %s", db_path)
-    return len(papers)
+    logger.info("Ingestion session complete. SQLite DB updated at %s", db_path)
+    conn.close()
+    return total
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ResearchAgent Data Ingestion")
+    parser.add_argument("--full", action="store_true", help="Full refresh (longer window)")
+    parser.add_argument("--arxiv", action="store_true", help="Only fetch from arXiv API (Scout)")
+    parser.add_argument("--s2", action="store_true", help="Only fetch from Semantic Scholar (Analyzer)")
+    parser.add_argument("--days", type=int, default=15, help="Days to look back for arXiv Scout (default: 15)")
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
-    run_ingestion(incremental="--full" not in sys.argv)
+    
+    run_ingestion(
+        incremental=not args.full,
+        arxiv_only=args.arxiv,
+        s2_only=args.s2,
+        days=args.days
+    )

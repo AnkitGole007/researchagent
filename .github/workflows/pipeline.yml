@@ -37,7 +37,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        # Check out the testing branch with a PAT
+        # Check out the main branch with a PAT
         token: ${{ secrets.GH_PAT }}
         ref: main
     

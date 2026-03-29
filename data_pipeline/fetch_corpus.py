@@ -223,138 +223,141 @@ def fetch_fresh_arxiv_papers(days: int = 30) -> List[PaperRecord]:
         ]
         extract_venue_func = None
 
-    query_str = " OR ".join(f"cat:{c}" for c in cats)
     cutoff_date = (datetime.now() - timedelta(days=days))
     
-    logger.info("Starting Stage 1 ArXiv Scout targeting last %d days...", days)
+    logger.info("Starting Stage 1 ArXiv Scout targeting last %d days across %d sub-categories...", days, len(cats))
     
     results = []
     seen = set()
-    start = 0
-    max_results = 1000
-    backoff = 3
     
-    while True:
-        # Enforce ArXiv's absolute minimum 3-second delay
-        time.sleep(3.1)
+    for cat in cats:
+        query_str = f"cat:{cat}"
+        logger.info("Scouting ArXiv sub-category: %s", cat)
+        start = 0
+        max_results = 1000
+        backoff = 3
         
-        url = f"http://export.arxiv.org/api/query?search_query=({quote(query_str)})&sortBy=submittedDate&sortOrder=descending&start={start}&max_results={max_results}"
-        
-        # Adaptive Stealth 3 & 4: User-Agent Identity & True Exponential Backoff
-        import requests
-        try:
-            headers = {"User-Agent": "ResearchAgent/2.0 (mailto:admin@example.com)"}
-            r = requests.get(url, headers=headers, timeout=60)
-            r.raise_for_status()
-            feed_text = r.text
-            backoff = 3 # Reset on success
-        except Exception as http_err:
-            logger.error("ArXiv API hit a limit or failed: %s. Backing off for %ds...", http_err, backoff)
-            time.sleep(backoff)
-            if backoff < 300:
-                backoff *= 2
-            continue
-                
-        feed = feedparser.parse(feed_text)
-        
-        # 1. Avoid error pages being treated as entries
-        if feed.get("bozo_exception"):
-            logger.error("ArXiv API returned malformed feed (possible error page). Backing off for %ds...", backoff)
-            time.sleep(backoff)
-            if backoff < 300:
-                backoff *= 2
-            continue
+        while True:
+            # Enforce ArXiv's absolute minimum 3-second delay
+            time.sleep(3.1)
             
-        if not feed.get("entries"):
-            break
+            url = f"http://export.arxiv.org/api/query?search_query=({quote(query_str)})&sortBy=submittedDate&sortOrder=descending&start={start}&max_results={max_results}"
             
-        oldest_date_in_batch = None
-        for entry in feed.get("entries", []):
-            arxiv_or_full = entry.get("id", "")
-            if not arxiv_or_full:
+            # Adaptive Stealth 3 & 4: User-Agent Identity & True Exponential Backoff
+            import requests
+            try:
+                headers = {"User-Agent": "ResearchAgent/2.0 (mailto:admin@example.com)"}
+                r = requests.get(url, headers=headers, timeout=60)
+                r.raise_for_status()
+                feed_text = r.text
+                backoff = 3 # Reset on success
+            except Exception as http_err:
+                logger.error("ArXiv API hit a limit or failed: %s. Backing off for %ds...", http_err, backoff)
+                time.sleep(backoff)
+                if backoff < 300:
+                    backoff *= 2
                 continue
-                
-            if "/abs/" in arxiv_or_full:
-                arxiv_id = arxiv_or_full.split("/abs/")[-1].split("v")[0]
-            else:
-                arxiv_id = arxiv_or_full
-                
-            # Filter out error documents mimicking entries
-            if len(arxiv_id) > 30 or " " in arxiv_id or "error" in arxiv_id.lower():
-                continue
-                
-            if arxiv_id in seen:
-                continue
-            seen.add(arxiv_id)
-            
-            # ArXiv feed uses 'published' or 'updated'. Use .get() defensively.
-            pub_date_str = entry.get("published") or entry.get("updated")
-            if not pub_date_str:
-                pub_date = datetime.now()
-            else:
-                try:
-                    # ArXiv standard format: 2026-03-21T21:30:11Z
-                    pub_date = datetime.strptime(pub_date_str, "%Y-%m-%dT%H:%M:%SZ")
-                except Exception:
-                    pub_date = datetime.now()
-                
-            # Track the oldest to know when to terminate pagination
-            if oldest_date_in_batch is None or pub_date < oldest_date_in_batch:
-                oldest_date_in_batch = pub_date
-                
-            # If older than cutoff, don't append, but we might keep searching the page
-            if pub_date < cutoff_date:
-                continue
-                
-            authors = [a.get("name", "") for a in entry.get("authors", []) if a.get("name")]
-            
-            # 3. Extract correct arXiv tags (cs.AI, cs.RO, etc.) directly into fields_of_study
-            extracted_tags = []
-            for t in entry.get("tags", []):
-                term = t.get("term")
-                if term and not term.startswith("http"):
-                    extracted_tags.append(term)
                     
-            # 4. Extract venue natively from arXiv comments if present
-            comment = entry.get("arxiv_comment", "")
-            journal_ref = entry.get("arxiv_journal_ref", "")
-            final_venue = None
-            if extract_venue_func:
-                val = extract_venue_func(comment) or extract_venue_func(journal_ref)
-                if val:
-                    final_venue = val
+            feed = feedparser.parse(feed_text)
             
-            results.append(PaperRecord(
-                arxiv_id=arxiv_id,
-                s2_id="", # Null until S2 Stage 2 populates it
-                title=entry.get("title", "No Title").replace('\n', ' ').strip(),
-                abstract=entry.get("summary", "No Abstract").replace('\n', ' ').strip(),
-                authors=authors,
-                # 2. Maintain strict YYYY-MM-DD format dynamically
-                submitted_date=pub_date.strftime("%Y-%m-%d"),
-                venue=final_venue,
-                citation_count=0,
-                max_author_citations=0,
-                pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
-                arxiv_url=f"https://arxiv.org/abs/{arxiv_id}",
-                fields_of_study=["Computer Science"] + extracted_tags,
-                source="arXiv.org",
-            ))
+            # 1. Avoid error pages being treated as entries
+            if feed.get("bozo_exception"):
+                logger.error("ArXiv API returned malformed feed (possible error page). Backing off for %ds...", backoff)
+                time.sleep(backoff)
+                if backoff < 300:
+                    backoff *= 2
+                continue
+                
+            if not feed.get("entries"):
+                break
+                
+            oldest_date_in_batch = None
+            for entry in feed.get("entries", []):
+                arxiv_or_full = entry.get("id", "")
+                if not arxiv_or_full:
+                    continue
+                    
+                if "/abs/" in arxiv_or_full:
+                    arxiv_id = arxiv_or_full.split("/abs/")[-1].split("v")[0]
+                else:
+                    arxiv_id = arxiv_or_full
+                    
+                # Filter out error documents mimicking entries
+                if len(arxiv_id) > 30 or " " in arxiv_id or "error" in arxiv_id.lower():
+                    continue
+                    
+                if arxiv_id in seen:
+                    continue
+                seen.add(arxiv_id)
+                
+                # ArXiv feed uses 'published' or 'updated'. Use .get() defensively.
+                pub_date_str = entry.get("published") or entry.get("updated")
+                if not pub_date_str:
+                    pub_date = datetime.now()
+                else:
+                    try:
+                        # ArXiv standard format: 2026-03-21T21:30:11Z
+                        pub_date = datetime.strptime(pub_date_str, "%Y-%m-%dT%H:%M:%SZ")
+                    except Exception:
+                        pub_date = datetime.now()
+                    
+                # Track the oldest to know when to terminate pagination
+                if oldest_date_in_batch is None or pub_date < oldest_date_in_batch:
+                    oldest_date_in_batch = pub_date
+                    
+                # If older than cutoff, don't append, but we might keep searching the page
+                if pub_date < cutoff_date:
+                    continue
+                    
+                authors = [a.get("name", "") for a in entry.get("authors", []) if a.get("name")]
+                
+                # 3. Extract correct arXiv tags (cs.AI, cs.RO, etc.) directly into fields_of_study
+                extracted_tags = []
+                for t in entry.get("tags", []):
+                    term = t.get("term")
+                    if term and not term.startswith("http"):
+                        extracted_tags.append(term)
+                        
+                # 4. Extract venue natively from arXiv comments if present
+                comment = entry.get("arxiv_comment", "")
+                journal_ref = entry.get("arxiv_journal_ref", "")
+                final_venue = None
+                if extract_venue_func:
+                    val = extract_venue_func(comment) or extract_venue_func(journal_ref)
+                    if val:
+                        final_venue = val
+                
+                results.append(PaperRecord(
+                    arxiv_id=arxiv_id,
+                    s2_id="", # Null until S2 Stage 2 populates it
+                    title=entry.get("title", "No Title").replace('\n', ' ').strip(),
+                    abstract=entry.get("summary", "No Abstract").replace('\n', ' ').strip(),
+                    authors=authors,
+                    # 2. Maintain strict YYYY-MM-DD format dynamically
+                    submitted_date=pub_date.strftime("%Y-%m-%d"),
+                    venue=final_venue,
+                    citation_count=0,
+                    max_author_citations=0,
+                    pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
+                    arxiv_url=f"https://arxiv.org/abs/{arxiv_id}",
+                    fields_of_study=["Computer Science"] + extracted_tags,
+                    source="arXiv.org",
+                ))
+                
+            # If we broke the threshold, stop fetching entirely
+            if not oldest_date_in_batch or oldest_date_in_batch < cutoff_date:
+                break
+                
+            start += max_results
             
-        # If we broke the threshold, stop fetching entirely
-        if not oldest_date_in_batch or oldest_date_in_batch < cutoff_date:
-            break
-            
-        start += max_results
-        
-        # Hard fail-safe: ArXiv API crashes (500 Server Error) when start + max_results > 10000 
-        # unless you use OAI-PMH. Since this is just a short-term Scout, gracefully break.
-        if start >= 10000:
-            logger.info("Reached ArXiv's safe limit (10k preprints). Concluding Stage 1 Scout.")
-            break
-            
-        time.sleep(3) # Comply with arXiv 3-second delay policy
-        
+            # Hard fail-safe: ArXiv API crashes (500 Server Error) when start + max_results > 10000 
+            # Since we iterate per category, 10k per category is plenty (~170k total).
+            if start >= 10000:
+                logger.info("Reached ArXiv's safe limit (10k preprints) for subcategory %s. Moving to next.", cat)
+                break
+                
+            time.sleep(3) # Comply with arXiv 3-second delay policy
+
     logger.info("Stage 1 ArXiv Scout finished: %d recent papers fetched.", len(results))
     return results
 

@@ -116,6 +116,17 @@ def _fetch_page(url: str, params: dict, headers: dict) -> dict:
     r.raise_for_status()
     return r.json()
 
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(min=2, max=30),
+    reraise=True,
+)
+def _fetch_batch_post(url: str, payload: dict, params: dict, headers: dict) -> list:
+    """Batch POST fetch with retry."""
+    r = requests.post(url, json=payload, params=params, headers=headers, timeout=45)
+    r.raise_for_status()
+    return r.json()
+
 
 def fetch_papers_bulk(
     api_key: Optional[str] = None,
@@ -347,6 +358,70 @@ def fetch_fresh_arxiv_papers(days: int = 30) -> List[PaperRecord]:
     logger.info("Stage 1 ArXiv Scout finished: %d recent papers fetched.", len(results))
     return results
 
+def enrich_author_citations(conn, api_key: Optional[str] = None) -> int:
+    """
+    Stage 3 'Fame Enricher': The Bulk Search API doesn't support authors.citationCount (causes 400).
+    This function finds papers with missing max_author_citations (0) that have an s2_id,
+    and hits the S2 POST /batch endpoint to backfill them, fixing the Moneyball "Fame" metric gap.
+    """
+    resolved_key = api_key or os.getenv("S2_API_KEY")
+    headers = {"x-api-key": resolved_key} if resolved_key else {}
+    
+    # Grab all valid S2 papers where we haven't resolved an author citation count yet
+    cursor = conn.execute("SELECT arxiv_id, s2_id FROM papers WHERE s2_id IS NOT NULL AND s2_id != '' AND max_author_citations = 0")
+    rows = cursor.fetchall()
+    
+    if not rows:
+        logger.info("Stage 3 Fame Enricher: No papers require author citation backfilling.")
+        return 0
+
+    logger.info("Stage 3 Fame Enricher: Found %d papers missing max_author_citations. Batch processing...", len(rows))
+    
+    batch_size = 300 # S2 batch /paper limit is typically 500
+    updates_made = 0
+    url = "https://api.semanticscholar.org/graph/v1/paper/batch"
+    
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i:i + batch_size]
+        s2_ids = [r[1] for r in chunk]
+        
+        try:
+            data = _fetch_batch_post(
+                url=url, 
+                payload={"ids": s2_ids}, 
+                params={"fields": "paperId,authors.citationCount"}, 
+                headers=headers
+            )
+            
+            update_batch = []
+            for paper_data in data:
+                if not paper_data:
+                    continue
+                paper_id = paper_data.get("paperId")
+                authors = paper_data.get("authors") or []
+                max_cites = 0
+                for a in authors:
+                    c = a.get("citationCount") or 0
+                    if c > max_cites:
+                        max_cites = c
+                        
+                if max_cites > 0:
+                    update_batch.append((max_cites, paper_id))
+            
+            if update_batch:
+                conn.executemany("UPDATE papers SET max_author_citations = ? WHERE s2_id = ?", update_batch)
+                conn.commit()
+                updates_made += len(update_batch)
+                
+            logger.info("Batch processed %d/%d (Updated %d total)", min(i + batch_size, len(rows)), len(rows), updates_made)
+            time.sleep(1.5) # Comply with rate limits
+            
+        except Exception as e:
+            logger.error("Batch update failed at chunk %d: %s", i, e)
+            
+    logger.info("Stage 3 Fame Enricher complete: %d records backfilled.", updates_made)
+    return updates_made
+
 def run_ingestion(
     db_path: str = "data_pipeline/corpus.db",
     max_papers: int = MAX_PAPERS_TO_FETCH,
@@ -399,6 +474,16 @@ def run_ingestion(
             total += len(papers)
         except Exception as e:
             logger.error("Stage 2 S2 fetching failed: %s", e)
+
+    # ----------------------------------------------------
+    # Stage 3: The 'Fame Enricher' (S2 /batch Author Citations)
+    # ----------------------------------------------------
+    if s2_only or run_all:
+        try:
+            enriched_count = enrich_author_citations(conn)
+            total += enriched_count
+        except Exception as e:
+            logger.error("Stage 3 Fame Enricher failed: %s", e)
     
     logger.info("Ingestion session complete. SQLite DB updated at %s", db_path)
     conn.close()

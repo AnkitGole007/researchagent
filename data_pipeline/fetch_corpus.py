@@ -55,21 +55,34 @@ _FIELDS = [
 def parse_s2_paper(raw: dict) -> Optional[PaperRecord]:
     """
     Convert a raw S2 API dict to a PaperRecord.
-    Returns None if the paper has no arXiv ID (non-arXiv papers skipped).
-
+    Now supports non-arXiv papers natively by synthesizing an S2 Primary Key.
+    
     Note: max_author_citations is set to 0 because authors.citationCount is
-    not available from the bulk search endpoint. Can be enriched later.
+    not available from the bulk search endpoint. It is enriched in Stage 3.
     """
     try:
         ids = raw.get("externalIds") or {}
         arxiv_id = ids.get("ArXiv", "")
-        if not arxiv_id:
-            return None
+        s2_id = raw.get("paperId", "")
+        
+        if not arxiv_id and not s2_id:
+            return None # Un-indexable without any identifier
+            
+        is_arxiv = bool(arxiv_id)
+        if not is_arxiv:
+            arxiv_id = f"s2:{s2_id}" # Synthesize unique Primary Key
 
         authors = raw.get("authors") or []
-        pdf_url = (raw.get("openAccessPdf") or {}).get(
-            "url", f"https://arxiv.org/pdf/{arxiv_id}"
-        )
+        
+        # Native URL resolution
+        pdf_url = (raw.get("openAccessPdf") or {}).get("url", "")
+        if not pdf_url and is_arxiv:
+            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+            
+        paper_url = raw.get("url")
+        if not paper_url:
+            paper_url = f"https://arxiv.org/abs/{arxiv_id}" if is_arxiv else f"https://www.semanticscholar.org/paper/{s2_id}"
+            
         pub_date = (
             raw.get("publicationDate")
             or str(raw.get("year", "2024")) + "-01-01"
@@ -82,16 +95,16 @@ def parse_s2_paper(raw: dict) -> Optional[PaperRecord]:
 
         return PaperRecord(
             arxiv_id=arxiv_id,
-            s2_id=raw.get("paperId", ""),
+            s2_id=s2_id,
             title=(raw.get("title") or "").replace("\n", " ").strip(),
             abstract=(raw.get("abstract") or "").replace("\n", " ").strip(),
             authors=[a.get("name", "") for a in authors],
             submitted_date=pub_date,
             venue=s2_venue,
             citation_count=raw.get("citationCount", 0) or 0,
-            max_author_citations=0,  # not available from bulk endpoint
+            max_author_citations=0,  # Enriched natively in Stage 3
             pdf_url=pdf_url,
-            arxiv_url=f"https://arxiv.org/abs/{arxiv_id}",
+            arxiv_url=paper_url,
             fields_of_study=[
                 f.get("category", "")
                 for f in (raw.get("s2FieldsOfStudy") or [])

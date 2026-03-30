@@ -11,7 +11,6 @@ from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Any
 import numpy as np
 import pathlib
-import tempfile
 
 try:
     import streamlit as st
@@ -106,8 +105,6 @@ def get_date_range(option: str) -> (date, date):
         return today - timedelta(days=7), today
     elif option == "Last Month":
         return today - timedelta(days=30), today
-    elif option == "All Time":
-        return date(2000, 1, 1), today
     else:
         raise ValueError(f"Unknown date range option: {option}")
 
@@ -122,23 +119,32 @@ def save_json(path: str, obj: Any):
         json.dump(obj, f, indent=2, default=str)
 
 
-def get_corpus_dir() -> pathlib.Path:
-    """
-    Returns the writable directory for data pipeline artifacts.
-    Always uses a platform-agnostic temp directory to ensure the app 
-    relies exclusively on R2 as the single source of truth.
-    """
-    # 1. Manual override (mainly for CI/CD or explicit local overrides)
-    env_dir = os.environ.get("CORPUS_DATA_DIR")
-    if env_dir:
-        p = pathlib.Path(env_dir)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+# def get_corpus_dir() -> pathlib.Path:
+#     """Returns the writable directory for data pipeline artifacts."""
+#     local_dir = pathlib.Path("data_pipeline")
+#     # In Streamlit Cloud and most containers, /tmp is always writable.
+#     # Check if we are running in a deployed environment or if local data_pipeline is missing/not writable.
+#     is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
+#     if is_streamlit_cloud or not local_dir.exists():
+#         return pathlib.Path("/tmp/data_pipeline")
+#     return local_dir
 
-    # 2. Always fallback to system temp directory (Streamlit Cloud & local usage matches)
-    temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_corpus"
-    temp_path.mkdir(parents=True, exist_ok=True)
-    return temp_path
+def get_corpus_dir() -> pathlib.Path:
+    """Returns the writable directory for data pipeline artifacts."""
+    # Always use /tmp for deployed environments where the repo's data_pipeline/
+    # folder contains source code, not corpus artifacts.
+    # Check multiple signals for Streamlit Cloud / container environments.
+    is_cloud = (
+        os.getenv("STREAMLIT_SHARING_MODE") is not None
+        or os.getenv("STREAMLIT_SERVER_ADDRESS") is not None
+        or os.path.exists("/home/appuser")  # Streamlit Cloud uses this home dir
+    )
+    if is_cloud:
+        return pathlib.Path("/tmp/data_pipeline")
+    
+    # Local development: use a dedicated corpus subdirectory
+    local_dir = pathlib.Path("data_pipeline/corpus_data")
+    return local_dir
 
 
 def _check_corpus_freshness():
@@ -163,14 +169,11 @@ def _check_corpus_freshness():
         return
 
     try:
-        from botocore.config import Config
         s3 = boto3.client(
             's3',
             endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            region_name="auto",
-            config=Config(signature_version="s3v4"),
         )
         
         # 3. HEAD request to check ETag of the metadata file
@@ -198,125 +201,102 @@ def _check_corpus_freshness():
         pass
 
 
+@st.cache_resource(show_spinner=False)
 def download_corpus_artifacts():
     """
     Startup sync from Cloudflare R2 with freshness check.
-    Runs once per Streamlit session using session_state as a guard.
-    Downloads artifacts to get_corpus_dir() if the remote is newer.
+    Syncs artifacts down to the local get_corpus_dir() if remote is newer.
     """
-    # Guard: only run once per session (not on every Streamlit re-run)
-    if st.session_state.get("_corpus_synced"):
-        return
-
     import boto3
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
 
-    # 1. Resolve credentials: st.secrets (Streamlit Cloud) → os.getenv (.env / GitHub Actions)
-    key_id    = (st.secrets.get("R2_ACCESS_KEY_ID")     or os.getenv("R2_ACCESS_KEY_ID", "")).strip().strip('\'"')
-    access_key = (st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY", "")).strip().strip('\'"')
-    endpoint   = (st.secrets.get("R2_ENDPOINT")          or os.getenv("R2_ENDPOINT", "")).strip().strip('\'"')
-    bucket     = (st.secrets.get("R2_BUCKET")            or os.getenv("R2_BUCKET", "")).strip().strip('\'"')
+    # 1. Resolve credentials
+    # Use st.secrets if in Streamlit Cloud, otherwise environment variables
+    key_id = st.secrets.get("R2_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID")
+    access_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY")
+    endpoint = st.secrets.get("R2_ENDPOINT") or os.getenv("R2_ENDPOINT")
+    bucket = st.secrets.get("R2_BUCKET") or os.getenv("R2_BUCKET")
 
     if not all([key_id, access_key, endpoint, bucket]):
-        st.warning("⚠️ R2 credentials not fully configured. Corpus sync skipped.")
-        st.session_state["_corpus_synced"] = True
+        st.info("💡 R2 credentials not fully set; skipping remote corpus sync.")
         return
 
     corpus_dir = get_corpus_dir()
     corpus_dir.mkdir(parents=True, exist_ok=True)
-    meta_path  = corpus_dir / "build_meta.json"
-    status     = st.empty()
-
+    meta_path = corpus_dir / "build_meta.json"
+    status_placeholder = st.empty()
     try:
-        from botocore.config import Config
-        s3 = boto3.client(
+        s2_client = boto3.client(
             "s3",
             endpoint_url=endpoint,
             aws_access_key_id=key_id,
             aws_secret_access_key=access_key,
-            region_name="auto",  # Required for Cloudflare R2
-            config=Config(signature_version="s3v4"),
         )
 
-        # 2. Freshness check — compare local vs remote build_meta.json
-        status.info("🔍 Checking for fresh corpus updates on R2...")
+        # 2. Freshness Check
+        status_placeholder.info("Checking for fresh corpus updates on R2...")
         local_meta = {}
         if meta_path.exists():
             try:
                 local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
-            except Exception:
+            except:
                 pass
 
-        remote_meta_obj = s3.get_object(Bucket=bucket, Key="corpus/build_meta.json")
-        remote_meta     = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
+        # Download remote build_meta.json to a temp buffer
+        remote_meta_obj = s2_client.get_object(Bucket=bucket, Key="corpus/build_meta.json")
+        remote_meta = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
 
-        remote_ts  = remote_meta.get("built_at", "")
-        local_ts   = local_meta.get("built_at", "")
+        remote_ts = remote_meta.get("built_at", "")
+        local_ts = local_meta.get("built_at", "")
         remote_ver = remote_meta.get("schema_version", 1)
-        local_ver  = local_meta.get("schema_version", 0)
+        local_ver = local_meta.get("schema_version", 0)
 
-        if remote_ts == local_ts and remote_ver == local_ver and meta_path.exists():
-            status.empty()
-            st.session_state["_corpus_synced"] = True
-            return  # Already up-to-date
+        if remote_ts == local_ts and remote_ver == local_ver:
+            # No update needed
+            return
 
-        # 3. Download core flat files in parallel
-        corpus_size = remote_meta.get("corpus_size", "?")
-        status.info(f"🔄 Syncing corpus from R2 ({corpus_size:,} papers)...")
-
-        core_files = [
+        # 3. Full Download
+        status_placeholder.info("🔄 Downloading fresh corpus artifacts from R2...")
+        
+        # Files to download (prefix 'corpus/' removed from bucket key during sync to app local)
+        # Note: scheduler.py pushes with prefix 'corpus/'. 
+        files = [
             "corpus.db",
             "index_minilm.faiss",
             "embeddings_minilm.npy",
             "id_map.json",
-            "build_meta.json",
+            "build_meta.json"
         ]
-
-        def _download_file(filename):
+        
+        def _download(filename):
             dest = corpus_dir / filename
-            s3.download_file(bucket, f"corpus/{filename}", str(dest))
-            size_mb = dest.stat().st_size / (1024 * 1024)
-            return filename, size_mb
+            s2_client.download_file(bucket, f"corpus/{filename}", str(dest))
+            
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            executor.map(_download, files)
 
-        failed_files = []
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(_download_file, f): f for f in core_files}
-            for future in as_completed(futures):
-                try:
-                    fname, size_mb = future.result()
-                except Exception as exc:
-                    failed_files.append(f"{futures[future]} ({exc})")
-
-        if failed_files:
-            status.error(f"❌ Corpus sync failed for: {', '.join(failed_files)}")
-            return  # Don't mark as synced — allow retry
-
-        # 4. BM25 index directory (non-fatal if missing)
+        # 4. BM25 special case (recursive directory)
+        # We'll just download the index files manually for now
+        # bm25s keeps files in bm25_index/ folder
+        # For simplicity, if we need full directory sync, we'd list the bucket
+        # but here we'll just download the known ones
         bm25_dir = corpus_dir / "bm25_index"
         bm25_dir.mkdir(exist_ok=True)
-        try:
-            paginator = s3.get_paginator("list_objects_v2")
-            bm25_count = 0
-            for page in paginator.paginate(Bucket=bucket, Prefix="corpus/bm25_index/"):
-                for obj in page.get("Contents", []):
-                    key      = obj["Key"]
-                    filename = key[len("corpus/bm25_index/"):]
-                    if filename:
-                        s3.download_file(bucket, key, str(bm25_dir / filename))
-                        bm25_count += 1
-        except Exception as bm25_err:
-            # BM25 failure is non-fatal — corpus.db + FAISS still work
-            st.warning(f"⚠️ BM25 index sync failed (BM25 retrieval disabled): {bm25_err}")
+        
+        # We need to list objects in corpus/bm25_index/
+        response = s2_client.list_objects_v2(Bucket=bucket, Prefix="corpus/bm25_index/")
+        for obj in response.get("Contents", []):
+            key = obj["Key"]
+            filename = key.replace("corpus/bm25_index/", "")
+            if filename:
+                s2_client.download_file(bucket, key, str(bm25_dir / filename))
 
-        status.success("✅ Corpus synced from R2 successfully!")
+        status_placeholder.success("✅ Corpus artifacts updated successfully!")
         time.sleep(1)
-        status.empty()
-        st.session_state["_corpus_synced"] = True
+        status_placeholder.empty()
 
     except Exception as e:
-        # Show a persistent error so it is always visible on-screen
-        status.error(f"❌ R2 corpus sync error: {e}")
-        # Do NOT set _corpus_synced = True so the next re-run retries
+        status_placeholder.warning(f"⚠️ Remote corpus sync failed: {e}. Falling back to local data.")
 
 
 def build_query_brief(research_brief: str, not_looking_for: str) -> str:
@@ -1068,8 +1048,7 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
             with open("moneyball_weights.json", "r") as f: weights = json.load(f)
         except: pass
     
-    # Read S2 key from st.secrets (Streamlit Cloud) with os.getenv fallback (local/.env)
-    s2_key = st.secrets.get("S2_API_KEY") or os.getenv("S2_API_KEY")
+    s2_key = os.getenv("S2_API_KEY") 
     progress_bar = st.progress(0)
     
     for i, p in enumerate(target_papers):
@@ -1519,7 +1498,7 @@ def _main_body():
 
         
 
-        date_option = st.selectbox("Date Range", ["Last 3 Days", "Last Week", "Last Month", "All Time"], index=2)
+        date_option = st.selectbox("Date Range", ["Last 3 Days", "Last Week", "Last Month"])
 
         st.markdown("### ⭐ Top N Highlight")
         top_n = st.slider(

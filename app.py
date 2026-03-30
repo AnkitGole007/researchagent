@@ -183,11 +183,14 @@ def _check_corpus_freshness():
         return
 
     try:
+        from botocore.config import Config
         s3 = boto3.client(
             's3',
             endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
+            region_name="auto",
+            config=Config(signature_version="s3v4"),
         )
         
         # 3. HEAD request to check ETag of the metadata file
@@ -215,102 +218,125 @@ def _check_corpus_freshness():
         pass
 
 
-@st.cache_resource(show_spinner=False)
 def download_corpus_artifacts():
     """
     Startup sync from Cloudflare R2 with freshness check.
-    Syncs artifacts down to the local get_corpus_dir() if remote is newer.
+    Runs once per Streamlit session using session_state as a guard.
+    Downloads artifacts to get_corpus_dir() if the remote is newer.
     """
-    import boto3
-    from concurrent.futures import ThreadPoolExecutor
+    # Guard: only run once per session (not on every Streamlit re-run)
+    if st.session_state.get("_corpus_synced"):
+        return
 
-    # 1. Resolve credentials
-    # Use st.secrets if in Streamlit Cloud, otherwise environment variables
-    key_id = st.secrets.get("R2_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID")
+    import boto3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # 1. Resolve credentials: st.secrets (Streamlit Cloud) → os.getenv (.env / GitHub Actions)
+    key_id    = st.secrets.get("R2_ACCESS_KEY_ID")     or os.getenv("R2_ACCESS_KEY_ID")
     access_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY")
-    endpoint = st.secrets.get("R2_ENDPOINT") or os.getenv("R2_ENDPOINT")
-    bucket = st.secrets.get("R2_BUCKET") or os.getenv("R2_BUCKET")
+    endpoint   = st.secrets.get("R2_ENDPOINT")          or os.getenv("R2_ENDPOINT")
+    bucket     = st.secrets.get("R2_BUCKET")            or os.getenv("R2_BUCKET")
 
     if not all([key_id, access_key, endpoint, bucket]):
-        st.info("💡 R2 credentials not fully set; skipping remote corpus sync.")
+        st.warning("⚠️ R2 credentials not fully configured. Corpus sync skipped.")
+        st.session_state["_corpus_synced"] = True
         return
 
     corpus_dir = get_corpus_dir()
     corpus_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = corpus_dir / "build_meta.json"
-    status_placeholder = st.empty()
+    meta_path  = corpus_dir / "build_meta.json"
+    status     = st.empty()
+
     try:
-        s2_client = boto3.client(
+        from botocore.config import Config
+        s3 = boto3.client(
             "s3",
             endpoint_url=endpoint,
             aws_access_key_id=key_id,
             aws_secret_access_key=access_key,
+            region_name="auto",  # Required for Cloudflare R2
+            config=Config(signature_version="s3v4"),
         )
 
-        # 2. Freshness Check
-        status_placeholder.info("Checking for fresh corpus updates on R2...")
+        # 2. Freshness check — compare local vs remote build_meta.json
+        status.info("🔍 Checking for fresh corpus updates on R2...")
         local_meta = {}
         if meta_path.exists():
             try:
                 local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
-            except:
+            except Exception:
                 pass
 
-        # Download remote build_meta.json to a temp buffer
-        remote_meta_obj = s2_client.get_object(Bucket=bucket, Key="corpus/build_meta.json")
-        remote_meta = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
+        remote_meta_obj = s3.get_object(Bucket=bucket, Key="corpus/build_meta.json")
+        remote_meta     = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
 
-        remote_ts = remote_meta.get("built_at", "")
-        local_ts = local_meta.get("built_at", "")
+        remote_ts  = remote_meta.get("built_at", "")
+        local_ts   = local_meta.get("built_at", "")
         remote_ver = remote_meta.get("schema_version", 1)
-        local_ver = local_meta.get("schema_version", 0)
+        local_ver  = local_meta.get("schema_version", 0)
 
-        if remote_ts == local_ts and remote_ver == local_ver:
-            # No update needed
-            return
+        if remote_ts == local_ts and remote_ver == local_ver and meta_path.exists():
+            status.empty()
+            st.session_state["_corpus_synced"] = True
+            return  # Already up-to-date
 
-        # 3. Full Download
-        status_placeholder.info("🔄 Downloading fresh corpus artifacts from R2...")
-        
-        # Files to download (prefix 'corpus/' removed from bucket key during sync to app local)
-        # Note: scheduler.py pushes with prefix 'corpus/'. 
-        files = [
+        # 3. Download core flat files in parallel
+        corpus_size = remote_meta.get("corpus_size", "?")
+        status.info(f"🔄 Syncing corpus from R2 ({corpus_size:,} papers)...")
+
+        core_files = [
             "corpus.db",
             "index_minilm.faiss",
             "embeddings_minilm.npy",
             "id_map.json",
-            "build_meta.json"
+            "build_meta.json",
         ]
-        
-        def _download(filename):
-            dest = corpus_dir / filename
-            s2_client.download_file(bucket, f"corpus/{filename}", str(dest))
-            
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            executor.map(_download, files)
 
-        # 4. BM25 special case (recursive directory)
-        # We'll just download the index files manually for now
-        # bm25s keeps files in bm25_index/ folder
-        # For simplicity, if we need full directory sync, we'd list the bucket
-        # but here we'll just download the known ones
+        def _download_file(filename):
+            dest = corpus_dir / filename
+            s3.download_file(bucket, f"corpus/{filename}", str(dest))
+            size_mb = dest.stat().st_size / (1024 * 1024)
+            return filename, size_mb
+
+        failed_files = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_download_file, f): f for f in core_files}
+            for future in as_completed(futures):
+                try:
+                    fname, size_mb = future.result()
+                except Exception as exc:
+                    failed_files.append(f"{futures[future]} ({exc})")
+
+        if failed_files:
+            status.error(f"❌ Corpus sync failed for: {', '.join(failed_files)}")
+            return  # Don't mark as synced — allow retry
+
+        # 4. BM25 index directory (non-fatal if missing)
         bm25_dir = corpus_dir / "bm25_index"
         bm25_dir.mkdir(exist_ok=True)
-        
-        # We need to list objects in corpus/bm25_index/
-        response = s2_client.list_objects_v2(Bucket=bucket, Prefix="corpus/bm25_index/")
-        for obj in response.get("Contents", []):
-            key = obj["Key"]
-            filename = key.replace("corpus/bm25_index/", "")
-            if filename:
-                s2_client.download_file(bucket, key, str(bm25_dir / filename))
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            bm25_count = 0
+            for page in paginator.paginate(Bucket=bucket, Prefix="corpus/bm25_index/"):
+                for obj in page.get("Contents", []):
+                    key      = obj["Key"]
+                    filename = key[len("corpus/bm25_index/"):]
+                    if filename:
+                        s3.download_file(bucket, key, str(bm25_dir / filename))
+                        bm25_count += 1
+        except Exception as bm25_err:
+            # BM25 failure is non-fatal — corpus.db + FAISS still work
+            st.warning(f"⚠️ BM25 index sync failed (BM25 retrieval disabled): {bm25_err}")
 
-        status_placeholder.success("✅ Corpus artifacts updated successfully!")
+        status.success("✅ Corpus synced from R2 successfully!")
         time.sleep(1)
-        status_placeholder.empty()
+        status.empty()
+        st.session_state["_corpus_synced"] = True
 
     except Exception as e:
-        status_placeholder.warning(f"⚠️ Remote corpus sync failed: {e}. Falling back to local data.")
+        # Show a persistent error so it is always visible on-screen
+        status.error(f"❌ R2 corpus sync error: {e}")
+        # Do NOT set _corpus_synced = True so the next re-run retries
 
 
 def build_query_brief(research_brief: str, not_looking_for: str) -> str:

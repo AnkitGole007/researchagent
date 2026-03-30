@@ -119,31 +119,14 @@ def save_json(path: str, obj: Any):
         json.dump(obj, f, indent=2, default=str)
 
 
-# def get_corpus_dir() -> pathlib.Path:
-#     """Returns the writable directory for data pipeline artifacts."""
-#     local_dir = pathlib.Path("data_pipeline")
-#     # In Streamlit Cloud and most containers, /tmp is always writable.
-#     # Check if we are running in a deployed environment or if local data_pipeline is missing/not writable.
-#     is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
-#     if is_streamlit_cloud or not local_dir.exists():
-#         return pathlib.Path("/tmp/data_pipeline")
-#     return local_dir
-
 def get_corpus_dir() -> pathlib.Path:
     """Returns the writable directory for data pipeline artifacts."""
-    # Always use /tmp for deployed environments where the repo's data_pipeline/
-    # folder contains source code, not corpus artifacts.
-    # Check multiple signals for Streamlit Cloud / container environments.
-    is_cloud = (
-        os.getenv("STREAMLIT_SHARING_MODE") is not None
-        or os.getenv("STREAMLIT_SERVER_ADDRESS") is not None
-        or os.path.exists("/home/appuser")  # Streamlit Cloud uses this home dir
-    )
-    if is_cloud:
+    local_dir = pathlib.Path("data_pipeline")
+    # In Streamlit Cloud and most containers, /tmp is always writable.
+    # Check if we are running in a deployed environment or if local data_pipeline is missing/not writable.
+    is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
+    if is_streamlit_cloud or not local_dir.exists():
         return pathlib.Path("/tmp/data_pipeline")
-    
-    # Local development: use a dedicated corpus subdirectory
-    local_dir = pathlib.Path("data_pipeline/corpus_data")
     return local_dir
 
 
@@ -1277,21 +1260,17 @@ PIPELINE_DESCRIPTION_MD = """
 
 You write a short research brief in natural language about the kind of work you care about, and optionally what you are not interested in. If you leave both fields empty, the agent switches to a global mode and just looks for the most impactful recent Computer Science papers overall.
 
-#### 2. The agent searches a curated local corpus
+#### 2. The agent fetches recent arXiv papers
 
-Instead of fetching papers live, the agent queries a pre-built local library of 40,000+ papers harvested from arXiv and Semantic Scholar. This library is refreshed on a schedule via a pipeline and, when configured, synced from cloud storage (Cloudflare R2) on startup — so you always get fast, up-to-date results without depending on external API availability at search time.
+It fetches up to about 5000 papers from arxiv.org for the date range you choose, using your selected arXiv category filters—either all categories, or a specific main category (like Computer Science) with one or more subcategories (like cs.AI, cs.LG etc.). It does this carefully, respecting arXiv's API rate limits.
+#### 3. The agent picks candidate papers
 
-#### 3. The agent picks candidate papers using 3-stage hybrid search
-
-Retrieval is a three-step funnel designed to be both fast and accurate:
-
-- **Stage 1 — Keyword Recall (BM25):** Quickly narrows the corpus to papers containing terminology relevant to your brief.
-- **Stage 2 — Semantic Filter (MiniLM):** An embedding model removes keyword matches that aren't actually relevant to the *meaning* of your query, keeping the top candidates by semantic similarity.
-- **Stage 3 — Precision Reranking (CrossEncoder):** A deep cross-attention model does a final comparison between your brief and each candidate, selecting the best papers to pass to the AI.
+- In **targeted mode**, the agent uses embeddings to measure how close each paper's title and abstract are to your brief in meaning and keeps the top 150 as candidates.
+- In **global mode**, it simply takes the most recent 150  papers as candidates.
 
 #### The agent filters by venue (Optional)
 
-If you selected a venue filter (e.g. "NeurIPS only" or "All Journals"), the agent applies it **after** the hybrid search. This ensures the agent first identifies the most semantically relevant papers from the entire corpus, and then narrows them down to your preferred venues.
+If you selected a venue filter (e.g. "NeurIPS only" or "All Journals"), the agent applies it **after** the embedding search. This ensures that the agent first identifies the most semantically relevant papers from the entire pool, and then narrows them down to your preferred venues.
 
 #### 4. The agent judges how relevant each paper is
 
@@ -1308,7 +1287,7 @@ The agent builds a set of papers to send to the citation impact step:
 
 #### 6. The agent computes 1-year citation impact scores
 
-- In **LLM API mode** (OpenAI, Gemini, or Groq), a model estimates a 1-year citation impact score for each paper using author citation data from Semantic Scholar and an LLM-generated narrative, and provides short explanations.
+- In **LLM API mode** (OpenAI, Gemini, or Groq), a model estimates a 1-year citation impact score for each paper and provides short explanations.
 - In **free local mode**, the agent derives a citation impact score from the relevance signals and uses that to rank papers.
 
 These scores are heuristic impact signals and are best used for ranking within this batch, not as ground truth.

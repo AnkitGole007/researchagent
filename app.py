@@ -119,14 +119,31 @@ def save_json(path: str, obj: Any):
         json.dump(obj, f, indent=2, default=str)
 
 
+# def get_corpus_dir() -> pathlib.Path:
+#     """Returns the writable directory for data pipeline artifacts."""
+#     local_dir = pathlib.Path("data_pipeline")
+#     # In Streamlit Cloud and most containers, /tmp is always writable.
+#     # Check if we are running in a deployed environment or if local data_pipeline is missing/not writable.
+#     is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
+#     if is_streamlit_cloud or not local_dir.exists():
+#         return pathlib.Path("/tmp/data_pipeline")
+#     return local_dir
+
 def get_corpus_dir() -> pathlib.Path:
     """Returns the writable directory for data pipeline artifacts."""
-    local_dir = pathlib.Path("data_pipeline")
-    # In Streamlit Cloud and most containers, /tmp is always writable.
-    # Check if we are running in a deployed environment or if local data_pipeline is missing/not writable.
-    is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
-    if is_streamlit_cloud or not local_dir.exists():
+    # Always use /tmp for deployed environments where the repo's data_pipeline/
+    # folder contains source code, not corpus artifacts.
+    # Check multiple signals for Streamlit Cloud / container environments.
+    is_cloud = (
+        os.getenv("STREAMLIT_SHARING_MODE") is not None
+        or os.getenv("STREAMLIT_SERVER_ADDRESS") is not None
+        or os.path.exists("/home/appuser")  # Streamlit Cloud uses this home dir
+    )
+    if is_cloud:
         return pathlib.Path("/tmp/data_pipeline")
+    
+    # Local development: use a dedicated corpus subdirectory
+    local_dir = pathlib.Path("data_pipeline/corpus_data")
     return local_dir
 
 

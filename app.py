@@ -1,4 +1,9 @@
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import json
 import time
 import textwrap
@@ -1073,7 +1078,7 @@ def specter2_vector_rerank(
         # Encode papers: title + sep + abstract (SPECTER2 paper-side format)
         sep = tokenizer.sep_token or " "
         paper_texts = [
-            p.title + sep + (p.abstract[:300] if p.abstract else "")
+            p.title + sep + (p.abstract if p.abstract else "")
             for p in papers
         ]
         p_vecs = _encode_batch(paper_texts)
@@ -1217,7 +1222,7 @@ def select_embedding_candidates(
     3-Stage Hybrid Search (Task 33: Stage 1 upgraded to RRF parallel retrieval):
 
     Stage 1 (RRF):  Parallel BM25 + FAISS/MiniLM → Reciprocal Rank Fusion → top-600
-    Stage 2 (MiniLM vector rerank): top-600 → top-300 by cosine similarity
+    Stage 2 (SPECTER2 vector rerank; falls back to MiniLM): top-600 → top-300 by cosine similarity
     Stage 3 (CrossEncoder precision): top-300 → top-150 by cross-attention score
 
     Fallback modes (graceful degradation):
@@ -1529,8 +1534,6 @@ def classify_papers_with_llm(
     return papers
 
 
-PRIMARY_THRESHOLD = 0.65
-SECONDARY_THRESHOLD = 0.30
 
 def scibert_classify_papers(papers: List[Paper]) -> List[Paper]:
     """
@@ -1861,9 +1864,9 @@ Instead of fetching papers live, the agent queries a pre-built local library of 
 
 Retrieval is a three-step funnel designed to be both fast and accurate:
 
-- **Stage 1 — Keyword Recall (BM25):** Quickly narrows the corpus to papers containing terminology relevant to your brief.
-- **Stage 2 — Semantic Filter (MiniLM):** An embedding model removes keyword matches that aren't actually relevant to the *meaning* of your query, keeping the top candidates by semantic similarity.
-- **Stage 3 — Precision Reranking (CrossEncoder):** A deep cross-attention model does a final comparison between your brief and each candidate, selecting the best papers to pass to the AI.
+- **Stage 1 — Keyword & Basic Semantic Recall (RRF):** Quickly narrows the corpus using reciprocal rank fusion of BM25 keyword matches and FAISS dense embeddings.
+- **Stage 2 — Semantic Rethink (SPECTER2):** A powerful document-level embedding model (SPECTER2) re-evaluates the candidate pairs to refine the rankings.
+- **Stage 3 — Precision Reranking (CrossEncoder):** A deep cross-attention model does a final comparison between your brief and each candidate, selecting the best papers to pass to the next stage.
 
 #### The agent filters by venue (Optional)
 
@@ -1871,8 +1874,7 @@ If you selected a venue filter (e.g. "NeurIPS only" or "All Journals"), the agen
 
 #### 4. The agent judges how relevant each paper is
 
-- In **LLM API mode** (OpenAI, Gemini, or Groq), a model reads each candidate and labels it as primary, secondary, or off topic.
-- In **free local mode**, the agent uses a simple heuristic based on the embedding similarity to mark the most relevant papers as primary and the rest as secondary.
+A CrossEncoder model (`ms-marco-MiniLM-L-6-v2`) scores each candidate against the research brief. Papers scoring ≥ 0.65 are labelled **primary**; ≥ 0.30 are **secondary**; below 0.30 are filtered out. No LLM tokens are used at this step.
 
 #### 5. The agent builds a citation impact set
 
@@ -2085,7 +2087,7 @@ def _main_body():
 
         if provider == "openai":
             st.markdown("### 🤖 OpenAI Settings")
-            api_key = st.text_input("OpenAI API Key", type="password")
+            api_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
             st.caption(
                 "Your API key is used only in memory for this session, is never written to disk, "
                 "and is never shared with anyone or any service other than OpenAI's API. "
@@ -2122,7 +2124,7 @@ def _main_body():
 
         elif provider == "gemini":
             st.markdown("### 🌌 Gemini Settings")
-            api_key = st.text_input("Gemini API Key", type="password")
+            api_key = st.text_input("Gemini API Key", type="password", value=os.getenv("GEMINI_API_KEY", ""))
             st.caption(
                 "Use an API key from Google AI Studio or Vertex AI for the Gemini API. "
                 "The key is kept only in memory for this session and is never written to disk."
@@ -2155,7 +2157,7 @@ def _main_body():
 
         elif provider == "groq":
             st.markdown("### ⚡ Groq Settings")
-            api_key = st.text_input("Groq API Key (Optional)", type="password")
+            api_key = st.text_input("Groq API Key (Optional)", type="password", value=os.getenv("GROQ_API_KEY", ""))
             st.caption(
                 "Groq API keys are free. No credit card needed. Get yours at [https://console.groq.com](https://console.groq.com). "
                 "If omitted, the classification will still run using CrossEncoder, but the narrative score will fallback to a default."
@@ -2163,7 +2165,10 @@ def _main_body():
 
             groq_models = [
                 "llama-3.3-70b-versatile",
+                "llama-3.1-70b-versatile",
                 "llama-3.1-8b-instant",
+                "qwen-qwq-32b",
+                "gemma2-9b-it",
             ]
 
             model_choice = st.selectbox(
@@ -2290,9 +2295,9 @@ def _main_body():
                 st.warning("Your Gemini API key and model name are required to run in Gemini mode.")
                 return
     elif provider == "groq":
-        if not api_key or not model_name:
+        if not model_name:
             if "ranked_papers" not in st.session_state:
-                st.warning("Your Groq API key and model name are required to run in Groq mode.")
+                st.warning("Your Groq model name is required to run in Groq mode.")
                 return
     else:
         api_key = api_key or ""
@@ -2304,6 +2309,8 @@ def _main_body():
         api_base=api_base,
         provider=provider,
     )
+    
+    active_llm_config = (llm_config if api_key.strip() else None) if provider in ("openai", "gemini", "groq") else None
 
     try:
         current_start, current_end = get_date_range(date_option)
@@ -2443,7 +2450,7 @@ def _main_body():
                 candidates = select_embedding_candidates(
                     current_papers,
                     query_brief=query_brief,
-                    llm_config=llm_config if provider in ("openai", "gemini", "groq") else None,
+                    llm_config=active_llm_config,
                     embedding_model=embedding_model_name,
                     provider=provider,
                     max_candidates=150,
@@ -2681,7 +2688,7 @@ These scores are heuristic and should be used as a guide for exploration rather 
             with st.spinner("Calling LLM API to compute citation impact scores for selected papers..."):
                 papers_with_pred = predict_citations_direct(
                     target_papers=selected_papers,
-                    llm_config=llm_config,
+                    llm_config=active_llm_config,
                 )
         else:
             with st.spinner("Computing heuristic citation impact scores from relevance signals..."):

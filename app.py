@@ -769,40 +769,195 @@ def load_bm25_index():
         print(f"Failed to load BM25 index: {e}")
         return None, None
 
-def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: dict, n1: int = 600) -> List[Paper]:
+
+# =========================
+# Task 33 — RRF Hybrid Retrieval helpers
+# =========================
+
+def _bm25_ranked_pool(
+    papers: List[Paper],
+    query_brief: str,
+    retriever,
+    arxiv_to_pos: dict,
+    top_k: int = 400,
+) -> Dict[str, int]:
+    """
+    Run BM25 retrieval on `papers` using `query_brief`.
+    Returns a dict mapping arxiv_id → 1-indexed BM25 rank for the top-K results.
+    Papers not in the BM25 top-K are absent from the dict.
+    """
     if not retriever or not papers:
-        return papers
-    # Build dictionary for O(1) fetch
-    paper_dict = {p.arxiv_id: p for p in papers}
-    
+        return {}
+
+    pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
+    paper_ids = {p.arxiv_id for p in papers}
+
     tokens = bm25s.tokenize([query_brief])
     try:
-        res, scores = retriever.retrieve(tokens, k=n1)
+        res, _scores = retriever.retrieve(tokens, k=min(top_k, len(arxiv_to_pos)))
+    except Exception as exc:
+        print(f"[BM25] retrieve error: {exc}")
+        return {}
+
+    ranked: Dict[str, int] = {}
+    rank = 1
+    for pos in res[0]:
+        arxiv_id = pos_to_arxiv.get(int(pos))
+        if arxiv_id and arxiv_id in paper_ids and arxiv_id not in ranked:
+            ranked[arxiv_id] = rank
+            rank += 1
+            if rank > top_k:
+                break
+    return ranked
+
+
+def _faiss_ranked_pool(
+    papers: List[Paper],
+    query_brief: str,
+    embeddings: Optional[np.ndarray],
+    arxiv_to_pos: dict,
+    top_k: int = 400,
+) -> Dict[str, int]:
+    """
+    Run MiniLM cosine retrieval on `papers` using precomputed `embeddings`.
+    Returns a dict mapping arxiv_id → 1-indexed FAISS/cosine rank for the top-K results.
+    Falls back to runtime embedding if precomputed embeddings are unavailable.
+    Papers not in the FAISS top-K are absent from the dict.
+    """
+    if not papers:
+        return {}
+
+    try:
+        model = get_local_embed_model()
+        q_vec = model.encode([query_brief], normalize_embeddings=True)[0]  # shape (D,)
+    except Exception as exc:
+        print(f"[FAISS] query embed error: {exc}")
+        return {}
+
+    if embeddings is not None and arxiv_to_pos:
+        # Fast path: precomputed embeddings matrix
+        scores_list = []
+        for p in papers:
+            pos = arxiv_to_pos.get(p.arxiv_id)
+            if pos is not None and pos < embeddings.shape[0]:
+                sim = float(np.dot(embeddings[pos], q_vec))
+            else:
+                sim = -1.0  # Unseen paper gets lowest priority
+            scores_list.append((p.arxiv_id, sim))
+    else:
+        # Slow path: encode paper texts at runtime
+        texts = [p.title + "\n\n" + p.abstract[:512] for p in papers]
+        try:
+            vecs = model.encode(texts, normalize_embeddings=True, batch_size=64)
+        except Exception as exc:
+            print(f"[FAISS] batch embed error: {exc}")
+            return {}
+        scores_list = [(p.arxiv_id, float(np.dot(vecs[i], q_vec))) for i, p in enumerate(papers)]
+
+    scores_list.sort(key=lambda x: x[1], reverse=True)
+    ranked: Dict[str, int] = {}
+    for rank, (arxiv_id, _sim) in enumerate(scores_list[:top_k], start=1):
+        ranked[arxiv_id] = rank
+    return ranked
+
+
+# RRF constant (standard value from Cormack et al. 2009)
+_RRF_K: int = 60
+
+
+def rrf_merge(
+    papers: List[Paper],
+    bm25_ranks: Dict[str, int],
+    faiss_ranks: Dict[str, int],
+    rrf_weight_bm25: float = 1.0,
+    rrf_weight_faiss: float = 1.0,
+    top_n: int = 600,
+) -> List[Paper]:
+    """
+    Reciprocal Rank Fusion merge of BM25 and FAISS ranked pools.
+
+    For each paper found by at least one retriever:
+      rrf_score = w_bm25 / (k + bm25_rank) + w_faiss / (k + faiss_rank)
+
+    Papers absent from a retriever receive rank = pool_size + 1 for that retriever.
+    Populates p.bm25_rank, p.faiss_rank, p.rrf_score, p.retrieval_source.
+    Returns top_n papers sorted by rrf_score descending.
+    """
+    n_bm25 = len(bm25_ranks)
+    n_faiss = len(faiss_ranks)
+    # Sentinel rank for papers missing from a retriever
+    missing_bm25_rank = n_bm25 + 1
+    missing_faiss_rank = n_faiss + 1
+
+    paper_dict = {p.arxiv_id: p for p in papers}
+    # Union of all paper IDs seen by at least one retriever
+    union_ids = set(bm25_ranks.keys()) | set(faiss_ranks.keys())
+
+    if not union_ids:
+        return []
+
+    scored: List[tuple] = []
+    for arxiv_id in union_ids:
+        p = paper_dict.get(arxiv_id)
+        if p is None:
+            continue  # Not in the current input pool (shouldn't happen, but guard)
+
+        br = bm25_ranks.get(arxiv_id)
+        fr = faiss_ranks.get(arxiv_id)
+
+        rrf = (
+            rrf_weight_bm25 / (_RRF_K + (br if br is not None else missing_bm25_rank))
+            + rrf_weight_faiss / (_RRF_K + (fr if fr is not None else missing_faiss_rank))
+        )
+
+        # Determine retrieval source
+        if br is not None and fr is not None:
+            src = "both"
+        elif br is not None:
+            src = "bm25_only"
+        else:
+            src = "faiss_only"
+
+        # Populate Task 37 provenance fields
+        p.bm25_rank = br
+        p.faiss_rank = fr
+        p.rrf_score = rrf
+        p.retrieval_source = src
+
+        scored.append((rrf, p))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored[:top_n]]
+
+
+def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: dict, n1: int = 600) -> List[Paper]:
+    """
+    Legacy BM25-only recall (kept for backward compat / eval harness).
+    For new code, use _bm25_ranked_pool + rrf_merge instead.
+    """
+    if not retriever or not papers:
+        return papers
+    paper_dict = {p.arxiv_id: p for p in papers}
+    tokens = bm25s.tokenize([query_brief])
+    try:
+        res, _scores = retriever.retrieve(tokens, k=n1)
     except Exception as e:
         print(f"BM25 retrieve error: {e}")
         return papers
-    
-    positions = res[0]
-    
-    # Needs id_map inverted to map position back to arxiv_id. 
-    # But wait, we inverted the id_map to arxiv_to_pos. So we need pos_to_arxiv.
-    # Let's recreate pos_to_arxiv locally
     pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
-    
     recalled_papers = []
     seen = set()
-    for pos in positions:
+    for pos in res[0]:
         pos_int = int(pos)
         arxiv_id = pos_to_arxiv.get(pos_int)
         if arxiv_id and arxiv_id in paper_dict and arxiv_id not in seen:
             recalled_papers.append(paper_dict[arxiv_id])
             seen.add(arxiv_id)
-            
     if len(recalled_papers) < 50:
-        st.info("BM25 recall found fewer than 50 intersecting papers. Skiping strict BM25 pruning.")
+        st.info("BM25 recall found fewer than 50 intersecting papers. Skipping strict BM25 pruning.")
         return papers
-    
     return recalled_papers
+
 
 @st.cache_resource(show_spinner=False)
 def load_precomputed_embeddings():
@@ -903,39 +1058,115 @@ def select_embedding_candidates(
     max_candidates: int = 150,
 ) -> List[Paper]:
     """
-    3-Stage Hybrid Search:
-    Stage 1: BM25 Lexical Recall (narrow down to Top 600)
-    Stage 2: MiniLM Vector Lookup (narrow down to Top 300)
-    Stage 3: CrossEncoder Precision Rerank (narrow down to Top 150)
+    3-Stage Hybrid Search (Task 33: Stage 1 upgraded to RRF parallel retrieval):
+
+    Stage 1 (RRF):  Parallel BM25 + FAISS/MiniLM → Reciprocal Rank Fusion → top-600
+    Stage 2 (MiniLM vector rerank): top-600 → top-300 by cosine similarity
+    Stage 3 (CrossEncoder precision): top-300 → top-150 by cross-attention score
+
+    Fallback modes (graceful degradation):
+    - BM25 missing  → FAISS-only (rrf_weight_bm25=0, all papers retrieval_source="faiss_only")
+    - FAISS missing → BM25-only  (rrf_weight_faiss=0, all papers retrieval_source="bm25_only")
+    - Both missing  → full input pool (legacy path, no provenance tags)
     """
-    if not papers: return []
-    
+    if not papers:
+        return []
+
     st.write(f"Starting 3-stage hybrid search from {len(papers)} SQLite candidates...")
 
-    # Load artifacts
+    # ─── Load shared artifacts ──────────────────────────────────────────────
     bm25_retriever, arxiv_to_pos = load_bm25_index()
     embeddings = load_precomputed_embeddings()
 
-    # Stage 1: BM25 Recall
-    if bm25_retriever and arxiv_to_pos:
-        st.write("⏱ Stage 1: BM25 lexical recall...")
-        stage1_papers = bm25_recall(papers, query_brief, bm25_retriever, arxiv_to_pos, n1=600)
-        st.write(f"✅ BM25 selected {len(stage1_papers)} candidates.")
+    have_bm25 = bool(bm25_retriever and arxiv_to_pos)
+    have_faiss = embeddings is not None  # Use numpy matrix as the FAISS stand-in
+
+    # ─── Stage 1: Parallel BM25 + FAISS → RRF ────────────────────────────
+    st.write("⏱ Stage 1: Parallel BM25 + FAISS → RRF merge...")
+
+    if have_bm25 and have_faiss:
+        # ━━━ Full RRF path ━━━
+        bm25_ranks = _bm25_ranked_pool(
+            papers, query_brief, bm25_retriever, arxiv_to_pos, top_k=400
+        )
+        faiss_ranks = _faiss_ranked_pool(
+            papers, query_brief, embeddings, arxiv_to_pos, top_k=400
+        )
+        stage1_papers = rrf_merge(
+            papers,
+            bm25_ranks=bm25_ranks,
+            faiss_ranks=faiss_ranks,
+            rrf_weight_bm25=1.0,
+            rrf_weight_faiss=1.0,
+            top_n=600,
+        )
+        n_both = sum(1 for p in stage1_papers if p.retrieval_source == "both")
+        n_bm25_only = sum(1 for p in stage1_papers if p.retrieval_source == "bm25_only")
+        n_faiss_only = sum(1 for p in stage1_papers if p.retrieval_source == "faiss_only")
+        st.write(
+            f"✅ RRF Stage 1: {len(stage1_papers)} candidates — "
+            f"🔵 {n_both} both · 🟠 {n_bm25_only} BM25-only · 🟣 {n_faiss_only} FAISS-only"
+        )
+
+    elif have_bm25 and not have_faiss:
+        # ━━━ BM25-only fallback ━━━
+        st.warning("⚠️ FAISS embeddings not available — running BM25-only Stage 1 (no RRF merge).")
+        bm25_ranks = _bm25_ranked_pool(
+            papers, query_brief, bm25_retriever, arxiv_to_pos, top_k=600
+        )
+        stage1_papers = rrf_merge(
+            papers,
+            bm25_ranks=bm25_ranks,
+            faiss_ranks={},
+            rrf_weight_bm25=1.0,
+            rrf_weight_faiss=0.0,
+            top_n=600,
+        )
+        if len(stage1_papers) < 50:
+            st.info("BM25 Stage 1 returned fewer than 50 papers — using full pool.")
+            stage1_papers = papers
+        else:
+            st.write(f"✅ BM25-only Stage 1: {len(stage1_papers)} candidates.")
+
+    elif not have_bm25 and have_faiss:
+        # ━━━ FAISS-only fallback ━━━
+        st.warning("⚠️ BM25 index not available — running FAISS-only Stage 1 (no RRF merge).")
+        faiss_ranks = _faiss_ranked_pool(
+            papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, top_k=600
+        )
+        stage1_papers = rrf_merge(
+            papers,
+            bm25_ranks={},
+            faiss_ranks=faiss_ranks,
+            rrf_weight_bm25=0.0,
+            rrf_weight_faiss=1.0,
+            top_n=600,
+        )
+        st.write(f"✅ FAISS-only Stage 1: {len(stage1_papers)} candidates.")
+
     else:
-        st.warning("BM25 index not found. Skipping Stage 1.")
+        # ━━━ Legacy fallback: both missing ━━━
+        st.warning("⚠️ Neither BM25 nor FAISS index is available — using full pool as Stage 1 fallback.")
         stage1_papers = papers
 
-    # Stage 2: MiniLM Semantic Filter
+    # ─── Stage 2: MiniLM Semantic Filter ────────────────────────────────
     st.write("⏱ Stage 2: MiniLM vector semantic filter...")
-    stage2_papers = minilm_vector_rerank(stage1_papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, n2=300)
+    stage2_papers = minilm_vector_rerank(
+        stage1_papers,
+        query_brief,
+        embeddings,
+        arxiv_to_pos if arxiv_to_pos else {},
+        n2=300,
+    )
     st.write(f"✅ Vector reranking selected {len(stage2_papers)} candidates.")
-    
-    # Stage 3: CrossEncoder Precision Rerank
+
+    # ─── Stage 3: CrossEncoder Precision Rerank ───────────────────────
     st.write("⏱ Stage 3: Cross-Encoder precision reranking...")
     stage3_papers = cross_encoder_rerank(stage2_papers, query_brief, n3=max_candidates)
     st.write(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
 
     return stage3_papers
+
 
 
 # =========================

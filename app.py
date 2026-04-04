@@ -971,6 +971,126 @@ def load_precomputed_embeddings():
         print(f"Failed to load precomputed embeddings: {e}")
         return None
 
+# =========================
+# Task 34 — SPECTER2 adhoc_query Stage 2 adapter
+# =========================
+
+@st.cache_resource(show_spinner=False)
+def get_specter2_model():
+    """
+    Load SPECTER2 base + adhoc_query adapter for asymmetric scientific retrieval.
+
+    Query side  → adhoc_query adapter (short free-text query)
+    Paper side  → encode as: title + [SEP] + abstract  (handled in specter2_vector_rerank)
+
+    Returns (model, tokenizer) on success, (None, None) on any failure so the
+    caller can fall back to the MiniLM pre-computed embedding path.
+    """
+    try:
+        from adapters import AutoAdapterModel
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
+        model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
+        # Load and activate the adhoc_query adapter for query-to-paper retrieval
+        model.load_adapter(
+            "allenai/specter2_adhoc_query",
+            source="hf",
+            load_as="specter2_adhoc_query",
+            set_active=True,
+        )
+        model.eval()
+        return model, tokenizer
+    except ImportError:
+        print("[SPECTER2] 'adapters' library not installed — falling back to MiniLM Stage 2.")
+        return None, None
+    except Exception as e:
+        print(f"[SPECTER2] load error: {e} — falling back to MiniLM Stage 2.")
+        return None, None
+
+
+def specter2_vector_rerank(
+    papers: List[Paper],
+    query_brief: str,
+    n2: int = 300,
+) -> List[Paper]:
+    """
+    Stage 2 reranker using SPECTER2 adhoc_query adapter.
+
+    Encoding protocol (official SPECTER2 asymmetric format):
+      - Query : query_brief  (encode with adhoc_query adapter)
+      - Paper : title + tokenizer.sep_token + abstract  (encode with adhoc_query adapter;
+                the proximity adapter would be ideal for papers but requires loading a second
+                adapter—using adhoc_query for both keeps a single adapter loaded and is
+                still considerably better than MiniLM for scientific text retrieval)
+
+    Sets p.semantic_relevance on each paper.
+    Fallback: if SPECTER2 unavailable, returns [] so the caller uses MiniLM.
+    """
+    if not papers:
+        return []
+
+    model, tokenizer = get_specter2_model()
+    if model is None or tokenizer is None:
+        return []   # Caller should detect and fall back to minilm_vector_rerank
+
+    import torch
+
+    def _encode_batch(texts: List[str], batch_size: int = 32) -> "np.ndarray":
+        all_vecs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+                max_length=512,
+                return_token_type_ids=False,
+            )
+            with torch.no_grad():
+                output = model(**inputs)
+            # [CLS] token = index 0 of last_hidden_state
+            vecs = output.last_hidden_state[:, 0, :].cpu().numpy()
+            all_vecs.append(vecs)
+        return np.vstack(all_vecs)
+
+    try:
+        # Encode query (adhoc_query adapter is already set active)
+        q_vecs = _encode_batch([query_brief])
+        q_vec = q_vecs[0]
+        q_norm = np.linalg.norm(q_vec)
+        if q_norm > 0:
+            q_vec = q_vec / q_norm
+
+        # Encode papers: title + sep + abstract (SPECTER2 paper-side format)
+        sep = tokenizer.sep_token or " "
+        paper_texts = [
+            p.title + sep + (p.abstract[:300] if p.abstract else "")
+            for p in papers
+        ]
+        p_vecs = _encode_batch(paper_texts)
+        # Normalise for cosine similarity via dot product
+        norms = np.linalg.norm(p_vecs, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        p_vecs = p_vecs / norms
+
+        similarities = p_vecs @ q_vec   # shape (N,)
+
+        scored = []
+        for p, sim in zip(papers, similarities):
+            p.semantic_relevance = float(sim)
+            scored.append((float(sim), p))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        k = min(n2, len(scored))
+        return [p for _, p in scored[:k]]
+
+    except Exception as e:
+        print(f"[SPECTER2] rerank inference error: {e} — caller will use MiniLM fallback.")
+        return []
+
+
 def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Optional[np.ndarray], arxiv_to_pos: dict, n2: int = 300) -> List[Paper]:
     if not papers: return []
     if embeddings is None or not arxiv_to_pos:
@@ -1149,24 +1269,94 @@ def select_embedding_candidates(
         st.warning("⚠️ Neither BM25 nor FAISS index is available — using full pool as Stage 1 fallback.")
         stage1_papers = papers
 
-    # ─── Stage 2: MiniLM Semantic Filter ────────────────────────────────
-    st.write("⏱ Stage 2: MiniLM vector semantic filter...")
-    stage2_papers = minilm_vector_rerank(
-        stage1_papers,
-        query_brief,
-        embeddings,
-        arxiv_to_pos if arxiv_to_pos else {},
-        n2=300,
-    )
-    st.write(f"✅ Vector reranking selected {len(stage2_papers)} candidates.")
+    # ─── Stage 2: SPECTER2 adhoc_query → MiniLM fallback ─────────────────
+    st.write("⏱ Stage 2: SPECTER2 semantic reranking (falls back to MiniLM if unavailable)...")
+    stage2_papers = specter2_vector_rerank(stage1_papers, query_brief, n2=300)
+    if stage2_papers:
+        st.write(
+            f"✅ SPECTER2 Stage 2: {len(stage2_papers)} candidates selected "
+            f"(scientific asymmetric retrieval)."
+        )
+    else:
+        # SPECTER2 not available or failed — use MiniLM pre-computed embeddings
+        st.write("⚠️ SPECTER2 unavailable — using MiniLM pre-computed embeddings for Stage 2.")
+        stage2_papers = minilm_vector_rerank(
+            stage1_papers,
+            query_brief,
+            embeddings,
+            arxiv_to_pos if arxiv_to_pos else {},
+            n2=300,
+        )
+        st.write(f"✅ MiniLM Stage 2 fallback: {len(stage2_papers)} candidates selected.")
+
 
     # ─── Stage 3: CrossEncoder Precision Rerank ───────────────────────
     st.write("⏱ Stage 3: Cross-Encoder precision reranking...")
     stage3_papers = cross_encoder_rerank(stage2_papers, query_brief, n3=max_candidates)
     st.write(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
 
+    # ─── Stage 4: Abstract Highlights Extraction ──────────────────────
+    st.write("⏱ Stage 4: Extracting sentence-level abstract highlights...")
+    stage3_papers = extract_abstract_highlights(stage3_papers, query_brief)
+
     return stage3_papers
 
+
+# =========================
+# Task 36 — Stage 4 Abstract Highlights
+# =========================
+
+def extract_abstract_highlights(papers: List[Paper], query_brief: str) -> List[Paper]:
+    """
+    Splits paper abstracts into sentences, scores them against the query_brief
+    using the lightweight local MiniLM embedding model, and sets p.semantic_reason
+    to the top-2 most relevant sentences. This provides auditability and explains
+    why the paper matched the semantic intent.
+    """
+    if not papers: 
+        return papers
+
+    try:
+        model = get_local_embed_model()
+        q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
+    except Exception as e:
+        print(f"Failed to load embed model for abstract highlights: {e}")
+        return papers
+
+    import re
+    # re.split to split on sentence boundaries
+    sent_regex = re.compile(r'(?<=[.!?])\s+')
+
+    for p in papers:
+        if not p.abstract:
+            continue
+        
+        sentences = [s.strip() for s in sent_regex.split(p.abstract) if len(s.strip()) >= 15]
+        if not sentences:
+            p.semantic_reason = "No extractable sentences found in abstract."
+            continue
+        
+        try:
+            s_vecs = model.encode(sentences, normalize_embeddings=True)
+            # Dot product works because vectors are normalized
+            scores = [float(np.dot(vec, q_vec)) for vec in s_vecs]
+            
+            # Sort sentences by score descending
+            scored_sentences = sorted(zip(scores, sentences), key=lambda x: x[0], reverse=True)
+            
+            # Take top 2
+            top_sents = [s for _, s in scored_sentences[:2]]
+            
+            if len(top_sents) == 1:
+                p.semantic_reason = f"Matched: '{top_sents[0][:120]}...'"
+            else:
+                p.semantic_reason = f"Matched: '{top_sents[0][:120]}...' | '{top_sents[1][:120]}...'"
+                
+        except Exception as e:
+            print(f"Highlight extraction error for {p.arxiv_id}: {e}")
+            pass
+
+    return papers
 
 
 # =========================

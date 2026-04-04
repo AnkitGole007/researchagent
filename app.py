@@ -60,6 +60,17 @@ DEFAULT_MONEYBALL_WEIGHTS = {
     "weight_utility": 0.16
 }
 
+# =========================
+# SciBERT Split — Classification thresholds (Task 41)
+# Tuned against eval harness (Task 39); adjust if Recall@primary drops below 0.85.
+# CrossEncoder sigmoid score ∈ [0, 1]:
+#   >= PRIMARY_THRESHOLD   → focus_label = "primary"
+#   >= SECONDARY_THRESHOLD → focus_label = "secondary"
+#   <  SECONDARY_THRESHOLD → focus_label = "off-topic"
+# =========================
+PRIMARY_THRESHOLD: float = 0.65
+SECONDARY_THRESHOLD: float = 0.30
+
 
 
 # =========================
@@ -92,6 +103,11 @@ class Paper:
     llm_relevance_score: Optional[float] = None
     venue: Optional[str] = None
     source: Optional[str] = None
+    # ── Task 37: Retrieval provenance (populated by Task 33 RRF hybrid Stage 1) ──
+    retrieval_source: Optional[str] = None   # "bm25_only" | "faiss_only" | "both"
+    bm25_rank: Optional[int] = None          # BM25 rank within top-K BM25 pool (1-indexed)
+    faiss_rank: Optional[int] = None         # FAISS rank within top-K FAISS pool (1-indexed)
+    rrf_score: Optional[float] = None        # Reciprocal Rank Fusion merged score
 
 
 # =========================
@@ -2050,6 +2066,20 @@ def _main_body():
                 st.write("**Why this paper is (or is not) relevant to your brief:**")
                 st.write(p.semantic_reason)
             st.write(f"**Embedding similarity score:** {sim_str}")
+            # ── Task 37: Retrieval provenance (visible when Task 33 RRF is active) ──
+            if p.retrieval_source is not None:
+                src_label = {
+                    "both": "🔵 BM25 + FAISS (both)",
+                    "bm25_only": "🟠 BM25 only",
+                    "faiss_only": "🟣 FAISS only",
+                }.get(p.retrieval_source, p.retrieval_source)
+                rrf_str = f"{p.rrf_score:.4f}" if p.rrf_score is not None else "N/A"
+                bm25_str = f"#{p.bm25_rank}" if p.bm25_rank is not None else "—"
+                faiss_str = f"#{p.faiss_rank}" if p.faiss_rank is not None else "—"
+                st.caption(
+                    f"📡 Retrieval: {src_label} · RRF score: {rrf_str} · "
+                    f"BM25 rank: {bm25_str} · FAISS rank: {faiss_str}"
+                )
             st.write("**Abstract:**")
             st.write(p.abstract)
 
@@ -2275,6 +2305,21 @@ These scores are heuristic and should be used as a guide for exploration rather 
         if p.semantic_reason:
             st.write("**Why this paper matches your brief:**")
             st.write(p.semantic_reason)
+
+        # ── Task 37: Retrieval provenance (visible when Task 33 RRF is active) ──
+        if p.retrieval_source is not None:
+            src_label = {
+                "both": "🔵 BM25 + FAISS (both)",
+                "bm25_only": "🟠 BM25 only",
+                "faiss_only": "🟣 FAISS only",
+            }.get(p.retrieval_source, p.retrieval_source)
+            rrf_str = f"{p.rrf_score:.4f}" if p.rrf_score is not None else "N/A"
+            bm25_str = f"#{p.bm25_rank}" if p.bm25_rank is not None else "—"
+            faiss_str = f"#{p.faiss_rank}" if p.faiss_rank is not None else "—"
+            st.caption(
+                f"📡 Retrieval: {src_label} · RRF score: {rrf_str} · "
+                f"BM25 rank: {bm25_str} · FAISS rank: {faiss_str}"
+            )
 
         st.write("**Abstract:**")
         st.write(p.abstract)

@@ -822,6 +822,7 @@ def _faiss_ranked_pool(
     embeddings: Optional[np.ndarray],
     arxiv_to_pos: dict,
     top_k: int = 400,
+    q_vec: Optional[np.ndarray] = None,
 ) -> Dict[str, int]:
     """
     Run MiniLM cosine retrieval on `papers` using precomputed `embeddings`.
@@ -832,12 +833,13 @@ def _faiss_ranked_pool(
     if not papers:
         return {}
 
-    try:
-        model = get_local_embed_model()
-        q_vec = model.encode([query_brief], normalize_embeddings=True)[0]  # shape (D,)
-    except Exception as exc:
-        print(f"[FAISS] query embed error: {exc}")
-        return {}
+    if q_vec is None:
+        try:
+            model = get_local_embed_model()
+            q_vec = model.encode([query_brief], normalize_embeddings=True)[0]  # shape (D,)
+        except Exception as exc:
+            print(f"[FAISS] query embed error: {exc}")
+            return {}
 
     if embeddings is not None and arxiv_to_pos:
         # Fast path: precomputed embeddings matrix
@@ -1174,6 +1176,34 @@ def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -
         return papers[:n3]
 
 
+def _hyde_enrich_query(query_brief: str, llm_config: Optional[LLMConfig]) -> np.ndarray:
+    """
+    Task 35: HyDE Stage 0 query enrichment. 
+    Averages original query_brief vector with a LLM-generated hypothetical abstract vector.
+    """
+    model = get_local_embed_model()
+    brief_vec = model.encode([query_brief], normalize_embeddings=True)[0]
+    
+    if not llm_config:
+        return brief_vec
+
+    prompt = (
+        f"Write a concise 100-word paper abstract (not a question) that would be highly relevant to "
+        f"this research brief. Use academic technical language. Brief: {query_brief}"
+    )
+    
+    try:
+        raw_hypothetical = call_llm(prompt, llm_config, label="hyde")
+        if raw_hypothetical:
+            st.write(f"**⚡ HyDE Generated Abstract:**\n\n> {raw_hypothetical.strip()}")
+            hypothetical_vec = model.encode([raw_hypothetical], normalize_embeddings=True)[0]
+            enriched_vec = (brief_vec + hypothetical_vec) / 2
+            return enriched_vec / np.linalg.norm(enriched_vec)
+    except Exception as e:
+        print(f"HyDE error: {e}")
+        
+    return brief_vec
+
 def select_embedding_candidates(
     papers: List[Paper],
     query_brief: str,
@@ -1181,6 +1211,7 @@ def select_embedding_candidates(
     embedding_model: str = "",
     provider: str = "",
     max_candidates: int = 150,
+    use_hyde: bool = False,
 ) -> List[Paper]:
     """
     3-Stage Hybrid Search (Task 33: Stage 1 upgraded to RRF parallel retrieval):
@@ -1206,6 +1237,12 @@ def select_embedding_candidates(
     have_bm25 = bool(bm25_retriever and arxiv_to_pos)
     have_faiss = embeddings is not None  # Use numpy matrix as the FAISS stand-in
 
+    # ─── Stage 0: HyDE optional enrichment ───────────────────────────────────
+    q_vec = None
+    if use_hyde and llm_config:
+        st.write("⏱ Stage 0: HyDE AI query enrichment...")
+        q_vec = _hyde_enrich_query(query_brief, llm_config)
+
     # ─── Stage 1: Parallel BM25 + FAISS → RRF ────────────────────────────
     st.write("⏱ Stage 1: Parallel BM25 + FAISS → RRF merge...")
 
@@ -1215,7 +1252,7 @@ def select_embedding_candidates(
             papers, query_brief, bm25_retriever, arxiv_to_pos, top_k=400
         )
         faiss_ranks = _faiss_ranked_pool(
-            papers, query_brief, embeddings, arxiv_to_pos, top_k=400
+            papers, query_brief, embeddings, arxiv_to_pos, top_k=400, q_vec=q_vec
         )
         stage1_papers = rrf_merge(
             papers,
@@ -1257,7 +1294,7 @@ def select_embedding_candidates(
         # ━━━ FAISS-only fallback ━━━
         st.warning("⚠️ BM25 index not available — running FAISS-only Stage 1 (no RRF merge).")
         faiss_ranks = _faiss_ranked_pool(
-            papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, top_k=600
+            papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, top_k=600, q_vec=q_vec
         )
         stage1_papers = rrf_merge(
             papers,
@@ -2155,6 +2192,17 @@ def _main_body():
                 "Classification and citation impact scoring use simple heuristics. No API key or external calls."
             )
 
+        # ─── Task 35: HyDE UI Toggle ───
+        use_hyde = False
+        if provider in ("openai", "gemini", "groq") and api_key.strip():
+            brief_word_count = len(research_brief.split())
+            if 0 < brief_word_count < 30:
+                use_hyde = st.checkbox(
+                    "⚡ Expand query with AI (HyDE)", 
+                    value=False,
+                    help="Generates a hypothetical paper abstract to improve recall for short or informal queries. May reduce precision for very specific queries."
+                )
+
         run_clicked = st.button("🚀 Run Pipeline")
 
     if run_clicked:
@@ -2399,6 +2447,7 @@ def _main_body():
                     embedding_model=embedding_model_name,
                     provider=provider,
                     max_candidates=150,
+                    use_hyde=use_hyde,
                 )
             if not candidates:
                 st.warning("Embedding stage returned no candidates. Using all fetched papers as fallback.")

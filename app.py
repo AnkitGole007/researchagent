@@ -1,4 +1,9 @@
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import json
 import time
 import textwrap
@@ -60,6 +65,17 @@ DEFAULT_MONEYBALL_WEIGHTS = {
     "weight_utility": 0.16
 }
 
+# =========================
+# SciBERT Split — Classification thresholds (Task 41)
+# Tuned against eval harness (Task 39); adjust if Recall@primary drops below 0.85.
+# CrossEncoder sigmoid score ∈ [0, 1]:
+#   >= PRIMARY_THRESHOLD   → focus_label = "primary"
+#   >= SECONDARY_THRESHOLD → focus_label = "secondary"
+#   <  SECONDARY_THRESHOLD → focus_label = "off-topic"
+# =========================
+PRIMARY_THRESHOLD: float = 0.65
+SECONDARY_THRESHOLD: float = 0.30
+
 
 
 # =========================
@@ -92,6 +108,16 @@ class Paper:
     llm_relevance_score: Optional[float] = None
     venue: Optional[str] = None
     source: Optional[str] = None
+    # ── Task 37: Retrieval provenance (populated by Task 33 RRF hybrid Stage 1) ──
+    retrieval_source: Optional[str] = None   # "bm25_only" | "faiss_only" | "both"
+    bm25_rank: Optional[int] = None          # BM25 rank within top-K BM25 pool (1-indexed)
+    faiss_rank: Optional[int] = None         # FAISS rank within top-K FAISS pool (1-indexed)
+    rrf_score: Optional[float] = None        # Reciprocal Rank Fusion merged score
+    # ── Task 38: Artifact signal detection and paper type tagging ──
+    has_code: bool = False                   # True if GitHub URL detected in abstract/comments/pdf_url
+    has_dataset: bool = False                # True if dataset/benchmark release mentioned
+    reproducibility_score: int = 0           # 0-3 count of reproducibility signals
+    paper_type_tag: Optional[str] = None     # "New Technique" | "Scale Study" | "New Dataset" | "Survey" | "Evaluation" | "Other"
 
 
 # =========================
@@ -753,40 +779,197 @@ def load_bm25_index():
         print(f"Failed to load BM25 index: {e}")
         return None, None
 
-def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: dict, n1: int = 600) -> List[Paper]:
+
+# =========================
+# Task 33 — RRF Hybrid Retrieval helpers
+# =========================
+
+def _bm25_ranked_pool(
+    papers: List[Paper],
+    query_brief: str,
+    retriever,
+    arxiv_to_pos: dict,
+    top_k: int = 400,
+) -> Dict[str, int]:
+    """
+    Run BM25 retrieval on `papers` using `query_brief`.
+    Returns a dict mapping arxiv_id → 1-indexed BM25 rank for the top-K results.
+    Papers not in the BM25 top-K are absent from the dict.
+    """
     if not retriever or not papers:
-        return papers
-    # Build dictionary for O(1) fetch
-    paper_dict = {p.arxiv_id: p for p in papers}
-    
+        return {}
+
+    pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
+    paper_ids = {p.arxiv_id for p in papers}
+
     tokens = bm25s.tokenize([query_brief])
     try:
-        res, scores = retriever.retrieve(tokens, k=n1)
+        res, _scores = retriever.retrieve(tokens, k=min(top_k, len(arxiv_to_pos)))
+    except Exception as exc:
+        print(f"[BM25] retrieve error: {exc}")
+        return {}
+
+    ranked: Dict[str, int] = {}
+    rank = 1
+    for pos in res[0]:
+        arxiv_id = pos_to_arxiv.get(int(pos))
+        if arxiv_id and arxiv_id in paper_ids and arxiv_id not in ranked:
+            ranked[arxiv_id] = rank
+            rank += 1
+            if rank > top_k:
+                break
+    return ranked
+
+
+def _faiss_ranked_pool(
+    papers: List[Paper],
+    query_brief: str,
+    embeddings: Optional[np.ndarray],
+    arxiv_to_pos: dict,
+    top_k: int = 400,
+    q_vec: Optional[np.ndarray] = None,
+) -> Dict[str, int]:
+    """
+    Run MiniLM cosine retrieval on `papers` using precomputed `embeddings`.
+    Returns a dict mapping arxiv_id → 1-indexed FAISS/cosine rank for the top-K results.
+    Falls back to runtime embedding if precomputed embeddings are unavailable.
+    Papers not in the FAISS top-K are absent from the dict.
+    """
+    if not papers:
+        return {}
+
+    if q_vec is None:
+        try:
+            model = get_local_embed_model()
+            q_vec = model.encode([query_brief], normalize_embeddings=True)[0]  # shape (D,)
+        except Exception as exc:
+            print(f"[FAISS] query embed error: {exc}")
+            return {}
+
+    if embeddings is not None and arxiv_to_pos:
+        # Fast path: precomputed embeddings matrix
+        scores_list = []
+        for p in papers:
+            pos = arxiv_to_pos.get(p.arxiv_id)
+            if pos is not None and pos < embeddings.shape[0]:
+                sim = float(np.dot(embeddings[pos], q_vec))
+            else:
+                sim = -1.0  # Unseen paper gets lowest priority
+            scores_list.append((p.arxiv_id, sim))
+    else:
+        # Slow path: encode paper texts at runtime
+        texts = [p.title + "\n\n" + p.abstract[:512] for p in papers]
+        try:
+            vecs = model.encode(texts, normalize_embeddings=True, batch_size=64)
+        except Exception as exc:
+            print(f"[FAISS] batch embed error: {exc}")
+            return {}
+        scores_list = [(p.arxiv_id, float(np.dot(vecs[i], q_vec))) for i, p in enumerate(papers)]
+
+    scores_list.sort(key=lambda x: x[1], reverse=True)
+    ranked: Dict[str, int] = {}
+    for rank, (arxiv_id, _sim) in enumerate(scores_list[:top_k], start=1):
+        ranked[arxiv_id] = rank
+    return ranked
+
+
+# RRF constant (standard value from Cormack et al. 2009)
+_RRF_K: int = 60
+
+
+def rrf_merge(
+    papers: List[Paper],
+    bm25_ranks: Dict[str, int],
+    faiss_ranks: Dict[str, int],
+    rrf_weight_bm25: float = 1.0,
+    rrf_weight_faiss: float = 1.0,
+    top_n: int = 600,
+) -> List[Paper]:
+    """
+    Reciprocal Rank Fusion merge of BM25 and FAISS ranked pools.
+
+    For each paper found by at least one retriever:
+      rrf_score = w_bm25 / (k + bm25_rank) + w_faiss / (k + faiss_rank)
+
+    Papers absent from a retriever receive rank = pool_size + 1 for that retriever.
+    Populates p.bm25_rank, p.faiss_rank, p.rrf_score, p.retrieval_source.
+    Returns top_n papers sorted by rrf_score descending.
+    """
+    n_bm25 = len(bm25_ranks)
+    n_faiss = len(faiss_ranks)
+    # Sentinel rank for papers missing from a retriever
+    missing_bm25_rank = n_bm25 + 1
+    missing_faiss_rank = n_faiss + 1
+
+    paper_dict = {p.arxiv_id: p for p in papers}
+    # Union of all paper IDs seen by at least one retriever
+    union_ids = set(bm25_ranks.keys()) | set(faiss_ranks.keys())
+
+    if not union_ids:
+        return []
+
+    scored: List[tuple] = []
+    for arxiv_id in union_ids:
+        p = paper_dict.get(arxiv_id)
+        if p is None:
+            continue  # Not in the current input pool (shouldn't happen, but guard)
+
+        br = bm25_ranks.get(arxiv_id)
+        fr = faiss_ranks.get(arxiv_id)
+
+        rrf = (
+            rrf_weight_bm25 / (_RRF_K + (br if br is not None else missing_bm25_rank))
+            + rrf_weight_faiss / (_RRF_K + (fr if fr is not None else missing_faiss_rank))
+        )
+
+        # Determine retrieval source
+        if br is not None and fr is not None:
+            src = "both"
+        elif br is not None:
+            src = "bm25_only"
+        else:
+            src = "faiss_only"
+
+        # Populate Task 37 provenance fields
+        p.bm25_rank = br
+        p.faiss_rank = fr
+        p.rrf_score = rrf
+        p.retrieval_source = src
+
+        scored.append((rrf, p))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored[:top_n]]
+
+
+def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: dict, n1: int = 600) -> List[Paper]:
+    """
+    Legacy BM25-only recall (kept for backward compat / eval harness).
+    For new code, use _bm25_ranked_pool + rrf_merge instead.
+    """
+    if not retriever or not papers:
+        return papers
+    paper_dict = {p.arxiv_id: p for p in papers}
+    tokens = bm25s.tokenize([query_brief])
+    try:
+        res, _scores = retriever.retrieve(tokens, k=n1)
     except Exception as e:
         print(f"BM25 retrieve error: {e}")
         return papers
-    
-    positions = res[0]
-    
-    # Needs id_map inverted to map position back to arxiv_id. 
-    # But wait, we inverted the id_map to arxiv_to_pos. So we need pos_to_arxiv.
-    # Let's recreate pos_to_arxiv locally
     pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
-    
     recalled_papers = []
     seen = set()
-    for pos in positions:
+    for pos in res[0]:
         pos_int = int(pos)
         arxiv_id = pos_to_arxiv.get(pos_int)
         if arxiv_id and arxiv_id in paper_dict and arxiv_id not in seen:
             recalled_papers.append(paper_dict[arxiv_id])
             seen.add(arxiv_id)
-            
     if len(recalled_papers) < 50:
-        st.info("BM25 recall found fewer than 50 intersecting papers. Skiping strict BM25 pruning.")
+        st.info("BM25 recall found fewer than 50 intersecting papers. Skipping strict BM25 pruning.")
         return papers
-    
     return recalled_papers
+
 
 @st.cache_resource(show_spinner=False)
 def load_precomputed_embeddings():
@@ -799,6 +982,126 @@ def load_precomputed_embeddings():
     except Exception as e:
         print(f"Failed to load precomputed embeddings: {e}")
         return None
+
+# =========================
+# Task 34 — SPECTER2 adhoc_query Stage 2 adapter
+# =========================
+
+@st.cache_resource(show_spinner=False)
+def get_specter2_model():
+    """
+    Load SPECTER2 base + adhoc_query adapter for asymmetric scientific retrieval.
+
+    Query side  → adhoc_query adapter (short free-text query)
+    Paper side  → encode as: title + [SEP] + abstract  (handled in specter2_vector_rerank)
+
+    Returns (model, tokenizer) on success, (None, None) on any failure so the
+    caller can fall back to the MiniLM pre-computed embedding path.
+    """
+    try:
+        from adapters import AutoAdapterModel
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
+        model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
+        # Load and activate the adhoc_query adapter for query-to-paper retrieval
+        model.load_adapter(
+            "allenai/specter2_adhoc_query",
+            source="hf",
+            load_as="specter2_adhoc_query",
+            set_active=True,
+        )
+        model.eval()
+        return model, tokenizer
+    except ImportError:
+        print("[SPECTER2] 'adapters' library not installed — falling back to MiniLM Stage 2.")
+        return None, None
+    except Exception as e:
+        print(f"[SPECTER2] load error: {e} — falling back to MiniLM Stage 2.")
+        return None, None
+
+
+def specter2_vector_rerank(
+    papers: List[Paper],
+    query_brief: str,
+    n2: int = 300,
+) -> List[Paper]:
+    """
+    Stage 2 reranker using SPECTER2 adhoc_query adapter.
+
+    Encoding protocol (official SPECTER2 asymmetric format):
+      - Query : query_brief  (encode with adhoc_query adapter)
+      - Paper : title + tokenizer.sep_token + abstract  (encode with adhoc_query adapter;
+                the proximity adapter would be ideal for papers but requires loading a second
+                adapter—using adhoc_query for both keeps a single adapter loaded and is
+                still considerably better than MiniLM for scientific text retrieval)
+
+    Sets p.semantic_relevance on each paper.
+    Fallback: if SPECTER2 unavailable, returns [] so the caller uses MiniLM.
+    """
+    if not papers:
+        return []
+
+    model, tokenizer = get_specter2_model()
+    if model is None or tokenizer is None:
+        return []   # Caller should detect and fall back to minilm_vector_rerank
+
+    import torch
+
+    def _encode_batch(texts: List[str], batch_size: int = 32) -> "np.ndarray":
+        all_vecs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+                max_length=512,
+                return_token_type_ids=False,
+            )
+            with torch.no_grad():
+                output = model(**inputs)
+            # [CLS] token = index 0 of last_hidden_state
+            vecs = output.last_hidden_state[:, 0, :].cpu().numpy()
+            all_vecs.append(vecs)
+        return np.vstack(all_vecs)
+
+    try:
+        # Encode query (adhoc_query adapter is already set active)
+        q_vecs = _encode_batch([query_brief])
+        q_vec = q_vecs[0]
+        q_norm = np.linalg.norm(q_vec)
+        if q_norm > 0:
+            q_vec = q_vec / q_norm
+
+        # Encode papers: title + sep + abstract (SPECTER2 paper-side format)
+        sep = tokenizer.sep_token or " "
+        paper_texts = [
+            p.title + sep + (p.abstract if p.abstract else "")
+            for p in papers
+        ]
+        p_vecs = _encode_batch(paper_texts)
+        # Normalise for cosine similarity via dot product
+        norms = np.linalg.norm(p_vecs, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        p_vecs = p_vecs / norms
+
+        similarities = p_vecs @ q_vec   # shape (N,)
+
+        scored = []
+        for p, sim in zip(papers, similarities):
+            p.semantic_relevance = float(sim)
+            scored.append((float(sim), p))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        k = min(n2, len(scored))
+        return [p for _, p in scored[:k]]
+
+    except Exception as e:
+        print(f"[SPECTER2] rerank inference error: {e} — caller will use MiniLM fallback.")
+        return []
+
 
 def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Optional[np.ndarray], arxiv_to_pos: dict, n2: int = 300) -> List[Paper]:
     if not papers: return []
@@ -878,6 +1181,34 @@ def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -
         return papers[:n3]
 
 
+def _hyde_enrich_query(query_brief: str, llm_config: Optional[LLMConfig]) -> np.ndarray:
+    """
+    Task 35: HyDE Stage 0 query enrichment. 
+    Averages original query_brief vector with a LLM-generated hypothetical abstract vector.
+    """
+    model = get_local_embed_model()
+    brief_vec = model.encode([query_brief], normalize_embeddings=True)[0]
+    
+    if not llm_config:
+        return brief_vec
+
+    prompt = (
+        f"Write a concise 100-word paper abstract (not a question) that would be highly relevant to "
+        f"this research brief. Use academic technical language. Brief: {query_brief}"
+    )
+    
+    try:
+        raw_hypothetical = call_llm(prompt, llm_config, label="hyde")
+        if raw_hypothetical:
+            st.write(f"**⚡ HyDE Generated Abstract:**\n\n> {raw_hypothetical.strip()}")
+            hypothetical_vec = model.encode([raw_hypothetical], normalize_embeddings=True)[0]
+            enriched_vec = (brief_vec + hypothetical_vec) / 2
+            return enriched_vec / np.linalg.norm(enriched_vec)
+    except Exception as e:
+        print(f"HyDE error: {e}")
+        
+    return brief_vec
+
 def select_embedding_candidates(
     papers: List[Paper],
     query_brief: str,
@@ -885,45 +1216,250 @@ def select_embedding_candidates(
     embedding_model: str = "",
     provider: str = "",
     max_candidates: int = 150,
+    use_hyde: bool = False,
 ) -> List[Paper]:
     """
-    3-Stage Hybrid Search:
-    Stage 1: BM25 Lexical Recall (narrow down to Top 600)
-    Stage 2: MiniLM Vector Lookup (narrow down to Top 300)
-    Stage 3: CrossEncoder Precision Rerank (narrow down to Top 150)
+    3-Stage Hybrid Search (Task 33: Stage 1 upgraded to RRF parallel retrieval):
+
+    Stage 1 (RRF):  Parallel BM25 + FAISS/MiniLM → Reciprocal Rank Fusion → top-600
+    Stage 2 (SPECTER2 vector rerank; falls back to MiniLM): top-600 → top-300 by cosine similarity
+    Stage 3 (CrossEncoder precision): top-300 → top-150 by cross-attention score
+
+    Fallback modes (graceful degradation):
+    - BM25 missing  → FAISS-only (rrf_weight_bm25=0, all papers retrieval_source="faiss_only")
+    - FAISS missing → BM25-only  (rrf_weight_faiss=0, all papers retrieval_source="bm25_only")
+    - Both missing  → full input pool (legacy path, no provenance tags)
     """
-    if not papers: return []
-    
+    if not papers:
+        return []
+
     st.write(f"Starting 3-stage hybrid search from {len(papers)} SQLite candidates...")
 
-    # Load artifacts
+    # ─── Load shared artifacts ──────────────────────────────────────────────
     bm25_retriever, arxiv_to_pos = load_bm25_index()
     embeddings = load_precomputed_embeddings()
 
-    # Stage 1: BM25 Recall
-    if bm25_retriever and arxiv_to_pos:
-        st.write("⏱ Stage 1: BM25 lexical recall...")
-        stage1_papers = bm25_recall(papers, query_brief, bm25_retriever, arxiv_to_pos, n1=600)
-        st.write(f"✅ BM25 selected {len(stage1_papers)} candidates.")
+    have_bm25 = bool(bm25_retriever and arxiv_to_pos)
+    have_faiss = embeddings is not None  # Use numpy matrix as the FAISS stand-in
+
+    # ─── Stage 0: HyDE optional enrichment ───────────────────────────────────
+    q_vec = None
+    if use_hyde and llm_config:
+        st.write("⏱ Stage 0: HyDE AI query enrichment...")
+        q_vec = _hyde_enrich_query(query_brief, llm_config)
+
+    # ─── Stage 1: Parallel BM25 + FAISS → RRF ────────────────────────────
+    st.write("⏱ Stage 1: Parallel BM25 + FAISS → RRF merge...")
+
+    if have_bm25 and have_faiss:
+        # ━━━ Full RRF path ━━━
+        bm25_ranks = _bm25_ranked_pool(
+            papers, query_brief, bm25_retriever, arxiv_to_pos, top_k=400
+        )
+        faiss_ranks = _faiss_ranked_pool(
+            papers, query_brief, embeddings, arxiv_to_pos, top_k=400, q_vec=q_vec
+        )
+        stage1_papers = rrf_merge(
+            papers,
+            bm25_ranks=bm25_ranks,
+            faiss_ranks=faiss_ranks,
+            rrf_weight_bm25=1.0,
+            rrf_weight_faiss=1.0,
+            top_n=600,
+        )
+        n_both = sum(1 for p in stage1_papers if p.retrieval_source == "both")
+        n_bm25_only = sum(1 for p in stage1_papers if p.retrieval_source == "bm25_only")
+        n_faiss_only = sum(1 for p in stage1_papers if p.retrieval_source == "faiss_only")
+        st.write(
+            f"✅ RRF Stage 1: {len(stage1_papers)} candidates — "
+            f"🔵 {n_both} both · 🟠 {n_bm25_only} BM25-only · 🟣 {n_faiss_only} FAISS-only"
+        )
+
+    elif have_bm25 and not have_faiss:
+        # ━━━ BM25-only fallback ━━━
+        st.warning("⚠️ FAISS embeddings not available — running BM25-only Stage 1 (no RRF merge).")
+        bm25_ranks = _bm25_ranked_pool(
+            papers, query_brief, bm25_retriever, arxiv_to_pos, top_k=600
+        )
+        stage1_papers = rrf_merge(
+            papers,
+            bm25_ranks=bm25_ranks,
+            faiss_ranks={},
+            rrf_weight_bm25=1.0,
+            rrf_weight_faiss=0.0,
+            top_n=600,
+        )
+        if len(stage1_papers) < 50:
+            st.info("BM25 Stage 1 returned fewer than 50 papers — using full pool.")
+            stage1_papers = papers
+        else:
+            st.write(f"✅ BM25-only Stage 1: {len(stage1_papers)} candidates.")
+
+    elif not have_bm25 and have_faiss:
+        # ━━━ FAISS-only fallback ━━━
+        st.warning("⚠️ BM25 index not available — running FAISS-only Stage 1 (no RRF merge).")
+        faiss_ranks = _faiss_ranked_pool(
+            papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, top_k=600, q_vec=q_vec
+        )
+        stage1_papers = rrf_merge(
+            papers,
+            bm25_ranks={},
+            faiss_ranks=faiss_ranks,
+            rrf_weight_bm25=0.0,
+            rrf_weight_faiss=1.0,
+            top_n=600,
+        )
+        st.write(f"✅ FAISS-only Stage 1: {len(stage1_papers)} candidates.")
+
     else:
-        st.warning("BM25 index not found. Skipping Stage 1.")
+        # ━━━ Legacy fallback: both missing ━━━
+        st.warning("⚠️ Neither BM25 nor FAISS index is available — using full pool as Stage 1 fallback.")
         stage1_papers = papers
 
-    # Stage 2: MiniLM Semantic Filter
-    st.write("⏱ Stage 2: MiniLM vector semantic filter...")
-    stage2_papers = minilm_vector_rerank(stage1_papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, n2=300)
-    st.write(f"✅ Vector reranking selected {len(stage2_papers)} candidates.")
-    
-    # Stage 3: CrossEncoder Precision Rerank
+    # ─── Stage 2: SPECTER2 adhoc_query → MiniLM fallback ─────────────────
+    st.write("⏱ Stage 2: SPECTER2 semantic reranking (falls back to MiniLM if unavailable)...")
+    stage2_papers = specter2_vector_rerank(stage1_papers, query_brief, n2=300)
+    if stage2_papers:
+        st.write(
+            f"✅ SPECTER2 Stage 2: {len(stage2_papers)} candidates selected "
+            f"(scientific asymmetric retrieval)."
+        )
+    else:
+        # SPECTER2 not available or failed — use MiniLM pre-computed embeddings
+        st.write("⚠️ SPECTER2 unavailable — using MiniLM pre-computed embeddings for Stage 2.")
+        stage2_papers = minilm_vector_rerank(
+            stage1_papers,
+            query_brief,
+            embeddings,
+            arxiv_to_pos if arxiv_to_pos else {},
+            n2=300,
+        )
+        st.write(f"✅ MiniLM Stage 2 fallback: {len(stage2_papers)} candidates selected.")
+
+
+    # ─── Stage 3: CrossEncoder Precision Rerank ───────────────────────
     st.write("⏱ Stage 3: Cross-Encoder precision reranking...")
     stage3_papers = cross_encoder_rerank(stage2_papers, query_brief, n3=max_candidates)
     st.write(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
+
+    # ─── Stage 4: Abstract Highlights Extraction ──────────────────────
+    st.write("⏱ Stage 4: Extracting sentence-level abstract highlights...")
+    stage3_papers = extract_abstract_highlights(stage3_papers, query_brief)
+    
+    # ─── Stage 5: Artifact signal detection (Task 38) ─────────────────
+    stage3_papers = enrich_paper_signals(stage3_papers)
 
     return stage3_papers
 
 
 # =========================
-# LLM relevance classification
+# Task 36 — Stage 4 Abstract Highlights
+# =========================
+
+def extract_abstract_highlights(papers: List[Paper], query_brief: str) -> List[Paper]:
+    """
+    Splits paper abstracts into sentences, scores them against the query_brief
+    using the lightweight local MiniLM embedding model, and sets p.semantic_reason
+    to the top-2 most relevant sentences. This provides auditability and explains
+    why the paper matched the semantic intent.
+    """
+    if not papers: 
+        return papers
+
+    try:
+        model = get_local_embed_model()
+        q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
+    except Exception as e:
+        print(f"Failed to load embed model for abstract highlights: {e}")
+        return papers
+
+    import re
+    # re.split to split on sentence boundaries
+    sent_regex = re.compile(r'(?<=[.!?])\s+')
+
+    for p in papers:
+        if not p.abstract:
+            continue
+        
+        sentences = [s.strip() for s in sent_regex.split(p.abstract) if len(s.strip()) >= 15]
+        if not sentences:
+            p.semantic_reason = "No extractable sentences found in abstract."
+            continue
+        
+        try:
+            s_vecs = model.encode(sentences, normalize_embeddings=True)
+            # Dot product works because vectors are normalized
+            scores = [float(np.dot(vec, q_vec)) for vec in s_vecs]
+            
+            # Sort sentences by score descending
+            scored_sentences = sorted(zip(scores, sentences), key=lambda x: x[0], reverse=True)
+            
+            # Take top 2
+            top_sents = [s for _, s in scored_sentences[:2]]
+            
+            if len(top_sents) == 1:
+                p.semantic_reason = f"Matched: '{top_sents[0][:120]}...'"
+            else:
+                p.semantic_reason = f"Matched: '{top_sents[0][:120]}...' | '{top_sents[1][:120]}...'"
+                
+        except Exception as e:
+            print(f"Highlight extraction error for {p.arxiv_id}: {e}")
+            pass
+
+    return papers
+
+
+# =========================
+# Task 38 — Artifact signal detection and paper type tagging
+# =========================
+
+def enrich_paper_signals(papers: List[Paper]) -> List[Paper]:
+    """
+    Called after Stage 4 to set artifact signals (has_code, has_dataset,
+    reproducibility_score, paper_type_tag) based on fast regex/string regex.
+    """
+    for p in papers:
+        abstract_lower = p.abstract.lower() if p.abstract else ""
+        pdf_lower = p.pdf_url.lower() if p.pdf_url else ""
+        
+        # has_code
+        if "github.com/" in abstract_lower or "github.com/" in pdf_lower:
+            p.has_code = True
+            
+        # has_dataset
+        dataset_keywords = ["new dataset", "we release", "we introduce a benchmark", "data collection", "we collected"]
+        if any(kw in abstract_lower for kw in dataset_keywords):
+            p.has_dataset = True
+            
+        # reproducibility_score
+        score = 0
+        if "ablation" in abstract_lower:
+            score += 1
+        if "code available" in abstract_lower or "github.com/" in abstract_lower:
+            score += 1
+        if "reproducib" in abstract_lower:
+            score += 1
+        p.reproducibility_score = score
+        
+        # paper_type_tag
+        if any(kw in abstract_lower for kw in ["survey", "comprehensive study", "we survey"]):
+            p.paper_type_tag = "Survey"
+        elif any(kw in abstract_lower for kw in ["new dataset", "we introduce a benchmark", "we collect"]):
+            p.paper_type_tag = "New Dataset"
+        elif any(kw in abstract_lower for kw in ["we scale", "billion parameter", "x larger", "× larger"]):
+            p.paper_type_tag = "Scale Study"
+        elif any(kw in abstract_lower for kw in ["we propose", "novel method", "new architecture", "new approach"]):
+            p.paper_type_tag = "New Technique"
+        elif any(kw in abstract_lower for kw in ["we evaluate", "empirical study", "analysis of"]):
+            p.paper_type_tag = "Evaluation"
+        else:
+            p.paper_type_tag = "Other"
+            
+    return papers
+
+
+# =========================
+# SciBERT Split Classification (Tasks 41 & 42)
 # =========================
 
 def classify_papers_with_llm(
@@ -995,6 +1531,27 @@ def classify_papers_with_llm(
                 p.focus_label = "off-topic"
                 p.llm_relevance_score = 0.0
 
+    return papers
+
+
+
+def scibert_classify_papers(papers: List[Paper]) -> List[Paper]:
+    """
+    Task 41: CrossEncoder threshold classification.
+    Replaces LLM-based classification to save tokens.
+    Iterates through papers and assigns primary/secondary/off-topic using the p.semantic_relevance generated by Stage 3.
+    """
+    for p in papers:
+        score = p.semantic_relevance if p.semantic_relevance is not None else 0.0
+        p.llm_relevance_score = score
+        
+        if score >= PRIMARY_THRESHOLD:
+            p.focus_label = "primary"
+        elif score >= SECONDARY_THRESHOLD:
+            p.focus_label = "secondary"
+        else:
+            p.focus_label = "off-topic"
+            
     return papers
 
 
@@ -1195,6 +1752,47 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
     return target_papers
 
 
+def compute_keyword_match_score(paper: Paper, query_brief: str) -> float:
+    """
+    Lightweight keyword relevance score in [0, 1].
+    Uses overlap between meaningful query terms and the paper title/abstract.
+    """
+    text = f"{paper.title} {paper.abstract}".lower()
+    query = query_brief.lower()
+
+    stopwords = {
+        "the", "and", "or", "for", "with", "that", "this", "from", "into", "about",
+        "what", "are", "your", "their", "they", "them", "using", "used", "use",
+        "main", "whose", "where", "when", "which", "have", "has", "had", "been",
+        "being", "also", "only", "just", "more", "most", "very", "much", "some",
+        "such", "than", "then", "over", "under", "not", "without", "within",
+        "papers", "paper", "interested", "looking", "brief", "contribution"
+    }
+
+    query_terms = re.findall(r"\b[a-zA-Z][a-zA-Z\-]+\b", query)
+    query_terms = [t for t in query_terms if len(t) > 2 and t not in stopwords]
+
+    if not query_terms:
+        return 0.0
+
+    matched = sum(1 for term in set(query_terms) if term in text)
+    return min(matched / max(len(set(query_terms)), 1), 1.0)
+
+
+def compute_recency_score(submitted_date: datetime, max_days: int = 30) -> float:
+    """
+    Returns a recency score in [0, 1], where newer papers score higher.
+    """
+    try:
+        days_old = max((datetime.now().date() - submitted_date.date()).days, 0)
+    except Exception:
+        return 0.0
+
+    if days_old >= max_days:
+        return 0.0
+
+    return 1.0 - (days_old / max_days)
+
 def assign_heuristic_citations_free(papers: List[Paper]) -> List[Paper]:
     if not papers: return papers
     scores = [(p.llm_relevance_score or 0.0) * 0.7 + (p.semantic_relevance or 0.0) * 0.3 for p in papers]
@@ -1234,9 +1832,9 @@ Instead of fetching papers live, the agent queries a pre-built local library of 
 
 Retrieval is a three-step funnel designed to be both fast and accurate:
 
-- **Stage 1 — Keyword Recall (BM25):** Quickly narrows the corpus to papers containing terminology relevant to your brief.
-- **Stage 2 — Semantic Filter (MiniLM):** An embedding model removes keyword matches that aren't actually relevant to the *meaning* of your query, keeping the top candidates by semantic similarity.
-- **Stage 3 — Precision Reranking (CrossEncoder):** A deep cross-attention model does a final comparison between your brief and each candidate, selecting the best papers to pass to the AI.
+- **Stage 1 — Keyword & Basic Semantic Recall (RRF):** Quickly narrows the corpus using reciprocal rank fusion of BM25 keyword matches and FAISS dense embeddings.
+- **Stage 2 — Semantic Rethink (SPECTER2):** A powerful document-level embedding model (SPECTER2) re-evaluates the candidate pairs to refine the rankings.
+- **Stage 3 — Precision Reranking (CrossEncoder):** A deep cross-attention model does a final comparison between your brief and each candidate, selecting the best papers to pass to the next stage.
 
 #### The agent filters by venue (Optional)
 
@@ -1244,8 +1842,7 @@ If you selected a venue filter (e.g. "NeurIPS only" or "All Journals"), the agen
 
 #### 4. The agent judges how relevant each paper is
 
-- In **LLM API mode** (OpenAI, Gemini, or Groq), a model reads each candidate and labels it as primary, secondary, or off topic.
-- In **free local mode**, the agent uses a simple heuristic based on the embedding similarity to mark the most relevant papers as primary and the rest as secondary.
+A CrossEncoder model (`ms-marco-MiniLM-L-6-v2`) scores each candidate against the research brief. Papers scoring ≥ 0.65 are labelled **primary**; ≥ 0.30 are **secondary**; below 0.30 are filtered out. No LLM tokens are used at this step.
 
 #### 5. The agent builds a citation impact set
 
@@ -1268,7 +1865,6 @@ These scores are heuristic impact signals and are best used for ranking within t
 
 The agent ranks papers, always showing **primary** papers first, then secondary ones. For the top N that you choose, it shows metadata, relevance signals, and links to arXiv and the PDF. In LLM API mode it also adds plain English summaries. All artifacts and a markdown report are saved in a project folder under `~/arxiv_ai_digest_projects/project_<timestamp>`, and you can download everything as a ZIP.
 """
-
 
 def main():
     st.set_page_config(
@@ -1430,14 +2026,14 @@ def _main_body():
 
         st.markdown("### 🔌 Provider")
 
-        provider_label_free = "Free local model (no API key)"
+        provider_label_groq = "Free (Groq — no CC required)"
         provider_label_openai = "OpenAI (API key required)"
         provider_label_gemini = "Gemini (API key required)"
-        provider_label_groq = "Groq (API key required)"
+        provider_label_local = "Local Dev (Heuristics only)"
 
         provider_choice = st.radio(
             "Choose provider",
-            [provider_label_free, provider_label_openai, provider_label_gemini, provider_label_groq],
+            [provider_label_groq, provider_label_openai, provider_label_gemini, provider_label_local],
             index=0,
         )
 
@@ -1445,10 +2041,10 @@ def _main_body():
             provider = "openai"
         elif provider_choice == provider_label_gemini:
             provider = "gemini"
-        elif provider_choice == provider_label_groq:
-            provider = "groq"
-        else:
+        elif provider_choice == provider_label_local:
             provider = "free_local"
+        else:
+            provider = "groq"
 
         if provider == "openai":
             api_base = "https://api.openai.com/v1"
@@ -1459,7 +2055,7 @@ def _main_body():
 
         if provider == "openai":
             st.markdown("### 🤖 OpenAI Settings")
-            api_key = st.text_input("OpenAI API Key", type="password")
+            api_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
             st.caption(
                 "Your API key is used only in memory for this session, is never written to disk, "
                 "and is never shared with anyone or any service other than OpenAI's API. "
@@ -1496,7 +2092,7 @@ def _main_body():
 
         elif provider == "gemini":
             st.markdown("### 🌌 Gemini Settings")
-            api_key = st.text_input("Gemini API Key", type="password")
+            api_key = st.text_input("Gemini API Key", type="password", value=os.getenv("GEMINI_API_KEY", ""))
             st.caption(
                 "Use an API key from Google AI Studio or Vertex AI for the Gemini API. "
                 "The key is kept only in memory for this session and is never written to disk."
@@ -1529,15 +2125,18 @@ def _main_body():
 
         elif provider == "groq":
             st.markdown("### ⚡ Groq Settings")
-            api_key = st.text_input("Groq API Key", type="password")
+            api_key = st.text_input("Groq API Key (Optional)", type="password", value=os.getenv("GROQ_API_KEY", ""))
             st.caption(
-                "Groq API keys are free. No credit card needed. "
-                "Get yours at [https://console.groq.com](https://console.groq.com)"
+                "Groq API keys are free. No credit card needed. Get yours at [https://console.groq.com](https://console.groq.com). "
+                "If omitted, the classification will still run using CrossEncoder, but the narrative score will fallback to a default."
             )
 
             groq_models = [
                 "llama-3.3-70b-versatile",
+                "llama-3.1-70b-versatile",
                 "llama-3.1-8b-instant",
+                "qwen-qwq-32b",
+                "gemma2-9b-it",
             ]
 
             model_choice = st.selectbox(
@@ -1549,7 +2148,7 @@ def _main_body():
             if model_choice == "Custom":
                 model_name = st.text_input(
                     "Custom Groq Model Name",
-                    value="llama-3.1-70b-versatile",
+                    value="llama-3.3-70b-versatile",
                 )
             else:
                 model_name = model_choice
@@ -1565,6 +2164,17 @@ def _main_body():
                 f"Embeddings (local): `{embedding_model_name}`.\n"
                 "Classification and citation impact scoring use simple heuristics. No API key or external calls."
             )
+
+        # ─── Task 35: HyDE UI Toggle ───
+        use_hyde = False
+        if provider in ("openai", "gemini", "groq") and api_key.strip():
+            brief_word_count = len(research_brief.split())
+            if 0 < brief_word_count < 30:
+                use_hyde = st.checkbox(
+                    "⚡ Expand query with AI (HyDE)", 
+                    value=False,
+                    help="Generates a hypothetical paper abstract to improve recall for short or informal queries. May reduce precision for very specific queries."
+                )
 
         run_clicked = st.button("🚀 Run Pipeline")
 
@@ -1653,9 +2263,9 @@ def _main_body():
                 st.warning("Your Gemini API key and model name are required to run in Gemini mode.")
                 return
     elif provider == "groq":
-        if not api_key or not model_name:
+        if not model_name:
             if "ranked_papers" not in st.session_state:
-                st.warning("Your Groq API key and model name are required to run in Groq mode.")
+                st.warning("Your Groq model name is required to run in Groq mode.")
                 return
     else:
         api_key = api_key or ""
@@ -1667,6 +2277,8 @@ def _main_body():
         api_base=api_base,
         provider=provider,
     )
+    
+    active_llm_config = (llm_config if api_key.strip() else None) if provider in ("openai", "gemini", "groq") else None
 
     try:
         current_start, current_end = get_date_range(date_option)
@@ -1791,6 +2403,7 @@ def _main_body():
                 reverse=True,
             )
             candidates = sorted_papers[:150] if len(sorted_papers) > 150 else sorted_papers
+            candidates = enrich_paper_signals(candidates)
             st.session_state["candidates"] = candidates
         else:
             candidates = st.session_state["candidates"]
@@ -1805,10 +2418,11 @@ def _main_body():
                 candidates = select_embedding_candidates(
                     current_papers,
                     query_brief=query_brief,
-                    llm_config=llm_config if provider in ("openai", "gemini", "groq") else None,
+                    llm_config=active_llm_config,
                     embedding_model=embedding_model_name,
                     provider=provider,
                     max_candidates=150,
+                    use_hyde=use_hyde,
                 )
             if not candidates:
                 st.warning("Embedding stage returned no candidates. Using all fetched papers as fallback.")
@@ -1839,28 +2453,12 @@ def _main_body():
                 if p.semantic_reason is None:
                     p.semantic_reason = "Global mode: no topical filtering; treated as primary."
     else:
-        if provider in ("openai", "gemini", "groq"):
-            provider_label = "OpenAI" if provider == "openai" else "Gemini" if provider == "gemini" else "Groq"
-            if run_clicked or any(p.focus_label is None for p in candidates):
-                with st.spinner(f"Classifying candidates as PRIMARY, SECONDARY, or OFF TOPIC ({provider_label})..."):
-                    candidates = classify_papers_with_llm(
-                        candidates,
-                        query_brief=query_brief,
-                        llm_config=llm_config,
-                        batch_size=15,
-                    )
-                st.session_state["candidates"] = candidates
-                
-                # --- Inserted Line ---
-                st.success(f"Classifying candidates as PRIMARY, SECONDARY, or OFF TOPIC ({provider_label})... Done!")
-
-        else:
-            st.info(
-                "Free local mode: using a simple heuristic based on embedding similarity instead of LLM based classification."
-            )
-            if run_clicked or any(p.focus_label is None for p in candidates):
-                candidates = heuristic_classify_papers_free(candidates)
-                st.session_state["candidates"] = candidates
+        # Task 41: CrossEncoder Thresholding universally saves API tokens
+        if run_clicked or any(p.focus_label is None for p in candidates):
+            with st.spinner("Classifying candidates as PRIMARY, SECONDARY, or OFF TOPIC (CrossEncoder heuristic)..."):
+                candidates = scibert_classify_papers(candidates)
+            st.session_state["candidates"] = candidates
+            st.success("Classifying candidates as PRIMARY, SECONDARY, or OFF TOPIC (CrossEncoder)... Done!")
 
     save_json(
         os.path.join(project_folder, "candidates_with_classification.json"),
@@ -1966,6 +2564,17 @@ def _main_body():
 
     for p in used_papers:
         with st.expander(p.title, expanded=False):
+            # Task 38 Badges
+            badges = []
+            if p.has_code:
+                badges.append("💻 **Code**")
+            if p.has_dataset:
+                badges.append("📊 **Dataset**")
+            if p.paper_type_tag:
+                badges.append(f"🏷️ **{p.paper_type_tag}**")
+            if badges:
+                st.markdown(" ".join(badges))
+                
             st.write(f"**Authors:** {', '.join(p.authors) if p.authors else 'Unknown'}")
             st.write(f"**Submitted:** {p.submitted_date.date().isoformat()}")
             st.write(f"[arXiv link]({p.arxiv_url}) | [PDF link]({p.pdf_url})")
@@ -1978,6 +2587,20 @@ def _main_body():
                 st.write("**Why this paper is (or is not) relevant to your brief:**")
                 st.write(p.semantic_reason)
             st.write(f"**Embedding similarity score:** {sim_str}")
+            # ── Task 37: Retrieval provenance (visible when Task 33 RRF is active) ──
+            if p.retrieval_source is not None:
+                src_label = {
+                    "both": "🔵 BM25 + FAISS (both)",
+                    "bm25_only": "🟠 BM25 only",
+                    "faiss_only": "🟣 FAISS only",
+                }.get(p.retrieval_source, p.retrieval_source)
+                rrf_str = f"{p.rrf_score:.4f}" if p.rrf_score is not None else "N/A"
+                bm25_str = f"#{p.bm25_rank}" if p.bm25_rank is not None else "—"
+                faiss_str = f"#{p.faiss_rank}" if p.faiss_rank is not None else "—"
+                st.caption(
+                    f"📡 Retrieval: {src_label} · RRF score: {rrf_str} · "
+                    f"BM25 rank: {bm25_str} · FAISS rank: {faiss_str}"
+                )
             st.write("**Abstract:**")
             st.write(p.abstract)
 
@@ -2033,7 +2656,7 @@ These scores are heuristic and should be used as a guide for exploration rather 
             with st.spinner("Calling LLM API to compute citation impact scores for selected papers..."):
                 papers_with_pred = predict_citations_direct(
                     target_papers=selected_papers,
-                    llm_config=llm_config,
+                    llm_config=active_llm_config,
                 )
         else:
             with st.spinner("Computing heuristic citation impact scores from relevance signals..."):
@@ -2114,10 +2737,19 @@ These scores are heuristic and should be used as a guide for exploration rather 
 
     df = pd.DataFrame(table_rows)
 
+    # --- CSV Export ---
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📄 Download ranked results (CSV)",
+        data=csv_bytes,
+        file_name=f"ranked_papers_{timestamp}.csv",
+        mime="text/csv",
+    )
+
     if not df.empty:
         st.dataframe(
             df,
-            width='stretch',
+            use_container_width=True,
             hide_index=True,
             column_config={
                 "arXiv": st.column_config.LinkColumn(
@@ -2148,6 +2780,19 @@ These scores are heuristic and should be used as a guide for exploration rather 
     for rank, p in enumerate(topN, start=1):
         st.markdown(f"### #{rank}: {p.title}")
         
+        # Task 38 Badges
+        badges = []
+        if p.has_code:
+            badges.append("💻 **Code**")
+        if p.has_dataset:
+            badges.append("📊 **Dataset**")
+        if p.paper_type_tag:
+            badges.append(f"🏷️ **{p.paper_type_tag}**")
+        if p.reproducibility_score > 0:
+            badges.append(f"🔄 **Reproducibility: {p.reproducibility_score}/3**")
+        if badges:
+            st.markdown(" ".join(badges))
+            
         pred_val = p.predicted_citations
         if pred_val == -1.0:
             st.write(f"**Citation impact score (1 year):** Too new to rate")
@@ -2194,6 +2839,21 @@ These scores are heuristic and should be used as a guide for exploration rather 
         if p.semantic_reason:
             st.write("**Why this paper matches your brief:**")
             st.write(p.semantic_reason)
+
+        # ── Task 37: Retrieval provenance (visible when Task 33 RRF is active) ──
+        if p.retrieval_source is not None:
+            src_label = {
+                "both": "🔵 BM25 + FAISS (both)",
+                "bm25_only": "🟠 BM25 only",
+                "faiss_only": "🟣 FAISS only",
+            }.get(p.retrieval_source, p.retrieval_source)
+            rrf_str = f"{p.rrf_score:.4f}" if p.rrf_score is not None else "N/A"
+            bm25_str = f"#{p.bm25_rank}" if p.bm25_rank is not None else "—"
+            faiss_str = f"#{p.faiss_rank}" if p.faiss_rank is not None else "—"
+            st.caption(
+                f"📡 Retrieval: {src_label} · RRF score: {rrf_str} · "
+                f"BM25 rank: {bm25_str} · FAISS rank: {faiss_str}"
+            )
 
         st.write("**Abstract:**")
         st.write(p.abstract)

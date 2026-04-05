@@ -23,9 +23,11 @@ class PaperRecord:
     arxiv_url: str
     fields_of_study: List[str]
     source: str = "Semantic Scholar"
+    source_id: str = ""
+    doi: Optional[str] = None
 
 
-_DDL = """
+_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS papers (
     arxiv_id             TEXT PRIMARY KEY,
     s2_id                TEXT,
@@ -40,43 +42,57 @@ CREATE TABLE IF NOT EXISTS papers (
     arxiv_url            TEXT,
     fields_of_study      TEXT,
     source               TEXT,
+    source_id            TEXT,
+    doi                  TEXT,
     is_indexed           INTEGER DEFAULT 0,
     ingested_at          TEXT DEFAULT (datetime('now'))
 );
+"""
+
+_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_date ON papers(submitted_date);
 CREATE INDEX IF NOT EXISTS idx_cites ON papers(citation_count DESC);
+CREATE INDEX IF NOT EXISTS idx_source_id ON papers(source_id);
+CREATE INDEX IF NOT EXISTS idx_doi ON papers(doi);
 """
 
 
 def create_db(db_path: str) -> sqlite3.Connection:
     """Create (or open) the corpus SQLite database and ensure schema exists."""
     conn = sqlite3.connect(db_path)
-    conn.executescript(_DDL)
+    # 1. Ensure table exists
+    conn.execute(_TABLE_DDL)
     
-    # Safely inject source and is_indexed columns if migrating from an older schema version
-    try:
-        conn.execute("ALTER TABLE papers ADD COLUMN source TEXT DEFAULT 'Semantic Scholar'")
-    except sqlite3.OperationalError:
-        pass # Column likely already exists
-
-    try:
-        conn.execute("ALTER TABLE papers ADD COLUMN is_indexed INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass # Column likely already exists
+    # 2. Safely inject missing columns for migrations
+    cols_to_add = [
+        ("source", "TEXT DEFAULT 'Semantic Scholar'"),
+        ("source_id", "TEXT"),
+        ("doi", "TEXT"),
+        ("is_indexed", "INTEGER DEFAULT 0")
+    ]
+    for col_name, col_def in cols_to_add:
+        try:
+            conn.execute(f"ALTER TABLE papers ADD COLUMN {col_name} {col_def}")
+        except sqlite3.OperationalError:
+            pass # Column already exists
+    
+    # 3. Ensure indexes exist (safe after columns are injected)
+    conn.executescript(_INDEX_DDL)
         
     conn.commit()
     return conn
 
 
 def upsert_paper(conn: sqlite3.Connection, p: PaperRecord) -> None:
-    """Insert or update a paper, refreshing mutable fields on conflict."""
+    # Insert or update a paper record.
+    # Uses arxiv_id as the surrogate primary key (ADR-012).
     conn.execute(
         """
         INSERT INTO papers
             (arxiv_id, s2_id, title, abstract, authors, submitted_date,
              venue, citation_count, max_author_citations, pdf_url, arxiv_url,
-             fields_of_study, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             fields_of_study, source, source_id, doi)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(arxiv_id) DO UPDATE SET
             citation_count       = MAX(papers.citation_count, excluded.citation_count),
             max_author_citations = MAX(papers.max_author_citations, excluded.max_author_citations),
@@ -90,6 +106,8 @@ def upsert_paper(conn: sqlite3.Connection, p: PaperRecord) -> None:
                 ELSE papers.is_indexed
             END,
             title                = COALESCE(excluded.title, papers.title),
+            s2_id                = COALESCE(excluded.s2_id, papers.s2_id),
+            doi                  = COALESCE(excluded.doi, papers.doi),
             source               = CASE 
                 WHEN papers.source = 'Semantic Scholar' OR excluded.source = 'Semantic Scholar' THEN 'Semantic Scholar'
                 ELSE excluded.source
@@ -110,5 +128,7 @@ def upsert_paper(conn: sqlite3.Connection, p: PaperRecord) -> None:
             p.arxiv_url,
             json.dumps(p.fields_of_study),
             p.source,
+            p.source_id,
+            p.doi,
         ),
     )

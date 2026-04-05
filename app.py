@@ -1793,46 +1793,14 @@ def compute_recency_score(submitted_date: datetime, max_days: int = 30) -> float
 
     return 1.0 - (days_old / max_days)
 
-def assign_heuristic_citations_free(papers: List[Paper], query_brief: str) -> List[Paper]:
-    if not papers:
-        return papers
-
-    raw_scores = []
-
-    for p in papers:
-        semantic_score = p.semantic_relevance or 0.0
-        keyword_score = compute_keyword_match_score(p, query_brief)
-        recency_score = compute_recency_score(p.submitted_date)
-
-        # Minimal multi-signal scoring
-        final_score = (
-            0.60 * semantic_score +
-            0.25 * keyword_score +
-            0.15 * recency_score
-        )
-
-        raw_scores.append(final_score)
-
-        # Optional lightweight explanation for free mode
-        reasons = []
-        if keyword_score >= 0.3:
-            reasons.append("strong keyword overlap with the research brief")
-        if semantic_score >= 0.3:
-            reasons.append("high semantic similarity to the query")
-        if recency_score >= 0.8:
-            reasons.append("very recent submission")
-
-        if reasons:
-            p.semantic_reason = "Matched due to " + ", ".join(reasons) + "."
-        elif p.semantic_reason is None:
-            p.semantic_reason = "Matched using a hybrid free-mode heuristic."
-
-    min_s, max_s = min(raw_scores), max(raw_scores)
-
-    for p, s in zip(papers, raw_scores):
+def assign_heuristic_citations_free(papers: List[Paper]) -> List[Paper]:
+    if not papers: return papers
+    scores = [(p.llm_relevance_score or 0.0) * 0.7 + (p.semantic_relevance or 0.0) * 0.3 for p in papers]
+    if not scores: return papers
+    min_s, max_s = min(scores), max(scores)
+    for p, s in zip(papers, scores):
         norm = (s - min_s) / (max_s - min_s) if max_s > min_s else 0.5
         p.predicted_citations = float(int(10 + norm * 40))
-
     return papers
 
 
@@ -2692,7 +2660,7 @@ These scores are heuristic and should be used as a guide for exploration rather 
                 )
         else:
             with st.spinner("Computing heuristic citation impact scores from relevance signals..."):
-                papers_with_pred = assign_heuristic_citations_free(selected_papers, query_brief)
+                papers_with_pred = assign_heuristic_citations_free(selected_papers)
 
         # SEPARATE into groups by focus (Primary vs Secondary vs Others)
         primaries = [p for p in papers_with_pred if p.focus_label == "primary"]

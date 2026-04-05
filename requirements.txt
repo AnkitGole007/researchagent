@@ -1,3 +1,4 @@
+# Core app dependencies
 streamlit>=1.50.0
 requests>=2.31.0
 feedparser>=6.0.10
@@ -6,7 +7,6 @@ sentence-transformers>=3.0.0
 pandas>=2.0.0
 google-genai>=0.3.0
 groq>=0.9.0
-semanticscholar>=0.8.4
 faiss-cpu>=1.7.4
 bm25s>=0.2.0
 tenacity>=8.2.3

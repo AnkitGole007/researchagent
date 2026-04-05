@@ -22,13 +22,16 @@ def test_parse_extracts_arxiv_id():
     assert paper.max_author_citations == 0
 
 
-def test_parse_skips_non_arxiv():
+def test_parse_handles_non_arxiv():
     raw = {
-        "paperId": "x",
+        "paperId": "s2_only_id",
         "title": "T",
         "abstract": "A",
         "authors": [],
         "externalIds": {},
         "citationCount": 0,
     }
-    assert parse_s2_paper(raw) is None
+    paper = parse_s2_paper(raw)
+    assert paper is not None
+    assert paper.arxiv_id == "s2:s2_only_id"
+    assert paper.s2_id == "s2_only_id"

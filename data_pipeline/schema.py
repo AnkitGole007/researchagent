@@ -27,7 +27,7 @@ class PaperRecord:
     doi: Optional[str] = None
 
 
-_DDL = """
+_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS papers (
     arxiv_id             TEXT PRIMARY KEY,
     s2_id                TEXT,
@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS papers (
     is_indexed           INTEGER DEFAULT 0,
     ingested_at          TEXT DEFAULT (datetime('now'))
 );
+"""
+
+_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_date ON papers(submitted_date);
 CREATE INDEX IF NOT EXISTS idx_cites ON papers(citation_count DESC);
 CREATE INDEX IF NOT EXISTS idx_source_id ON papers(source_id);
@@ -57,9 +60,10 @@ CREATE INDEX IF NOT EXISTS idx_doi ON papers(doi);
 def create_db(db_path: str) -> sqlite3.Connection:
     """Create (or open) the corpus SQLite database and ensure schema exists."""
     conn = sqlite3.connect(db_path)
-    conn.executescript(_DDL)
+    # 1. Ensure table exists
+    conn.execute(_TABLE_DDL)
     
-    # Safely inject missing columns if migrating from an older schema version
+    # 2. Safely inject missing columns for migrations
     cols_to_add = [
         ("source", "TEXT DEFAULT 'Semantic Scholar'"),
         ("source_id", "TEXT"),
@@ -70,7 +74,10 @@ def create_db(db_path: str) -> sqlite3.Connection:
         try:
             conn.execute(f"ALTER TABLE papers ADD COLUMN {col_name} {col_def}")
         except sqlite3.OperationalError:
-            pass # Column likely already exists
+            pass # Column already exists
+    
+    # 3. Ensure indexes exist (safe after columns are injected)
+    conn.executescript(_INDEX_DDL)
         
     conn.commit()
     return conn

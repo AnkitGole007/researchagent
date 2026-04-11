@@ -7,6 +7,11 @@ except ImportError:
 import json
 import time
 import textwrap
+
+# Hugging Face optimization settings (must be set before importing transformers)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 import io
 import zipfile
 import math
@@ -581,6 +586,11 @@ def fetch_papers_from_db(
 # =========================
 
 def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
+    if not llm_config or not llm_config.api_key or not llm_config.api_key.strip():
+        # Fallback for Optional modes/crashes
+        print(f"DEBUG: Skipping LLM call ({label}) - Invalid or missing API key.")
+        return ""
+
     if "last_prompts" not in st.session_state:
         st.session_state["last_prompts"] = {}
     st.session_state["last_prompts"][label or "default"] = prompt
@@ -1001,9 +1011,20 @@ def get_specter2_model():
     try:
         from adapters import AutoAdapterModel
         from transformers import AutoTokenizer
+        import torch
 
-        tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
-        model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
+        # Set timeouts for robust downloading
+        tokenizer = AutoTokenizer.from_pretrained(
+            "allenai/specter2_base",
+            timeout=120,
+            local_files_only=False
+        )
+        model = AutoAdapterModel.from_pretrained(
+            "allenai/specter2_base",
+            timeout=120,
+            local_files_only=False
+        )
+
         # Load and activate the adhoc_query adapter for query-to-paper retrieval
         model.load_adapter(
             "allenai/specter2_adhoc_query",
@@ -1011,6 +1032,17 @@ def get_specter2_model():
             load_as="specter2_adhoc_query",
             set_active=True,
         )
+
+        # Verify adapter is active
+        try:
+            active_adapters = model.active_adapters
+            if "specter2_adhoc_query" not in active_adapters:
+                print(f"[SPECTER2] Warning: Adapter not active. Active adapters: {active_adapters}")
+                # Try to set it active again
+                model.set_active_adapters("specter2_adhoc_query")
+        except Exception as e:
+            print(f"[SPECTER2] Warning: Could not verify adapter activation: {e}")
+
         model.eval()
         return model, tokenizer
     except ImportError:
@@ -1047,6 +1079,12 @@ def specter2_vector_rerank(
         return []   # Caller should detect and fall back to minilm_vector_rerank
 
     import torch
+
+    # Ensure adapter is active before inference
+    try:
+        model.set_active_adapters("specter2_adhoc_query")
+    except Exception as e:
+        print(f"[SPECTER2] Warning: Could not set active adapter: {e}")
 
     def _encode_batch(texts: List[str], batch_size: int = 32) -> "np.ndarray":
         all_vecs = []
@@ -1689,7 +1727,10 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
         ]
         
         try:
-            raw = call_llm(prompt, llm_config, label="moneyball_narrative")
+            raw = ""
+            if llm_config and llm_config.api_key and llm_config.api_key.strip():
+                raw = call_llm(prompt, llm_config, label="moneyball_narrative")
+            
             if raw:
                 if "```" in raw:
                     parts = raw.split("```json")
@@ -1805,6 +1846,9 @@ def assign_heuristic_citations_free(papers: List[Paper]) -> List[Paper]:
 
 
 def summarize_paper_plain_english(paper: Paper, llm_config: LLMConfig) -> str:
+    if not llm_config or not llm_config.api_key or not llm_config.api_key.strip():
+        return "Plain English summary not available: Missing API key or configuration."
+        
     prompt = textwrap.dedent(f"""
     Explain this research paper to a non-expert.
     Title: {paper.title}
@@ -2749,7 +2793,7 @@ These scores are heuristic and should be used as a guide for exploration rather 
     if not df.empty:
         st.dataframe(
             df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "arXiv": st.column_config.LinkColumn(

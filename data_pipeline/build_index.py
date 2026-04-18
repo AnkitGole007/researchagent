@@ -8,9 +8,19 @@ Usage:
 import json
 import logging
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import sqlite3
 import sys
 from pathlib import Path
+
+# Hugging Face optimization settings (must be set before importing transformers)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 # Ensure project root is on sys.path when run as a script
 _root = str(Path(__file__).resolve().parent.parent)
@@ -49,33 +59,100 @@ def load_papers_from_db(db_path: str) -> list:
 
 def embed_papers(
     papers: list,
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    model_name: str = "allenai/specter2_base",  # P-03: SPECTER2 proximity adapter for Stage 1 FAISS
 ) -> np.ndarray:
     """
-    Encode title + abstract with a SentenceTransformer model.
-    Returns float32 ndarray of shape (N, dim), L2-normalised.
+    Encode title + abstract for FAISS indexing.
+
+    P-03: Uses SPECTER2 with the `proximity` adapter (document-side of asymmetric retrieval).
+    At query time, app.py uses the `adhoc_query` adapter for the search vector.
+    This asymmetry gives the best relevance on scientific corpora per the SPECTER2 paper.
+
+    Output: float32 ndarray of shape (N, 768), L2-normalised.
     """
-    from sentence_transformers import SentenceTransformer  # lazy import
     import gc
 
-    model = SentenceTransformer(model_name)
-    texts = [
-        (p.get("title") or "") + "\n\n" + (p.get("abstract") or "")
-        for p in papers
-    ]
-    vecs = model.encode(
-        texts,
-        batch_size=64,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-    
-    # Explicitly unload model to free memory for merging
-    del model
-    gc.collect()
-    
-    return vecs.astype("float32")
+    is_specter2 = "specter2" in model_name
+
+    if is_specter2:
+        from adapters import AutoAdapterModel
+        from transformers import AutoTokenizer
+        import torch
+
+        logger.info("Loading SPECTER2 base model + proximity adapter…")
+        # NOTE: timeout is controlled via HF_HUB_DOWNLOAD_TIMEOUT env var (set above).
+        # Do NOT pass timeout= to from_pretrained — adapters lib forwards it to
+        # BertAdapterModel.__init__() which rejects it with TypeError.
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoAdapterModel.from_pretrained(model_name)
+        model.load_adapter(
+            "allenai/specter2",
+            source="hf",
+            load_as="proximity",
+            set_active=True,
+        )
+
+        # Verify adapter is active
+        try:
+            active_adapters = model.active_adapters
+            if "proximity" not in active_adapters:
+                logger.warning("Adapter 'proximity' not active. Active adapters: %s", active_adapters)
+                model.set_active_adapters("proximity")
+        except Exception as e:
+            logger.warning("Could not verify adapter activation: %s", e)
+
+        model.eval()
+
+        texts = [
+            (p.get("title") or "") + tokenizer.sep_token + (p.get("abstract") or "")
+            for p in papers
+        ]
+
+        batch_size = 32
+        all_vecs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                outputs = model(**inputs)
+            # CLS token embedding
+            vecs = outputs.last_hidden_state[:, 0, :]
+            # L2 normalise
+            vecs = vecs / (vecs.norm(dim=-1, keepdim=True) + 1e-8)
+            all_vecs.append(vecs.cpu().float().numpy())
+            if i % (batch_size * 10) == 0:
+                logger.info("  Embedded %d / %d papers…", i + len(batch), len(texts))
+
+        del model
+        gc.collect()
+        vecs = np.vstack(all_vecs)
+    else:
+        # Generic SentenceTransformer fallback (kept for testing / CI)
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(model_name)
+        texts = [
+            (p.get("title") or "") + "\n\n" + (p.get("abstract") or "")
+            for p in papers
+        ]
+        vecs = model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        del model
+        gc.collect()
+
+    vecs = vecs.astype("float32")
+    logger.info("Embedded %d papers — dim=%d", len(papers), vecs.shape[1])
+    return vecs
 
 
 def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
@@ -112,7 +189,7 @@ def build_bm25_index(papers: list, save_dir: str) -> None:
 def run_index_build(
     db_path: str = "data_pipeline/corpus.db",
     output_dir: str = "data_pipeline",
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    model_name: str = "allenai/specter2_base",  # P-03: SPECTER2 is now the default
     force_full: bool = False,
     update_arxiv_ts: bool = False,
     update_s2_ts: bool = False,
@@ -129,8 +206,9 @@ def run_index_build(
     from data_pipeline.schema import create_db
 
     os.makedirs(output_dir, exist_ok=True)
-    emb_path = os.path.join(output_dir, "embeddings_minilm.npy")
-    faiss_path = os.path.join(output_dir, "index_minilm.faiss")
+    # P-03: Generic names — no longer model-specific
+    emb_path = os.path.join(output_dir, "embeddings.npy")
+    faiss_path = os.path.join(output_dir, "corpus.faiss")
     id_map_path = os.path.join(output_dir, "id_map.json")
 
     # Use create_db instead of direct connect to ensure columns (is_indexed) are migrated/created

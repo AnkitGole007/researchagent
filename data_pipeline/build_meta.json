@@ -1,9 +1,14 @@
 {
-  "built_at": "2026-04-03T04:27:14Z",
-  "last_arxiv_at": "2026-04-03T04:27:14Z",
-  "last_s2_at": "2026-03-27T17:56:05.680701+00:00Z",
-  "corpus_size": 51110,
-  "faiss_ntotal": 55068,
-  "db_size_bytes": 109797376,
-  "schema_version": 1
+  "built_at": "2026-04-13T23:53:07Z",
+  "last_arxiv_at": "2026-04-13T23:53:07Z",
+  "last_s2_at": "2026-04-13T23:53:07Z",
+  "corpus_size": 189573,
+  "faiss_ntotal": 189573,
+  "embed_model": "allenai/specter2_base",
+  "embed_adapter": "allenai/specter2",
+  "embed_dim": 768,
+  "db_size_bytes": 471572480,
+  "checksum_emb": "a74b960ad8269a346e73d2740a1d366d198068d9c5723d3b021d6b9cf78137c6",
+  "checksum_faiss": "e1f44f32fbfbd772765044258dbeed109d2234fdcdf5ee822a04dedfab104de0",
+  "schema_version": 2
 }

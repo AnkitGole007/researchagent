@@ -8,9 +8,19 @@ Usage:
 import json
 import logging
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import sqlite3
 import sys
 from pathlib import Path
+
+# Hugging Face optimization settings (must be set before importing transformers)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 # Ensure project root is on sys.path when run as a script
 _root = str(Path(__file__).resolve().parent.parent)
@@ -49,33 +59,85 @@ def load_papers_from_db(db_path: str) -> list:
 
 def embed_papers(
     papers: list,
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    model_name: str = "allenai/specter2_base",
 ) -> np.ndarray:
-    """
-    Encode title + abstract with a SentenceTransformer model.
-    Returns float32 ndarray of shape (N, dim), L2-normalised.
-    """
-    from sentence_transformers import SentenceTransformer  # lazy import
+    """Encode title+abstract for FAISS indexing. Returns float32 ndarray (N, 768), L2-normalised.
+    Uses SPECTER2 proximity adapter (document-side); query-side uses adhoc_query adapter in app.py."""
     import gc
 
-    model = SentenceTransformer(model_name)
-    texts = [
-        (p.get("title") or "") + "\n\n" + (p.get("abstract") or "")
-        for p in papers
-    ]
-    vecs = model.encode(
-        texts,
-        batch_size=64,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
-    
-    # Explicitly unload model to free memory for merging
-    del model
-    gc.collect()
-    
-    return vecs.astype("float32")
+    is_specter2 = "specter2" in model_name
+
+    if is_specter2:
+        from adapters import AutoAdapterModel
+        from transformers import AutoTokenizer
+        import torch
+
+        logger.info("Loading SPECTER2 base model + proximity adapter…")
+        # HF timeout controlled via HF_HUB_DOWNLOAD_TIMEOUT env var — do NOT pass to from_pretrained
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoAdapterModel.from_pretrained(model_name)
+        model.load_adapter("allenai/specter2", source="hf", load_as="proximity", set_active=True)
+
+        try:
+            active_adapters = model.active_adapters
+            if "proximity" not in active_adapters:
+                logger.warning("Adapter 'proximity' not active. Active adapters: %s", active_adapters)
+                model.set_active_adapters("proximity")
+        except Exception as e:
+            logger.warning("Could not verify adapter activation: %s", e)
+
+        model.eval()
+
+        texts = [
+            (p.get("title") or "") + tokenizer.sep_token + (p.get("abstract") or "")
+            for p in papers
+        ]
+
+        batch_size = 32
+        all_vecs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                outputs = model(**inputs)
+            # CLS token embedding
+            vecs = outputs.last_hidden_state[:, 0, :]
+            # L2 normalise
+            vecs = vecs / (vecs.norm(dim=-1, keepdim=True) + 1e-8)
+            all_vecs.append(vecs.cpu().float().numpy())
+            if i % (batch_size * 10) == 0:
+                logger.info("  Embedded %d / %d papers…", i + len(batch), len(texts))
+
+        del model
+        gc.collect()
+        vecs = np.vstack(all_vecs)
+    else:
+        # Generic SentenceTransformer fallback (kept for testing / CI)
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(model_name)
+        texts = [
+            (p.get("title") or "") + "\n\n" + (p.get("abstract") or "")
+            for p in papers
+        ]
+        vecs = model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        del model
+        gc.collect()
+
+    vecs = vecs.astype("float32")
+    logger.info("Embedded %d papers — dim=%d", len(papers), vecs.shape[1])
+    return vecs
 
 
 def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
@@ -112,7 +174,7 @@ def build_bm25_index(papers: list, save_dir: str) -> None:
 def run_index_build(
     db_path: str = "data_pipeline/corpus.db",
     output_dir: str = "data_pipeline",
-    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    model_name: str = "allenai/specter2_base",  # P-03: SPECTER2 is now the default
     force_full: bool = False,
     update_arxiv_ts: bool = False,
     update_s2_ts: bool = False,
@@ -129,11 +191,10 @@ def run_index_build(
     from data_pipeline.schema import create_db
 
     os.makedirs(output_dir, exist_ok=True)
-    emb_path = os.path.join(output_dir, "embeddings_minilm.npy")
-    faiss_path = os.path.join(output_dir, "index_minilm.faiss")
+    emb_path   = os.path.join(output_dir, "embeddings.npy")
+    faiss_path = os.path.join(output_dir, "corpus.faiss")
     id_map_path = os.path.join(output_dir, "id_map.json")
 
-    # Use create_db instead of direct connect to ensure columns (is_indexed) are migrated/created
     conn = create_db(db_path)
     conn.row_factory = sqlite3.Row
 
@@ -142,9 +203,7 @@ def run_index_build(
         conn.execute("UPDATE papers SET is_indexed = 0")
         conn.commit()
 
-    # 1. Load papers that need indexing
     new_papers_rows = conn.execute("SELECT * FROM papers WHERE is_indexed = 0").fetchall()
-    
     if not new_papers_rows:
         logger.info("No new papers to index.")
         conn.close()
@@ -156,11 +215,9 @@ def run_index_build(
         d["authors"] = json.loads(d.get("authors") or "[]")
         new_papers.append(d)
 
-    # 2. Embed new papers FIRST (heavy model in memory)
     logger.info("Embedding %d new papers…", len(new_papers))
     new_embeddings = embed_papers(new_papers, model_name)
 
-    # 3. Reload existing artifacts SECOND (heavy matrix in memory)
     has_artifacts = all(os.path.exists(p) for p in [emb_path, faiss_path, id_map_path])
     
     if has_artifacts and not force_full:
@@ -182,23 +239,19 @@ def run_index_build(
         id_map = {}
         logger.info("Starting fresh index build.")
 
-    # 4. Merge
     if existing_embeddings is not None:
-        # Note: np.vstack will load mmap'd segments temporarily
         all_embeddings = np.vstack([existing_embeddings, new_embeddings])
         existing_index.add(new_embeddings)
         all_index = existing_index
     else:
         all_embeddings = new_embeddings
         all_index = build_faiss_index(new_embeddings)
-    
-    # Update ID map (append new indices)
+
     start_idx = len(id_map)
     for i, p in enumerate(new_papers):
         id_map[str(start_idx + i)] = p["arxiv_id"]
 
-    # 5. Save all updated artifacts
-    # On Windows, we must delete the mmap object before overwriting the file
+    # Release mmap'd file before overwriting (required on Windows)
     if existing_embeddings is not None:
         del existing_embeddings
         import gc
@@ -208,23 +261,19 @@ def run_index_build(
     faiss.write_index(all_index, faiss_path)
     with open(id_map_path, "w", encoding="utf-8") as fh:
         json.dump(id_map, fh)
-    
-    # Capture metadata before freeing memory
+
     faiss_ntotal = all_index.ntotal
 
-    # Free up memory before rebuilding BM25
     del all_embeddings
     del all_index
     gc.collect()
-    
-    # 6. Update Database
+
     logger.info("Updating database flags...")
     for p in new_papers:
         conn.execute("UPDATE papers SET is_indexed = 1 WHERE arxiv_id = ?", (p["arxiv_id"],))
     conn.commit()
 
-    # 7. Rebuild BM25
-    # Always rebuild from all indexed papers to maintain global IDF statistics
+    # BM25 always rebuilt from all indexed papers to maintain global IDF statistics
     logger.info("Rebuilding BM25 index for all papers...")
     all_papers_rows = conn.execute("SELECT * FROM papers WHERE is_indexed = 1").fetchall()
     all_papers = [dict(r) for r in all_papers_rows]
@@ -241,7 +290,8 @@ def run_index_build(
         try:
             with open(meta_path, "r", encoding="utf-8") as fh:
                 existing_meta = json.load(fh)
-        except: pass
+        except (OSError, json.JSONDecodeError):
+            pass
 
     last_arxiv = existing_meta.get("last_arxiv_at")
     last_s2 = existing_meta.get("last_s2_at")

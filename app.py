@@ -5,6 +5,7 @@ try:
 except ImportError:
     pass
 import json
+import logging
 import time
 import textwrap
 
@@ -54,6 +55,12 @@ try:
 except ImportError:
     bm25s = None
 
+try:
+    from query_intelligence import analyse_query, StructuredQuery
+except ImportError:
+    analyse_query = None  # type: ignore
+    StructuredQuery = None  # type: ignore
+
 # =========================
 # Constants
 # =========================
@@ -72,14 +79,16 @@ DEFAULT_MONEYBALL_WEIGHTS = {
 
 # =========================
 # SciBERT Split — Classification thresholds (Task 41)
-# Tuned against eval harness (Task 39); adjust if Recall@primary drops below 0.85.
+# Applied to cross_encoder_score (dedicated Stage 3 field, sigmoid of BGE-reranker-base logit).
+# When CrossEncoder is unavailable, scibert_classify_papers falls back to
+# heuristic_classify_papers_free (rank-based top-30%) using semantic_relevance (Stage 2 cosine).
 # CrossEncoder sigmoid score ∈ [0, 1]:
 #   >= PRIMARY_THRESHOLD   → focus_label = "primary"
 #   >= SECONDARY_THRESHOLD → focus_label = "secondary"
 #   <  SECONDARY_THRESHOLD → focus_label = "off-topic"
 # =========================
-PRIMARY_THRESHOLD: float = 0.65
-SECONDARY_THRESHOLD: float = 0.30
+PRIMARY_THRESHOLD: float = 0.55    # CE sigmoid ≥ this → primary  (P-08: recalibrated for BAAI/bge-reranker-base)
+SECONDARY_THRESHOLD: float = 0.25  # CE sigmoid ≥ this → secondary (P-08: recalibrated for BAAI/bge-reranker-base)
 
 
 
@@ -123,6 +132,11 @@ class Paper:
     has_dataset: bool = False                # True if dataset/benchmark release mentioned
     reproducibility_score: int = 0           # 0-3 count of reproducibility signals
     paper_type_tag: Optional[str] = None     # "New Technique" | "Scale Study" | "New Dataset" | "Survey" | "Evaluation" | "Other"
+    # ── Option A: dedicated Stage 3 score field (P-10) ──
+    # cross_encoder_score is ONLY written by cross_encoder_rerank (Stage 3 sigmoid of BGE logit).
+    # semantic_relevance is ONLY written by Stage 2 (SPECTER2 / MiniLM cosine similarity).
+    # Keeping them separate prevents the dual-scale overwrite that caused Phase 4 "no results".
+    cross_encoder_score: Optional[float] = None
 
 
 # =========================
@@ -173,12 +187,10 @@ def get_corpus_dir() -> pathlib.Path:
 
 
 def _check_corpus_freshness():
-    """Lightweight per-search freshness check that reloads data in-place without restart."""
-    import time
+    """Check R2 for corpus updates at most every 30 min per session; reloads in-place."""
     import boto3
     from botocore.exceptions import ClientError
 
-    # 1. Throttle: check R2 at most every 30 minutes per session to save egress/API calls
     now = time.time()
     last_check = st.session_state.get("_freshness_checked_at", 0)
     if now - last_check < 1800: # 1800s = 30 min
@@ -239,6 +251,19 @@ def download_corpus_artifacts():
     if st.session_state.get("_corpus_synced"):
         return
 
+    # ── Local testing override ────────────────────────────────────────────────
+    # If CORPUS_DATA_DIR is explicitly set AND all core artifacts already exist
+    # locally, skip R2 entirely. This lets developers test local SPECTER2 index
+    # files without downloading from R2 or affecting the live Streamlit app.
+    # To re-enable R2 sync, comment out CORPUS_DATA_DIR in your .env file.
+    if os.environ.get("CORPUS_DATA_DIR"):
+        corpus_dir   = get_corpus_dir()
+        _core_files  = ["corpus.db", "embeddings.npy", "corpus.faiss", "id_map.json"]
+        _all_present = all((corpus_dir / f).exists() for f in _core_files)
+        if _all_present:
+            st.session_state["_corpus_synced"] = True
+            return  # All local files present — no R2 sync needed
+
     import boto3
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -297,11 +322,37 @@ def download_corpus_artifacts():
 
         core_files = [
             "corpus.db",
-            "index_minilm.faiss",
-            "embeddings_minilm.npy",
+            "corpus.faiss",       # P-03: renamed from index_minilm.faiss
+            "embeddings.npy",     # P-03: renamed from embeddings_minilm.npy
             "id_map.json",
             "build_meta.json",
         ]
+
+        # P-03 transition: FAISS + embeddings filenames changed.
+        # Try new generic names first; fall back to legacy MiniLM names if bucket not yet updated.
+        _faiss_aliases = ("corpus.faiss", "index_minilm.faiss")
+        _emb_aliases   = ("embeddings.npy", "embeddings_minilm.npy")
+
+        def _download_with_fallback(new_name, old_name):
+            """Try new_name first; if 404, fall back to old_name (rename locally)."""
+            dest_new = corpus_dir / new_name
+            try:
+                s3.download_file(bucket, f"corpus/{new_name}", str(dest_new))
+                size_mb = dest_new.stat().st_size / (1024 * 1024)
+                return new_name, size_mb
+            except Exception as primary_exc:
+                if "404" in str(primary_exc) or "NoSuchKey" in str(primary_exc) or "Not Found" in str(primary_exc):
+                    # Bucket still has old MiniLM file — download under old name then rename
+                    dest_old = corpus_dir / old_name
+                    try:
+                        s3.download_file(bucket, f"corpus/{old_name}", str(dest_old))
+                        dest_old.rename(dest_new)  # rename to new generic name locally
+                        size_mb = dest_new.stat().st_size / (1024 * 1024)
+                        print(f"[R2 sync] P-03 transition: downloaded {old_name} → renamed to {new_name}")
+                        return new_name, size_mb
+                    except Exception as fallback_exc:
+                        raise Exception(f"Both {new_name} and {old_name} failed: {primary_exc}; {fallback_exc}")
+                raise  # re-raise non-404 errors
 
         def _download_file(filename):
             dest = corpus_dir / filename
@@ -309,9 +360,19 @@ def download_corpus_artifacts():
             size_mb = dest.stat().st_size / (1024 * 1024)
             return filename, size_mb
 
+        # Files that have aliases (transition-aware)
+        aliased_files = {_faiss_aliases[0]: _faiss_aliases[1], _emb_aliases[0]: _emb_aliases[1]}
+        # Files that never changed (no alias needed)
+        stable_files  = [f for f in core_files if f not in aliased_files]
+
         failed_files = []
         with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(_download_file, f): f for f in core_files}
+            futures = {}
+            for new_name, old_name in aliased_files.items():
+                futures[executor.submit(_download_with_fallback, new_name, old_name)] = new_name
+            for filename in stable_files:
+                futures[executor.submit(_download_file, filename)] = filename
+
             for future in as_completed(futures):
                 try:
                     fname, size_mb = future.result()
@@ -387,6 +448,94 @@ def filter_papers_by_not_terms(papers: List[Paper], not_text: str) -> (List[Pape
             filtered.append(p)
 
     return filtered, removed
+
+
+def semantic_not_filter(
+    papers: List[Paper],
+    not_phrases: List[str],
+    arxiv_to_pos: dict,
+    embeddings: Optional[np.ndarray],
+    threshold: float = 0.65,
+) -> tuple:
+    """
+    P-01: Semantic NOT filter — second-pass after lexical NOT filter.
+    Embeds each NOT phrase via the active embedding model (SPECTER2 or MiniLM).
+    Rejects papers whose vector has cosine similarity >= threshold to any NOT phrase.
+    Falls back to runtime embedding for papers not in the precomputed index.
+    Returns (kept_papers, removed_count).
+    """
+    if not not_phrases or embeddings is None:
+        return papers, 0
+
+    emb_dim = embeddings.shape[1]
+
+    try:
+        if emb_dim == 768:
+            # P-03: SPECTER2 active
+            # SPECTER2 vectors natively sit much closer together on the hypersphere
+            # (unrelated terms often have baseline similarity of 0.70 to 0.85).
+            # We scale the strict MiniLM default threshold to a tight SPECTER2 threshold.
+            if threshold < 0.90:
+                active_threshold = 0.93  # Needs near-identical semantics to reject
+            else:
+                active_threshold = threshold
+
+            model, tok = get_specter2_model()
+            if model is None or tok is None:
+                return papers, 0
+            
+            import torch
+            inputs = tok(not_phrases, padding=True, truncation=True, max_length=512, return_tensors="pt")
+            with torch.no_grad():
+                out = model(**inputs)
+            not_vecs = out.last_hidden_state[:, 0, :].cpu().float().numpy()
+            norms = np.linalg.norm(not_vecs, axis=1, keepdims=True)
+            not_vecs = not_vecs / np.where(norms > 0, norms, 1.0)
+            
+            def embed_paper(p):
+                text = p.title + tok.sep_token + (p.abstract or "")[:400]
+                inp = tok([text], padding=True, truncation=True, max_length=512, return_tensors="pt")
+                with torch.no_grad():
+                    o = model(**inp)
+                v = o.last_hidden_state[:, 0, :].cpu().float().numpy()[0]
+                n = np.linalg.norm(v)
+                return v / n if n > 0 else v
+
+        else:
+            # Legacy fallback: MiniLM (384-dim)
+            active_threshold = threshold
+            model = get_local_embed_model()
+            if model is None:
+                return papers, 0
+            not_vecs = model.encode(not_phrases, normalize_embeddings=True)
+
+            def embed_paper(p):
+                return model.encode([p.title + "\n\n" + (p.abstract or "")], normalize_embeddings=True)[0]
+                
+    except Exception as e:
+        print(f"[semantic_not_filter] embed error: {e} — skipping semantic NOT pass")
+        return papers, 0
+
+    kept: List[Paper] = []
+    removed = 0
+    for p in papers:
+        pos = arxiv_to_pos.get(p.arxiv_id)
+        if pos is not None and pos < embeddings.shape[0]:
+            paper_vec = embeddings[pos]
+        else:
+            try:
+                paper_vec = embed_paper(p)
+            except Exception:
+                kept.append(p)
+                continue
+
+        max_sim = float(np.max(not_vecs @ paper_vec))  # cosine (normalized vectors)
+        if max_sim >= active_threshold:
+            removed += 1
+        else:
+            kept.append(p)
+
+    return kept, removed
 
 
 def filter_papers_by_venue(
@@ -587,8 +736,6 @@ def fetch_papers_from_db(
 
 def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
     if not llm_config or not llm_config.api_key or not llm_config.api_key.strip():
-        # Fallback for Optional modes/crashes
-        print(f"DEBUG: Skipping LLM call ({label}) - Invalid or missing API key.")
         return ""
 
     if "last_prompts" not in st.session_state:
@@ -599,7 +746,6 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
     for attempt in range(max_retries):
         try:
             if llm_config.provider == "openai":
-                # Standard OpenAI init
                 client_args = {"api_key": llm_config.api_key}
                 if llm_config.api_base and llm_config.api_base.strip():
                     client_args["base_url"] = llm_config.api_base
@@ -663,7 +809,8 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
 
 
 def safe_parse_json_array(raw: str) -> Optional[List[Dict[str, Any]]]:
-    if not raw or not raw.strip(): return None
+    if not raw or not raw.strip():
+        return None
     text = raw.strip()
     if text.startswith("```"):
         lines = text.splitlines()[1:]
@@ -671,20 +818,22 @@ def safe_parse_json_array(raw: str) -> Optional[List[Dict[str, Any]]]:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    # Try finding brackets
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
-        candidate = text[start:end + 1]
         try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, list): return parsed
-        except: pass
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
 
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, list): return parsed
-    except: return None
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        return None
     return None
 
 
@@ -800,19 +949,19 @@ def _bm25_ranked_pool(
     retriever,
     arxiv_to_pos: dict,
     top_k: int = 400,
+    bm25_query: Optional[str] = None,
 ) -> Dict[str, int]:
-    """
-    Run BM25 retrieval on `papers` using `query_brief`.
-    Returns a dict mapping arxiv_id → 1-indexed BM25 rank for the top-K results.
-    Papers not in the BM25 top-K are absent from the dict.
-    """
+    """BM25 retrieval over papers. Uses QIL keyword string when available.
+    Returns arxiv_id → 1-indexed rank for top-K results."""
     if not retriever or not papers:
         return {}
+
+    effective_query = bm25_query if bm25_query else query_brief
 
     pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
     paper_ids = {p.arxiv_id for p in papers}
 
-    tokens = bm25s.tokenize([query_brief])
+    tokens = bm25s.tokenize([effective_query])
     try:
         res, _scores = retriever.retrieve(tokens, k=min(top_k, len(arxiv_to_pos)))
     except Exception as exc:
@@ -838,44 +987,84 @@ def _faiss_ranked_pool(
     arxiv_to_pos: dict,
     top_k: int = 400,
     q_vec: Optional[np.ndarray] = None,
+    semantic_query: Optional[str] = None,
 ) -> Dict[str, int]:
-    """
-    Run MiniLM cosine retrieval on `papers` using precomputed `embeddings`.
-    Returns a dict mapping arxiv_id → 1-indexed FAISS/cosine rank for the top-K results.
-    Falls back to runtime embedding if precomputed embeddings are unavailable.
-    Papers not in the FAISS top-K are absent from the dict.
-    """
+    """SPECTER2 adhoc_query cosine retrieval over precomputed embeddings.
+    Uses QIL semantic_query when available; falls back to MiniLM if SPECTER2 unavailable.
+    Returns arxiv_id → 1-indexed cosine rank for top-K results."""
     if not papers:
         return {}
 
     if q_vec is None:
-        try:
-            model = get_local_embed_model()
-            q_vec = model.encode([query_brief], normalize_embeddings=True)[0]  # shape (D,)
-        except Exception as exc:
-            print(f"[FAISS] query embed error: {exc}")
-            return {}
+        encode_text = semantic_query if semantic_query and semantic_query.strip() else query_brief
+        target_dim = embeddings.shape[1] if embeddings is not None else 768
+
+        if target_dim == 768:
+            specter2_model, specter2_tok = get_specter2_model()
+            if specter2_model is not None and specter2_tok is not None:
+                try:
+                    import torch
+                    inputs = specter2_tok(
+                        [encode_text],
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                        return_tensors="pt",
+                    )
+                    with torch.no_grad():
+                        out = specter2_model(**inputs)
+                    q_vec = out.last_hidden_state[:, 0, :].cpu().float().numpy()[0]
+                    q_norm = np.linalg.norm(q_vec)
+                    if q_norm > 0:
+                        q_vec = q_vec / q_norm
+                except Exception as exc:
+                    print(f"[FAISS/SPECTER2] query embed error: {exc} — falling back to MiniLM")
+                    q_vec = None
+
+        # Fallback to MiniLM if SPECTER2 failed OR if the index is legacy 384-dim
+        if q_vec is None:
+            try:
+                model = get_local_embed_model()
+                q_vec = model.encode([encode_text], normalize_embeddings=True)[0]
+            except Exception as exc:
+                print(f"[FAISS] query embed error: {exc}")
+                return {}
 
     if embeddings is not None and arxiv_to_pos:
-        # Fast path: precomputed embeddings matrix
+        if q_vec.shape[0] != embeddings.shape[1]:
+            print(f"[FAISS] dim mismatch ({q_vec.shape[0]} vs {embeddings.shape[1]}). Rebuild index with build_index.py.")
+            return {}
+
         scores_list = []
         for p in papers:
             pos = arxiv_to_pos.get(p.arxiv_id)
-            if pos is not None and pos < embeddings.shape[0]:
-                sim = float(np.dot(embeddings[pos], q_vec))
-            else:
-                sim = -1.0  # Unseen paper gets lowest priority
+            sim = float(np.dot(embeddings[pos], q_vec)) if (pos is not None and pos < embeddings.shape[0]) else -1.0
             scores_list.append((p.arxiv_id, sim))
     else:
-        # Slow path: encode paper texts at runtime
-        texts = [p.title + "\n\n" + p.abstract[:512] for p in papers]
-        try:
-            vecs = model.encode(texts, normalize_embeddings=True, batch_size=64)
-        except Exception as exc:
-            print(f"[FAISS] batch embed error: {exc}")
-            return {}
+        # No precomputed index — encode at runtime (slow path)
+        specter2_model, specter2_tok = get_specter2_model()
+        if specter2_model is not None and specter2_tok is not None:
+            import torch
+            texts = [p.title + specter2_tok.sep_token + (p.abstract or "")[:400] for p in papers]
+            try:
+                inputs = specter2_tok(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
+                with torch.no_grad():
+                    out = specter2_model(**inputs)
+                vecs = out.last_hidden_state[:, 0, :].cpu().float().numpy()
+                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                vecs = vecs / np.where(norms > 0, norms, 1.0)
+            except Exception as exc:
+                print(f"[FAISS] batch embed error: {exc}")
+                return {}
+        else:
+            local_model = get_local_embed_model()
+            texts = [p.title + "\n\n" + p.abstract[:512] for p in papers]
+            try:
+                vecs = local_model.encode(texts, normalize_embeddings=True, batch_size=64)
+            except Exception as exc:
+                print(f"[FAISS] MiniLM embed error: {exc}")
+                return {}
         scores_list = [(p.arxiv_id, float(np.dot(vecs[i], q_vec))) for i, p in enumerate(papers)]
-
     scores_list.sort(key=lambda x: x[1], reverse=True)
     ranked: Dict[str, int] = {}
     for rank, (arxiv_id, _sim) in enumerate(scores_list[:top_k], start=1):
@@ -983,14 +1172,34 @@ def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: 
 
 @st.cache_resource(show_spinner=False)
 def load_precomputed_embeddings():
+    """
+    P-03: Load SPECTER2 proximity-encoded paper embeddings (dim=768).
+    Falls back to legacy MiniLM file (dim=384) if the new file is absent,
+    so the app stays functional while the offline rebuild is pending.
+    """
     base = get_corpus_dir()
-    emb_path = base / "embeddings_minilm.npy"
+    # Primary: SPECTER2 index (P-03)
+    emb_path = base / "embeddings.npy"
     if not emb_path.exists():
-        return None
+        # Legacy fallback during transition — remove once rebuild is complete
+        emb_path = base / "embeddings_minilm.npy"
+        if emb_path.exists():
+            # Use ASCII-safe logging to avoid CP1252 UnicodeEncodeError on Windows
+            logging.warning(
+                "[load_precomputed_embeddings] WARN: Using legacy MiniLM embeddings (384-dim). "
+                "Run build_index.py to upgrade to SPECTER2 (768-dim)."
+            )
+        else:
+            return None
     try:
-        return np.load(str(emb_path), mmap_mode='r')
+        arr = np.load(str(emb_path), mmap_mode='r')
+        logging.info(
+            "[load_precomputed_embeddings] Loaded embeddings %s from %s",
+            arr.shape, emb_path.name
+        )
+        return arr
     except Exception as e:
-        print(f"Failed to load precomputed embeddings: {e}")
+        logging.error("Failed to load precomputed embeddings: %s", e)
         return None
 
 # =========================
@@ -1013,17 +1222,11 @@ def get_specter2_model():
         from transformers import AutoTokenizer
         import torch
 
-        # Set timeouts for robust downloading
-        tokenizer = AutoTokenizer.from_pretrained(
-            "allenai/specter2_base",
-            timeout=120,
-            local_files_only=False
-        )
-        model = AutoAdapterModel.from_pretrained(
-            "allenai/specter2_base",
-            timeout=120,
-            local_files_only=False
-        )
+        # NOTE: timeout is controlled via HF_HUB_DOWNLOAD_TIMEOUT env var (set at top of file).
+        # Do NOT pass timeout= to from_pretrained — adapters lib forwards it to
+        # BertAdapterModel.__init__() which rejects it with TypeError.
+        tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
+        model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
 
         # Load and activate the adhoc_query adapter for query-to-paper retrieval
         model.load_adapter(
@@ -1159,6 +1362,22 @@ def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Opti
         
     try:
         model = get_local_embed_model()
+        embs_dim = embeddings.shape[1] if embeddings is not None else 0
+        
+        # If the index dimension is not 384, we can't use it with MiniLM query.
+        # Force runtime fallback.
+        if embs_dim != 384:
+            texts = [p.title + "\n\n" + (p.abstract or "") for p in papers]
+            paper_vecs = model.encode(texts, normalize_embeddings=True, batch_size=64)
+            q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
+            scored = []
+            for p, vec in zip(papers, paper_vecs):
+                sim = float(np.dot(vec, q_vec))
+                p.semantic_relevance = sim
+                scored.append((sim, p))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [p for _, p in scored[:n2]]
+
         q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
     except Exception as e:
         print(f"Local query embed error: {e}")
@@ -1184,68 +1403,46 @@ def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Opti
 def get_cross_encoder_model():
     try:
         from sentence_transformers import CrossEncoder
-        st.info("Loading CrossEncoder model for precision re-ranking (first run only)…")
-        return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        # P-07: Swapped from ms-marco-MiniLM-L-6-v2 to BAAI/bge-reranker-base
+        # bge-reranker-base is trained on broader multilingual+scientific corpus;
+        # consistently outperforms ms-marco on BEIR scientific subsets (SciFact, TREC-COVID).
+        st.info("Loading CrossEncoder model (BAAI/bge-reranker-base) for precision re-ranking (first run only)…")
+        return CrossEncoder("BAAI/bge-reranker-base")
     except Exception as e:
         print(f"CrossEncoder load error: {e}")
         return None
 
 def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -> List[Paper]:
+    """
+    P-10: Writes sigmoid(logit) exclusively to p.cross_encoder_score.
+    Does NOT overwrite p.semantic_relevance (Stage 2 cosine — preserved for display + fallback).
+    When model is unavailable, returns papers[:n3] with cross_encoder_score=None so
+    scibert_classify_papers can detect the failure and use cosine-based heuristic fallback.
+    """
     if not papers: return []
     model = get_cross_encoder_model()
     if not model:
-        # Fallback, just return top-N of whatever they came in as
+        # Model unavailable — cross_encoder_score stays None; classifier uses heuristic fallback
         return papers[:n3]
-        
+
     pairs = [[query_brief, p.title + "\n\n" + p.abstract] for p in papers]
     try:
         scores = model.predict(pairs)
-        # normalize to 0-1 range roughly using sigmoid if we want it to look like cosine, 
-        # or just sort by raw logits for reranking.
-        # We will sort by raw logit, but we can set semantic_relevance to an arbitrary 0-1 scale.
-        
         scored = []
         for p, score in zip(papers, scores):
             score_float = float(score)
-            # Sigmoid normalization for relevance
-            p.semantic_relevance = 1 / (1 + math.exp(-score_float)) 
+            # P-10: dedicated field only — semantic_relevance (Stage 2 cosine) is NOT touched
+            p.cross_encoder_score = 1 / (1 + math.exp(-score_float))
             scored.append((score_float, p))
-            
+
         scored.sort(key=lambda x: x[0], reverse=True)
         k = min(n3, len(scored))
         return [p for _, p in scored[:k]]
     except Exception as e:
         print(f"CrossEncoder predict error: {e}")
+        # cross_encoder_score stays None on failure — heuristic fallback kicks in at Phase 4
         return papers[:n3]
 
-
-def _hyde_enrich_query(query_brief: str, llm_config: Optional[LLMConfig]) -> np.ndarray:
-    """
-    Task 35: HyDE Stage 0 query enrichment. 
-    Averages original query_brief vector with a LLM-generated hypothetical abstract vector.
-    """
-    model = get_local_embed_model()
-    brief_vec = model.encode([query_brief], normalize_embeddings=True)[0]
-    
-    if not llm_config:
-        return brief_vec
-
-    prompt = (
-        f"Write a concise 100-word paper abstract (not a question) that would be highly relevant to "
-        f"this research brief. Use academic technical language. Brief: {query_brief}"
-    )
-    
-    try:
-        raw_hypothetical = call_llm(prompt, llm_config, label="hyde")
-        if raw_hypothetical:
-            st.write(f"**⚡ HyDE Generated Abstract:**\n\n> {raw_hypothetical.strip()}")
-            hypothetical_vec = model.encode([raw_hypothetical], normalize_embeddings=True)[0]
-            enriched_vec = (brief_vec + hypothetical_vec) / 2
-            return enriched_vec / np.linalg.norm(enriched_vec)
-    except Exception as e:
-        print(f"HyDE error: {e}")
-        
-    return brief_vec
 
 def select_embedding_candidates(
     papers: List[Paper],
@@ -1254,56 +1451,73 @@ def select_embedding_candidates(
     embedding_model: str = "",
     provider: str = "",
     max_candidates: int = 150,
-    use_hyde: bool = False,
+    use_hyde: bool = False,  # retired; kept for call-site backward compat
 ) -> List[Paper]:
     """
-    3-Stage Hybrid Search (Task 33: Stage 1 upgraded to RRF parallel retrieval):
-
-    Stage 1 (RRF):  Parallel BM25 + FAISS/MiniLM → Reciprocal Rank Fusion → top-600
-    Stage 2 (SPECTER2 vector rerank; falls back to MiniLM): top-600 → top-300 by cosine similarity
-    Stage 3 (CrossEncoder precision): top-300 → top-150 by cross-attention score
-
-    Fallback modes (graceful degradation):
-    - BM25 missing  → FAISS-only (rrf_weight_bm25=0, all papers retrieval_source="faiss_only")
-    - FAISS missing → BM25-only  (rrf_weight_faiss=0, all papers retrieval_source="bm25_only")
-    - Both missing  → full input pool (legacy path, no provenance tags)
+    4-stage hybrid search pipeline:
+      Stage 0 — QIL decomposes brief → semantic_query, bm25_keywords, intent
+      Stage 1 — Parallel BM25 + FAISS → RRF → adaptive top-K
+      Stage 2 — SPECTER2 vector rerank → top-400 (MiniLM fallback)
+      Stage 3 — CrossEncoder precision rerank → top-150
+    Graceful degradation: BM25-only, FAISS-only, or full-pool fallback.
     """
     if not papers:
         return []
 
     st.write(f"Starting 3-stage hybrid search from {len(papers)} SQLite candidates...")
 
-    # ─── Load shared artifacts ──────────────────────────────────────────────
+    # ─── Stage 0: Query Intelligence Layer ────────────────────────────────
+    sq = None
+    if analyse_query is not None:
+        try:
+            groq_key = os.getenv("GROQ_API_KEY", "").strip()
+            if not groq_key and llm_config and llm_config.provider == "groq" and llm_config.api_key:
+                groq_key = llm_config.api_key.strip()
+            sq = analyse_query(brief=query_brief, groq_api_key=groq_key or None)
+            qil_source = sq.source.upper() if sq else "NONE"
+            st.write(
+                f"⏱ Stage 0 (QIL/{qil_source}): intent=`{sq.intent}` · "
+                f"quality=`{sq.quality_modifier}` · "
+                f"keywords=`{', '.join(sq.bm25_keywords[:4])}{'...' if len(sq.bm25_keywords) > 4 else ''}`"
+            )
+        except Exception as _qil_err:
+            print(f"[QIL] query analysis failed: {_qil_err} — using raw brief")
+            sq = None
+
+    bm25_query     = sq.bm25_query_string if sq and sq.bm25_keywords else None
+    semantic_query = sq.semantic_query    if sq and sq.semantic_query  else None
+    intent_rrf_bm25  = sq.rrf_weight_bm25  if sq else 1.0
+    intent_rrf_faiss = sq.rrf_weight_faiss if sq else 1.0
+
     bm25_retriever, arxiv_to_pos = load_bm25_index()
     embeddings = load_precomputed_embeddings()
 
-    have_bm25 = bool(bm25_retriever and arxiv_to_pos)
-    have_faiss = embeddings is not None  # Use numpy matrix as the FAISS stand-in
+    have_bm25  = bool(bm25_retriever and arxiv_to_pos)
+    have_faiss = embeddings is not None
 
-    # ─── Stage 0: HyDE optional enrichment ───────────────────────────────────
-    q_vec = None
-    if use_hyde and llm_config:
-        st.write("⏱ Stage 0: HyDE AI query enrichment...")
-        q_vec = _hyde_enrich_query(query_brief, llm_config)
-
-    # ─── Stage 1: Parallel BM25 + FAISS → RRF ────────────────────────────
-    st.write("⏱ Stage 1: Parallel BM25 + FAISS → RRF merge...")
+    # ─── Stage 1: Parallel BM25(keywords) + FAISS(semantic_query) → RRF ──
+    # P-04: Adaptive top-K — 7% of corpus, capped at 1200
+    adaptive_k = min(int(len(papers) * 0.07), 1200)
+    adaptive_k = max(adaptive_k, 50)  # floor: never go below 50
+    st.write(f"⏱ Stage 1: Parallel BM25 + FAISS → RRF merge (adaptive_k={adaptive_k}, bm25_w={intent_rrf_bm25:.1f}, faiss_w={intent_rrf_faiss:.1f})...")
 
     if have_bm25 and have_faiss:
         # ━━━ Full RRF path ━━━
         bm25_ranks = _bm25_ranked_pool(
-            papers, query_brief, bm25_retriever, arxiv_to_pos, top_k=400
+            papers, query_brief, bm25_retriever, arxiv_to_pos,
+            top_k=adaptive_k, bm25_query=bm25_query,
         )
         faiss_ranks = _faiss_ranked_pool(
-            papers, query_brief, embeddings, arxiv_to_pos, top_k=400, q_vec=q_vec
+            papers, query_brief, embeddings, arxiv_to_pos,
+            top_k=adaptive_k, q_vec=None, semantic_query=semantic_query,
         )
         stage1_papers = rrf_merge(
             papers,
             bm25_ranks=bm25_ranks,
             faiss_ranks=faiss_ranks,
-            rrf_weight_bm25=1.0,
-            rrf_weight_faiss=1.0,
-            top_n=600,
+            rrf_weight_bm25=intent_rrf_bm25,
+            rrf_weight_faiss=intent_rrf_faiss,
+            top_n=adaptive_k,
         )
         n_both = sum(1 for p in stage1_papers if p.retrieval_source == "both")
         n_bm25_only = sum(1 for p in stage1_papers if p.retrieval_source == "bm25_only")
@@ -1317,15 +1531,16 @@ def select_embedding_candidates(
         # ━━━ BM25-only fallback ━━━
         st.warning("⚠️ FAISS embeddings not available — running BM25-only Stage 1 (no RRF merge).")
         bm25_ranks = _bm25_ranked_pool(
-            papers, query_brief, bm25_retriever, arxiv_to_pos, top_k=600
+            papers, query_brief, bm25_retriever, arxiv_to_pos,
+            top_k=adaptive_k, bm25_query=bm25_query,
         )
         stage1_papers = rrf_merge(
             papers,
             bm25_ranks=bm25_ranks,
             faiss_ranks={},
-            rrf_weight_bm25=1.0,
+            rrf_weight_bm25=intent_rrf_bm25,
             rrf_weight_faiss=0.0,
-            top_n=600,
+            top_n=adaptive_k,
         )
         if len(stage1_papers) < 50:
             st.info("BM25 Stage 1 returned fewer than 50 papers — using full pool.")
@@ -1337,15 +1552,16 @@ def select_embedding_candidates(
         # ━━━ FAISS-only fallback ━━━
         st.warning("⚠️ BM25 index not available — running FAISS-only Stage 1 (no RRF merge).")
         faiss_ranks = _faiss_ranked_pool(
-            papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, top_k=600, q_vec=q_vec
+            papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {},
+            top_k=adaptive_k, q_vec=None, semantic_query=semantic_query,
         )
         stage1_papers = rrf_merge(
             papers,
             bm25_ranks={},
             faiss_ranks=faiss_ranks,
             rrf_weight_bm25=0.0,
-            rrf_weight_faiss=1.0,
-            top_n=600,
+            rrf_weight_faiss=intent_rrf_faiss,
+            top_n=adaptive_k,
         )
         st.write(f"✅ FAISS-only Stage 1: {len(stage1_papers)} candidates.")
 
@@ -1354,36 +1570,58 @@ def select_embedding_candidates(
         st.warning("⚠️ Neither BM25 nor FAISS index is available — using full pool as Stage 1 fallback.")
         stage1_papers = papers
 
+    # ─── P-10: QIL not_terms filter — applied once after Stage 1 ──────────
+    # hard_filters.not_terms extracted by QIL (LLM or rules) from the research brief.
+    # Applied here (post-Stage 1, pre-Stage 2) so explicit exclusions don't pollute
+    # SPECTER2/CrossEncoder ranking and don't need a second pass later.
+    qil_not_terms = (sq.hard_filters.get("not_terms", []) if sq else [])
+    if qil_not_terms:
+        before_not = len(stage1_papers)
+        stage1_papers = [
+            p for p in stage1_papers
+            if not any(t in (p.title + " " + (p.abstract or "")).lower() for t in qil_not_terms)
+        ]
+        removed_not = before_not - len(stage1_papers)
+        if removed_not:
+            st.write(f"🚫 QIL not_terms filter removed {removed_not} papers from Stage 1 pool.")
+
     # ─── Stage 2: SPECTER2 adhoc_query → MiniLM fallback ─────────────────
+    # P-00: Pass semantic_query so SPECTER2 encodes the clean statement, not raw prose.
+    # P-05: expanded to n2=400 to compensate for larger adaptive Stage 1 pool.
+    stage2_query = semantic_query if semantic_query else query_brief
     st.write("⏱ Stage 2: SPECTER2 semantic reranking (falls back to MiniLM if unavailable)...")
-    stage2_papers = specter2_vector_rerank(stage1_papers, query_brief, n2=300)
+    stage2_papers = specter2_vector_rerank(stage1_papers, stage2_query, n2=400)
     if stage2_papers:
         st.write(
             f"✅ SPECTER2 Stage 2: {len(stage2_papers)} candidates selected "
             f"(scientific asymmetric retrieval)."
         )
     else:
-        # SPECTER2 not available or failed — use MiniLM pre-computed embeddings
-        st.write("⚠️ SPECTER2 unavailable — using MiniLM pre-computed embeddings for Stage 2.")
+        # P-06: upgraded from st.write to st.warning so fallback is visually distinct
+        st.warning(
+            "⚠️ SPECTER2 unavailable — falling back to MiniLM for Stage 2. "
+            "Retrieval quality may be reduced. Check that `allenai/specter2` is installed."
+        )
         stage2_papers = minilm_vector_rerank(
             stage1_papers,
-            query_brief,
+            stage2_query,
             embeddings,
             arxiv_to_pos if arxiv_to_pos else {},
-            n2=300,
+            n2=400,  # P-05: 300→400
         )
         st.write(f"✅ MiniLM Stage 2 fallback: {len(stage2_papers)} candidates selected.")
 
-
     # ─── Stage 3: CrossEncoder Precision Rerank ───────────────────────
+    # P-00: Cross-encoder pairs against semantic_query for a cleaner signal.
+    stage3_query = semantic_query if semantic_query else query_brief
     st.write("⏱ Stage 3: Cross-Encoder precision reranking...")
-    stage3_papers = cross_encoder_rerank(stage2_papers, query_brief, n3=max_candidates)
+    stage3_papers = cross_encoder_rerank(stage2_papers, stage3_query, n3=max_candidates)
     st.write(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
 
     # ─── Stage 4: Abstract Highlights Extraction ──────────────────────
     st.write("⏱ Stage 4: Extracting sentence-level abstract highlights...")
-    stage3_papers = extract_abstract_highlights(stage3_papers, query_brief)
-    
+    stage3_papers = extract_abstract_highlights(stage3_papers, stage2_query)
+
     # ─── Stage 5: Artifact signal detection (Task 38) ─────────────────
     stage3_papers = enrich_paper_signals(stage3_papers)
 
@@ -1534,16 +1772,13 @@ def classify_papers_with_llm(
 
         prompt = "\n\n".join([instruction, "PAPERS:", *paper_blocks])
         
-        # Retry logic handled inside call_llm now
         try:
             raw = call_llm(prompt, llm_config, label="classification")
-        except:
+        except Exception:
             raw = ""
 
         parsed = safe_parse_json_array(raw)
-
         if parsed is None:
-            # st.error("Failed to parse classification JSON.")
             continue
 
         idx_to_info = {}
@@ -1551,13 +1786,15 @@ def classify_papers_with_llm(
             try:
                 idx = int(item["index"])
                 label = str(item.get("focus_label", "")).strip().lower()
-                if label not in ["primary", "secondary", "off-topic"]: label = "off-topic"
+                if label not in ["primary", "secondary", "off-topic"]:
+                    label = "off-topic"
                 idx_to_info[idx] = {
                     "focus_label": label,
                     "relevance_score": float(item.get("relevance_score", 0.0)),
                     "reason": str(item.get("reason", "")).strip(),
                 }
-            except: continue
+            except (KeyError, TypeError, ValueError):
+                continue
 
         for idx, p in enumerate(batch):
             info = idx_to_info.get(idx)
@@ -1575,21 +1812,35 @@ def classify_papers_with_llm(
 
 def scibert_classify_papers(papers: List[Paper]) -> List[Paper]:
     """
-    Task 41: CrossEncoder threshold classification.
-    Replaces LLM-based classification to save tokens.
-    Iterates through papers and assigns primary/secondary/off-topic using the p.semantic_relevance generated by Stage 3.
+    P-10: CrossEncoder threshold classification with explicit heuristic fallback.
+
+    Primary path (CE available):
+      Reads p.cross_encoder_score (Stage 3 sigmoid of BGE-reranker-base logit).
+      Thresholds: PRIMARY_THRESHOLD=0.55, SECONDARY_THRESHOLD=0.25.
+
+    Fallback path (CE unavailable — model failed to load or predict raised):
+      p.cross_encoder_score is None for all papers.
+      Delegates to heuristic_classify_papers_free(), which uses rank-based
+      top-30% = primary over p.semantic_relevance (Stage 2 cosine).
+      This guarantees at least min(n, max(10, 30% of n)) primary papers,
+      preventing the "no results" failure when CrossEncoder is unavailable.
     """
+    ce_available = any(p.cross_encoder_score is not None for p in papers)
+
+    if not ce_available:
+        # No CE scores — cosine similarities in semantic_relevance; use rank-based heuristic
+        return heuristic_classify_papers_free(papers)
+
     for p in papers:
-        score = p.semantic_relevance if p.semantic_relevance is not None else 0.0
+        score = p.cross_encoder_score if p.cross_encoder_score is not None else 0.0
         p.llm_relevance_score = score
-        
         if score >= PRIMARY_THRESHOLD:
             p.focus_label = "primary"
         elif score >= SECONDARY_THRESHOLD:
             p.focus_label = "secondary"
         else:
             p.focus_label = "off-topic"
-            
+
     return papers
 
 
@@ -1612,44 +1863,40 @@ def heuristic_classify_papers_free(candidates: List[Paper]) -> List[Paper]:
 # =========================
 
 def get_s2_citation_stats(paper: Paper, api_key: Optional[str] = None) -> int:
-    """Queries Semantic Scholar to find the max author citations."""
+    """Return max author citation count from Semantic Scholar; 0 if unavailable."""
     headers = {"x-api-key": api_key} if api_key else {}
-    max_retries = 2 # 3 attempts total (initial + 2 retries)
+    max_retries = 2
 
     def fetch(url, params):
         for attempt in range(max_retries + 1):
             try:
-                # INCREASED TIMEOUT TO 10
                 r = requests.get(url, headers=headers, params=params, timeout=10)
                 if r.status_code == 200:
                     return r.json()
-                if r.status_code == 429: # Rate limit, backoff
-                     time.sleep(2 * (attempt + 1))
-                     continue
-            except:
-                 if attempt < max_retries:
-                     time.sleep(1)
-                     continue
+                if r.status_code == 429:
+                    time.sleep(2 * (attempt + 1))
+            except requests.RequestException:
+                if attempt < max_retries:
+                    time.sleep(1)
         return None
-    
-    # 1. Try Lookup by ArXiv ID first (More reliable)
-    if paper.arxiv_id:
-        clean_id = paper.arxiv_id.split('v')[0]
-        url = f"https://api.semanticscholar.org/graph/v1/paper/ARXIV:{clean_id}"
-        params = {"fields": "authors.citationCount"}
-        data = fetch(url, params)
-        if data:
-            auth_cites = [a.get('citationCount', 0) for a in data.get('authors', []) if a.get('citationCount')]
-            if auth_cites: return max(auth_cites)
 
-    # 2. Fallback to Title Search
-    url = "https://api.semanticscholar.org/graph/v1/paper/search"
-    params = {"query": paper.title, "limit": 1, "fields": "title,citationCount,authors.citationCount"}
-    data = fetch(url, params)
-    if data and data.get('data'):
-         paper_data = data['data'][0]
-         auth_cites = [a.get('citationCount', 0) for a in paper_data.get('authors', []) if a.get('citationCount')]
-         return max(auth_cites) if auth_cites else 0
+    if paper.arxiv_id:
+        data = fetch(
+            f"https://api.semanticscholar.org/graph/v1/paper/ARXIV:{paper.arxiv_id.split('v')[0]}",
+            {"fields": "authors.citationCount"},
+        )
+        if data:
+            auth_cites = [a.get("citationCount", 0) for a in data.get("authors", []) if a.get("citationCount")]
+            if auth_cites:
+                return max(auth_cites)
+
+    data = fetch(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        {"query": paper.title, "limit": 1, "fields": "title,citationCount,authors.citationCount"},
+    )
+    if data and data.get("data"):
+        auth_cites = [a.get("citationCount", 0) for a in data["data"][0].get("authors", []) if a.get("citationCount")]
+        return max(auth_cites) if auth_cites else 0
 
     return 0
 
@@ -1660,8 +1907,10 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
     weights = DEFAULT_MONEYBALL_WEIGHTS
     if os.path.exists("moneyball_weights.json"):
         try:
-            with open("moneyball_weights.json", "r") as f: weights = json.load(f)
-        except: pass
+            with open("moneyball_weights.json", "r") as f:
+                weights = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
     
     # Read S2 key from st.secrets (Streamlit Cloud) with os.getenv fallback (local/.env)
     s2_key = st.secrets.get("S2_API_KEY") or os.getenv("S2_API_KEY")
@@ -1730,24 +1979,22 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
             raw = ""
             if llm_config and llm_config.api_key and llm_config.api_key.strip():
                 raw = call_llm(prompt, llm_config, label="moneyball_narrative")
-            
+
             if raw:
                 if "```" in raw:
                     parts = raw.split("```json")
-                    if len(parts) > 1: raw = parts[1].split("```")[0]
-                    else: raw = raw.split("```")[1].split("```")[0]
-                
+                    raw = parts[1].split("```")[0] if len(parts) > 1 else raw.split("```")[1].split("```")[0]
+
                 parsed = json.loads(raw.strip())
                 h4_utility = float(parsed.get("score", 5) * 10)
-                
+
                 if "bullets" in parsed and isinstance(parsed["bullets"], list):
-                    raw_list = parsed["bullets"]
-                    cleaned_list = []
-                    for b in raw_list:
-                        b = b.replace("Market Fit:", "").replace("Contribution:", "").strip()
-                        cleaned_list.append(b)
-                    content_bullets = cleaned_list[:2]
-        except: pass
+                    content_bullets = [
+                        b.replace("Market Fit:", "").replace("Contribution:", "").strip()
+                        for b in parsed["bullets"][:2]
+                    ]
+        except (json.JSONDecodeError, ValueError, KeyError):
+            pass
 
         # 4. Calculate Final Score
         if fame_label == "too_new":
@@ -1886,7 +2133,7 @@ If you selected a venue filter (e.g. "NeurIPS only" or "All Journals"), the agen
 
 #### 4. The agent judges how relevant each paper is
 
-A CrossEncoder model (`ms-marco-MiniLM-L-6-v2`) scores each candidate against the research brief. Papers scoring ≥ 0.65 are labelled **primary**; ≥ 0.30 are **secondary**; below 0.30 are filtered out. No LLM tokens are used at this step.
+A CrossEncoder model (`BAAI/bge-reranker-base`) scores each candidate against the research brief. Papers scoring ≥ 0.55 are labelled **primary**; ≥ 0.25 are **secondary**; below 0.25 are filtered out. No LLM tokens are used at this step.
 
 #### 5. The agent builds a citation impact set
 
@@ -2209,16 +2456,12 @@ def _main_body():
                 "Classification and citation impact scoring use simple heuristics. No API key or external calls."
             )
 
-        # ─── Task 35: HyDE UI Toggle ───
-        use_hyde = False
-        if provider in ("openai", "gemini", "groq") and api_key.strip():
-            brief_word_count = len(research_brief.split())
-            if 0 < brief_word_count < 30:
-                use_hyde = st.checkbox(
-                    "⚡ Expand query with AI (HyDE)", 
-                    value=False,
-                    help="Generates a hypothetical paper abstract to improve recall for short or informal queries. May reduce precision for very specific queries."
-                )
+        # ─── Task 35: HyDE retired (P-10) ─────────────────────────────────────
+        # HyDE is superseded by the P-00 Query Intelligence Layer, which generates a
+        # clean semantic_query passed directly to FAISS and SPECTER2/CrossEncoder.
+        # HyDE's MiniLM encoding also causes a 384-vs-768 dim mismatch with the
+        # SPECTER2 FAISS index, silently returning zero FAISS candidates when used.
+        use_hyde = False  # kept for backward-compat signature; never passed True
 
         run_clicked = st.button("🚀 Run Pipeline")
 
@@ -2399,23 +2642,10 @@ def _main_body():
         else:
             st.info("No papers found in local corpus for this specific date range.")
 
-        # Apply venue filtering IMMEDIATELY
-        before_v = len(current_papers)
-        current_papers = filter_papers_by_venue(
-            current_papers,
-            venue_filter_type,
-            selected_category,
-            selected_venues
-        )
-        after_v = len(current_papers)
-        
-        if venue_filter_type != "None":
-            display_sel = ", ".join(selected_venues) if selected_venues else ""
-            name_string = f" → {display_sel}" if display_sel else ""
-            st.info(
-                f"Venue filter `{venue_filter_type}` applied{name_string}. "
-                f"Remaining: {after_v} (Filtered out {before_v - after_v})"
-            )
+        # P-09: Early venue filter REMOVED — was double-filtering and blinding Stage 1.
+        # Venue filter now runs correctly post-Stage 3 only (see below, after candidates are selected).
+        # Previously this block applied filter_papers_by_venue immediately after fetch,
+        # reducing Stage 1 input pool with no recall recovery path.
 
         st.session_state["current_papers"] = current_papers
     else:
@@ -2428,7 +2658,17 @@ def _main_body():
     # Apply NOT filter provider-agnostically
     if not_text:
         current_papers, removed_count = filter_papers_by_not_terms(current_papers, not_text)
-        st.info(f"Excluded {removed_count} papers whose title or abstract contained NOT terms.")
+        st.info(f"Excluded {removed_count} papers whose title or abstract contained NOT terms (lexical).")
+        # P-01: Semantic NOT second pass — catches paraphrased/synonym variants
+        not_phrases = [t.strip() for t in not_text.split(",") if t.strip()]
+        if not_phrases:
+            _emb = load_precomputed_embeddings()
+            _, _a2p = load_bm25_index()
+            current_papers, sem_removed = semantic_not_filter(
+                current_papers, not_phrases, _a2p or {}, _emb, threshold=0.65
+            )
+            if sem_removed:
+                st.info(f"Semantic NOT filter removed {sem_removed} additional papers (paraphrase/synonym exclusion).")
 
     st.session_state["current_papers"] = current_papers
 
@@ -2466,7 +2706,7 @@ def _main_body():
                     embedding_model=embedding_model_name,
                     provider=provider,
                     max_candidates=150,
-                    use_hyde=use_hyde,
+                    # P-10: use_hyde retired — QIL semantic_query supersedes HyDE
                 )
             if not candidates:
                 st.warning("Embedding stage returned no candidates. Using all fetched papers as fallback.")
@@ -2481,6 +2721,26 @@ def _main_body():
         os.path.join(project_folder, "candidates_embedding_selected.json"),
         [asdict(p) for p in candidates],
     )
+
+    # P-09: Venue filter — applied ONCE, post-Stage 3, for all code paths
+    if venue_filter_type != "None" and mode != "global":
+        before_v = len(candidates)
+        candidates = filter_papers_by_venue(
+            candidates,
+            venue_filter_type,
+            selected_category,
+            selected_venues,
+        )
+        after_v = len(candidates)
+        display_sel = ", ".join(selected_venues) if selected_venues else ""
+        name_string = f" → {display_sel}" if display_sel else ""
+        st.info(
+            f"Venue filter `{venue_filter_type}` applied{name_string} after Stage 3. "
+            f"Remaining: {after_v} (filtered out {before_v - after_v})"
+        )
+        if not candidates:
+            st.warning("Venue filter removed all candidates. Relaxing venue filter — showing all Stage 3 results.")
+            candidates = st.session_state.get("candidates", current_papers)
 
     # 4. Relevance classification
     st.subheader("4. Relevance Classification")
@@ -2624,13 +2884,17 @@ def _main_body():
             st.write(f"[arXiv link]({p.arxiv_url}) | [PDF link]({p.pdf_url})")
             if p.focus_label:
                 st.write(f"**Focus label:** {p.focus_label}")
-            rel_str = f"{p.llm_relevance_score:.2f}" if p.llm_relevance_score is not None else "N/A"
-            st.write(f"**Relevance score:** {rel_str}")
+            # P-10: show CE score (Stage 3) and cosine (Stage 2) as distinct signals
+            if p.cross_encoder_score is not None:
+                st.write(f"**CrossEncoder score (Stage 3):** {p.cross_encoder_score:.3f}")
+            else:
+                rel_str = f"{p.llm_relevance_score:.2f}" if p.llm_relevance_score is not None else "N/A"
+                st.write(f"**Relevance score (heuristic):** {rel_str}")
             sim_str = f"{p.semantic_relevance:.3f}" if p.semantic_relevance is not None else "N/A"
+            st.write(f"**Semantic similarity (Stage 2):** {sim_str}")
             if p.semantic_reason:
-                st.write("**Why this paper is (or is not) relevant to your brief:**")
+                st.write("**Why this paper matches your brief:**")
                 st.write(p.semantic_reason)
-            st.write(f"**Embedding similarity score:** {sim_str}")
             # ── Task 37: Retrieval provenance (visible when Task 33 RRF is active) ──
             if p.retrieval_source is not None:
                 src_label = {
@@ -2875,10 +3139,14 @@ These scores are heuristic and should be used as a guide for exploration rather 
 
         if p.focus_label:
             st.write(f"**Focus label:** {p.focus_label}")
-        rel_str = f"{p.llm_relevance_score:.2f}" if p.llm_relevance_score is not None else "N/A"
-        st.write(f"**Relevance score:** {rel_str}")
+        # P-10: separate CE score and Stage 2 cosine for transparency
+        if p.cross_encoder_score is not None:
+            st.write(f"**CrossEncoder score (Stage 3):** {p.cross_encoder_score:.3f}")
+        else:
+            rel_str = f"{p.llm_relevance_score:.2f}" if p.llm_relevance_score is not None else "N/A"
+            st.write(f"**Relevance score (heuristic):** {rel_str}")
         sim_str = f"{p.semantic_relevance:.3f}" if p.semantic_relevance is not None else "N/A"
-        st.write(f"**Embedding similarity score:** {sim_str}")
+        st.write(f"**Semantic similarity (Stage 2):** {sim_str}")
 
         if p.semantic_reason:
             st.write("**Why this paper matches your brief:**")

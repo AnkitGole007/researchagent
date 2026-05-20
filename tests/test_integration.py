@@ -43,6 +43,6 @@ def test_pipeline_100_papers(tmp_path):
     # Step 2 — index build
     run_index_build(db_path=db, output_dir=str(tmp_path))
 
-    assert (tmp_path / "index_minilm.faiss").exists(), "FAISS index not created"
+    assert (tmp_path / "corpus.faiss").exists(), "FAISS index not created"
     assert (tmp_path / "id_map.json").exists(), "id_map.json not created"
-    assert (tmp_path / "embeddings_minilm.npy").exists(), "embeddings file not created"
+    assert (tmp_path / "embeddings.npy").exists(), "embeddings file not created"

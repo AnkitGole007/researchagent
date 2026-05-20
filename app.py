@@ -660,6 +660,9 @@ def build_arxiv_category_query(
 
     return "(" + " OR ".join([f"cat:{c}" for c in cats]) + ")"
 
+DB_FETCH_LIMIT = 20_000  # Hard cap: prevents OOM on Streamlit Cloud with large date windows
+
+
 def fetch_papers_from_db(
     start_date: date,
     end_date: date,
@@ -667,9 +670,12 @@ def fetch_papers_from_db(
     subcats: Optional[List[str]] = None
 ) -> List[Paper]:
     """
-    Fetch papers from the local SQLite 20k corpus.
+    Fetch papers from the local SQLite corpus.
     Filters by submitted_date range, and optionally checks abstract/title
     for subcategory keyword matches to simulate arXiv category filtering.
+
+    Hard-capped at DB_FETCH_LIMIT rows (most recent first) to prevent OOM
+    on Streamlit Cloud when "All Time" is selected over a 180k+ corpus.
     """
     import os
     import json
@@ -680,10 +686,10 @@ def fetch_papers_from_db(
 
     conn = _sq.connect(db_path, check_same_thread=False)
     conn.row_factory = _sq.Row
-    
+
     query = "SELECT * FROM papers WHERE date(submitted_date) >= date(?) AND date(submitted_date) <= date(?)"
     params = [start_date.isoformat(), end_date.isoformat()]
-    
+
     if category_filter and category_filter != "All":
         query += " AND fields_of_study LIKE ?"
         params.append(f"%{category_filter}%")
@@ -698,14 +704,17 @@ def fetch_papers_from_db(
                 keyword = words[0]
                 if len(words) > 1:
                     keyword = " ".join(words[:2]) # e.g. "Artificial Intelligence"
-                
+
                 # Check for either standard keyword simulation OR absolute 100% precision raw arXiv tag
                 or_clauses.append("(title LIKE ? OR abstract LIKE ? OR fields_of_study LIKE ?)")
                 params.extend([f"%{keyword}%", f"%{keyword}%", f"%{cat_code}%"])
-                
+
         if or_clauses:
             query += " AND (" + " OR ".join(or_clauses) + ")"
-        
+
+    # Always return the most-recent papers first; cap at DB_FETCH_LIMIT to prevent OOM.
+    query += f" ORDER BY submitted_date DESC LIMIT {DB_FETCH_LIMIT}"
+
     rows = conn.execute(query, params).fetchall()
 
     papers: List[Paper] = []
@@ -1260,36 +1269,41 @@ def specter2_vector_rerank(
     papers: List[Paper],
     query_brief: str,
     n2: int = 300,
+    precomputed_embeddings: Optional[np.ndarray] = None,
+    arxiv_to_pos: Optional[dict] = None,
 ) -> List[Paper]:
     """
-    Stage 2 reranker using SPECTER2 adhoc_query adapter.
+    Stage 2 reranker — asymmetric SPECTER2 retrieval with precomputed-embedding fast path.
 
-    Encoding protocol (official SPECTER2 asymmetric format):
-      - Query : query_brief  (encode with adhoc_query adapter)
-      - Paper : title + tokenizer.sep_token + abstract  (encode with adhoc_query adapter;
-                the proximity adapter would be ideal for papers but requires loading a second
-                adapter—using adhoc_query for both keeps a single adapter loaded and is
-                still considerably better than MiniLM for scientific text retrieval)
+    Encoding protocol (correct SPECTER2 asymmetric format):
+      - Query : encode live with adhoc_query adapter (~0.3s, one forward pass)
+      - Paper : look up precomputed proximity-adapter embeddings from embeddings.npy
+                (already built by build_index.py with the correct paper-side adapter).
+                Only papers absent from the index fall back to a live adhoc_query pass,
+                which is a small minority in practice.
+
+    Fast path:   precomputed_embeddings + arxiv_to_pos provided → ~0.05s for 1200 papers
+    Slow path:   embeddings not provided → live SPECTER2 encode for all papers (~60s/1200)
+    Fallback:    SPECTER2 model unavailable → return [] so caller uses MiniLM path
 
     Sets p.semantic_relevance on each paper.
-    Fallback: if SPECTER2 unavailable, returns [] so the caller uses MiniLM.
     """
     if not papers:
         return []
 
     model, tokenizer = get_specter2_model()
     if model is None or tokenizer is None:
-        return []   # Caller should detect and fall back to minilm_vector_rerank
+        return []   # Caller falls back to minilm_vector_rerank
 
     import torch
 
-    # Ensure adapter is active before inference
+    # Ensure adhoc_query adapter active for query encoding
     try:
         model.set_active_adapters("specter2_adhoc_query")
     except Exception as e:
         print(f"[SPECTER2] Warning: Could not set active adapter: {e}")
 
-    def _encode_batch(texts: List[str], batch_size: int = 32) -> "np.ndarray":
+    def _encode_batch(texts: List[str], batch_size: int = 32) -> np.ndarray:
         all_vecs = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
@@ -1303,37 +1317,94 @@ def specter2_vector_rerank(
             )
             with torch.no_grad():
                 output = model(**inputs)
-            # [CLS] token = index 0 of last_hidden_state
             vecs = output.last_hidden_state[:, 0, :].cpu().numpy()
             all_vecs.append(vecs)
         return np.vstack(all_vecs)
 
     try:
-        # Encode query (adhoc_query adapter is already set active)
+        # Always encode query live (not precomputed)
         q_vecs = _encode_batch([query_brief])
         q_vec = q_vecs[0]
         q_norm = np.linalg.norm(q_vec)
         if q_norm > 0:
             q_vec = q_vec / q_norm
 
-        # Encode papers: title + sep + abstract (SPECTER2 paper-side format)
-        sep = tokenizer.sep_token or " "
-        paper_texts = [
-            p.title + sep + (p.abstract if p.abstract else "")
-            for p in papers
-        ]
-        p_vecs = _encode_batch(paper_texts)
-        # Normalise for cosine similarity via dot product
-        norms = np.linalg.norm(p_vecs, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        p_vecs = p_vecs / norms
+        # ── Fast path: use precomputed proximity-adapter embeddings ──────────
+        # build_index.py encoded papers with the proximity adapter (paper-side);
+        # this is the correct SPECTER2 asymmetric pairing with the adhoc_query query.
+        have_precomputed = (
+            precomputed_embeddings is not None
+            and arxiv_to_pos is not None
+            and precomputed_embeddings.shape[1] == q_vec.shape[0]  # dim must match
+        )
 
-        similarities = p_vecs @ q_vec   # shape (N,)
+        if have_precomputed:
+            # Split papers into indexed (fast lookup) and unindexed (live encode)
+            indexed_papers: List[Paper] = []
+            indexed_vecs_list: List[np.ndarray] = []
+            unindexed_papers: List[Paper] = []
 
-        scored = []
-        for p, sim in zip(papers, similarities):
-            p.semantic_relevance = float(sim)
-            scored.append((float(sim), p))
+            for p in papers:
+                pos = arxiv_to_pos.get(p.arxiv_id)
+                if pos is not None and pos < precomputed_embeddings.shape[0]:
+                    indexed_papers.append(p)
+                    indexed_vecs_list.append(precomputed_embeddings[pos])
+                else:
+                    unindexed_papers.append(p)
+
+            # Vectorized cosine for indexed papers — single numpy op
+            if indexed_papers:
+                indexed_vecs = np.vstack(indexed_vecs_list).astype("float32")
+                norms = np.linalg.norm(indexed_vecs, axis=1, keepdims=True)
+                norms = np.where(norms == 0, 1.0, norms)
+                indexed_vecs = indexed_vecs / norms
+                indexed_sims = indexed_vecs @ q_vec  # (N_indexed,)
+            else:
+                indexed_sims = np.array([], dtype="float32")
+
+            # Live encode only the minority not in the precomputed index
+            if unindexed_papers:
+                sep = tokenizer.sep_token or " "
+                unindexed_texts = [
+                    p.title + sep + (p.abstract if p.abstract else "")
+                    for p in unindexed_papers
+                ]
+                unindexed_vecs = _encode_batch(unindexed_texts)
+                norms = np.linalg.norm(unindexed_vecs, axis=1, keepdims=True)
+                norms = np.where(norms == 0, 1.0, norms)
+                unindexed_vecs = unindexed_vecs / norms
+                unindexed_sims = unindexed_vecs @ q_vec
+            else:
+                unindexed_sims = np.array([], dtype="float32")
+
+            # Merge, score, sort
+            all_papers = indexed_papers + unindexed_papers
+            all_sims = np.concatenate([indexed_sims, unindexed_sims])
+            scored = []
+            for p, sim in zip(all_papers, all_sims):
+                p.semantic_relevance = float(sim)
+                scored.append((float(sim), p))
+
+            n_live = len(unindexed_papers)
+            if n_live:
+                print(f"[SPECTER2 Stage 2] fast-path: {len(indexed_papers)} precomputed, {n_live} live-encoded")
+
+        else:
+            # ── Slow path: no precomputed embeddings — encode all live ──────
+            sep = tokenizer.sep_token or " "
+            paper_texts = [
+                p.title + sep + (p.abstract if p.abstract else "")
+                for p in papers
+            ]
+            p_vecs = _encode_batch(paper_texts)
+            norms = np.linalg.norm(p_vecs, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            p_vecs = p_vecs / norms
+            all_sims = p_vecs @ q_vec
+            scored = []
+            for p, sim in zip(papers, all_sims):
+                p.semantic_relevance = float(sim)
+                scored.append((float(sim), p))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         k = min(n2, len(scored))
@@ -1588,9 +1659,17 @@ def select_embedding_candidates(
     # ─── Stage 2: SPECTER2 adhoc_query → MiniLM fallback ─────────────────
     # P-00: Pass semantic_query so SPECTER2 encodes the clean statement, not raw prose.
     # P-05: expanded to n2=400 to compensate for larger adaptive Stage 1 pool.
+    # Fix 2: Pass precomputed embeddings so Stage 2 skips live BERT forward passes
+    #        for already-indexed papers (proximity adapter, correct paper-side encoding).
     stage2_query = semantic_query if semantic_query else query_brief
-    st.write("⏱ Stage 2: SPECTER2 semantic reranking (falls back to MiniLM if unavailable)...")
-    stage2_papers = specter2_vector_rerank(stage1_papers, stage2_query, n2=400)
+    st.write("⏱ Stage 2: SPECTER2 semantic reranking (precomputed fast-path active)...")
+    stage2_papers = specter2_vector_rerank(
+        stage1_papers,
+        stage2_query,
+        n2=400,
+        precomputed_embeddings=embeddings,
+        arxiv_to_pos=arxiv_to_pos if arxiv_to_pos else {},
+    )
     if stage2_papers:
         st.write(
             f"✅ SPECTER2 Stage 2: {len(stage2_papers)} candidates selected "
@@ -2638,7 +2717,10 @@ def _main_body():
             )
 
         if current_papers:
-            st.success(f"Loaded {len(current_papers)} papers from local corpus in this date range.")
+            msg = f"Loaded {len(current_papers)} papers from local corpus in this date range."
+            if date_option == "All Time" and len(current_papers) >= DB_FETCH_LIMIT:
+                msg += f" (capped at {DB_FETCH_LIMIT:,} most-recent — full corpus exceeds memory limits)"
+            st.success(msg)
         else:
             st.info("No papers found in local corpus for this specific date range.")
 

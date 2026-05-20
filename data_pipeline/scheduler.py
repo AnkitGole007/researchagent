@@ -56,16 +56,16 @@ def push_to_r2():
         rclone_cmd = [
             "rclone", "sync", "data_pipeline/", f"{remote}:{bucket}/corpus/",
             "--include", "corpus.db",
-            "--include", "index_minilm.faiss",
-            "--include", "embeddings_minilm.npy",
+            "--include", "corpus.faiss",
+            "--include", "embeddings.npy",
             "--include", "id_map.json",
             "--include", "build_meta.json",
             "--include", "bm25_index/**",
-            "--transfers", "1",           # Sequential to avoid saturating unstable connections 
-            "--s3-upload-concurrency", "1", # Single chunk at a time for stability
+            "--transfers", "1",
+            "--s3-upload-concurrency", "1",
             "--retries", "5",
             "--low-level-retries", "10",
-            "--progress"
+            "--progress",
         ]
         subprocess.run(rclone_cmd, check=True)
         logger.info("R2 Push complete.")

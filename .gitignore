@@ -31,6 +31,9 @@ docs/CODE_REVIEW.md
 .antigravity/
 .agent/
 
+# Graphify
+graphify-out/
+
 # Data pipeline artifacts (Issue #2) — do not commit large binary indexes
 data_pipeline/*.faiss
 data_pipeline/*.npy

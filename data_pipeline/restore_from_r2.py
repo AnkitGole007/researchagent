@@ -48,11 +48,10 @@ def restore():
     output_dir = Path("data_pipeline")
     output_dir.mkdir(exist_ok=True)
 
-    # Core artifacts (flat files)
     artifacts = [
         "corpus.db",
-        "embeddings_minilm.npy",
-        "index_minilm.faiss",
+        "embeddings.npy",
+        "corpus.faiss",
         "id_map.json",
         "build_meta.json",
     ]
@@ -69,25 +68,21 @@ def restore():
             size_mb = os.path.getsize(local_path) / (1024 * 1024)
             logger.info("Restored %s (%.2f MB)", filename, size_mb)
         except ClientError as e:
-            if e.response['Error']['Code'] == "404":
+            code = (e.response or {}).get("Error", {}).get("Code", "")
+            if code == "404":
                 logger.warning("Artifact %s not found in R2. Continuing.", filename)
             else:
                 logger.error("Failed to download %s: %s", filename, e)
         except Exception as e:
             logger.error("Error restoring %s: %s", filename, e)
 
-    # Specialized: bm25_index directory
-    # List all objects with prefix 'corpus/bm25_index/'
     try:
         prefix = "corpus/bm25_index/"
         paginator = s3.get_paginator('list_objects_v2')
-        
         bm25_count = 0
         for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
             for obj in page.get('Contents', []):
                 remote_key = obj['Key']
-                # Relative path inside data_pipeline
-                # remote_key is 'corpus/bm25_index/tokenizer.json' -> local is 'bm25_index/tokenizer.json'
                 relative_path = Path(remote_key).relative_to("corpus")
                 local_path = output_dir / relative_path
                 

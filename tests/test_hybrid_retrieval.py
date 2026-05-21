@@ -1,9 +1,12 @@
 """
 Integration test and latency benchmark for the 3-stage hybrid retrieval pipeline.
+Requires local corpus artifacts (data_pipeline/corpus.db etc.) — excluded from CI unit runs.
 """
 import time
 import os
 import pytest
+
+pytestmark = pytest.mark.integration
 from app import (
     Paper,
     select_embedding_candidates,

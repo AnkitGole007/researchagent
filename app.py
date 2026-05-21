@@ -720,7 +720,9 @@ def fetch_papers_from_db(
     papers: List[Paper] = []
     for r in rows:
         d = dict(r)
-        date_str = d.get("submitted_date", "2024-01-01")
+        # Guard: reject NULL, empty, or non-ISO strings like the literal "None"/"None-01-01"
+        raw = d.get("submitted_date") or ""
+        date_str = raw if (len(raw) >= 4 and raw[:4].isdigit()) else "2024-01-01"
         if "T" not in date_str:
             date_str = date_str + "T00:00:00"
             
@@ -1044,11 +1046,17 @@ def _faiss_ranked_pool(
             print(f"[FAISS] dim mismatch ({q_vec.shape[0]} vs {embeddings.shape[1]}). Rebuild index with build_index.py.")
             return {}
 
-        scores_list = []
-        for p in papers:
-            pos = arxiv_to_pos.get(p.arxiv_id)
-            sim = float(np.dot(embeddings[pos], q_vec)) if (pos is not None and pos < embeddings.shape[0]) else -1.0
-            scores_list.append((p.arxiv_id, sim))
+        # Fix 3: vectorized cosine — single matrix-vector multiply instead of Python loop.
+        # Build parallel arrays: paper IDs and their index positions (-1 = not in index).
+        paper_ids_arr = [p.arxiv_id for p in papers]
+        positions = np.array([arxiv_to_pos.get(pid, -1) for pid in paper_ids_arr], dtype=np.intp)
+        valid_mask = (positions >= 0) & (positions < embeddings.shape[0])
+
+        sims = np.full(len(papers), -1.0, dtype=np.float32)
+        if valid_mask.any():
+            sims[valid_mask] = embeddings[positions[valid_mask]] @ q_vec
+
+        scores_list = list(zip(paper_ids_arr, sims.tolist()))
     else:
         # No precomputed index — encode at runtime (slow path)
         specter2_model, specter2_tok = get_specter2_model()
@@ -1658,7 +1666,8 @@ def select_embedding_candidates(
 
     # ─── Stage 2: SPECTER2 adhoc_query → MiniLM fallback ─────────────────
     # P-00: Pass semantic_query so SPECTER2 encodes the clean statement, not raw prose.
-    # P-05: expanded to n2=400 to compensate for larger adaptive Stage 1 pool.
+    # n2=200: halved from 400 — Stage 2 precomputed fast-path makes this near-free,
+    # and halving CE input in Stage 3 cuts CrossEncoder time ~50% (400→200 pairs).
     # Fix 2: Pass precomputed embeddings so Stage 2 skips live BERT forward passes
     #        for already-indexed papers (proximity adapter, correct paper-side encoding).
     stage2_query = semantic_query if semantic_query else query_brief
@@ -1666,7 +1675,7 @@ def select_embedding_candidates(
     stage2_papers = specter2_vector_rerank(
         stage1_papers,
         stage2_query,
-        n2=400,
+        n2=200,
         precomputed_embeddings=embeddings,
         arxiv_to_pos=arxiv_to_pos if arxiv_to_pos else {},
     )
@@ -1686,7 +1695,7 @@ def select_embedding_candidates(
             stage2_query,
             embeddings,
             arxiv_to_pos if arxiv_to_pos else {},
-            n2=400,  # P-05: 300→400
+            n2=200,  # halved: matches SPECTER2 path; CE Stage 3 input capped at 200
         )
         st.write(f"✅ MiniLM Stage 2 fallback: {len(stage2_papers)} candidates selected.")
 

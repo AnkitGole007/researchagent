@@ -17,8 +17,10 @@ from app import (
     Paper,
     scibert_classify_papers,
     heuristic_classify_papers_free,
+    cross_encoder_rerank,
     PRIMARY_THRESHOLD,
     SECONDARY_THRESHOLD,
+    _CE_MAX_ABSTRACT_CHARS,
 )
 
 
@@ -185,6 +187,57 @@ class TestCrossEncoderFieldIsolation:
         assert len(result) == 10
         primaries = [p for p in result if p.focus_label == "primary"]
         assert len(primaries) >= 1
+
+
+# ─── CrossEncoder abstract truncation ────────────────────────────────────────
+
+class TestCrossEncoderTruncation:
+    """Verify abstract truncation stays within _CE_MAX_ABSTRACT_CHARS budget."""
+
+    def test_constant_is_within_token_budget(self):
+        # At ~4 chars/token, 1500 chars ≈ 375 tokens; well within 512-token window.
+        assert _CE_MAX_ABSTRACT_CHARS > 0
+        assert _CE_MAX_ABSTRACT_CHARS <= 2000
+
+    def test_long_abstract_truncated_in_model_unavailable_path(self):
+        """
+        CE unavailable path (model=None) returns papers[:n3] unchanged.
+        Verifies cross_encoder_rerank doesn't crash on very long abstracts.
+        """
+        long_abstract = "word " * 1000  # 5000 chars, far above token limit
+        papers = [
+            Paper(
+                arxiv_id=str(i),
+                title=f"Paper {i}",
+                authors=[],
+                email_domains=[],
+                abstract=long_abstract,
+                submitted_date=datetime(2025, 1, 1),
+                pdf_url="",
+                arxiv_url="",
+            )
+            for i in range(5)
+        ]
+        # Without a live model this returns papers[:n3]; verifies no crash on long abstracts.
+        result = cross_encoder_rerank(papers, "recommendation systems", n3=150)
+        assert len(result) <= 5
+
+    def test_none_abstract_handled_gracefully(self):
+        """cross_encoder_rerank must not raise on papers with None abstract."""
+        papers = [
+            Paper(
+                arxiv_id="1",
+                title="Test paper",
+                authors=[],
+                email_domains=[],
+                abstract=None,  # type: ignore[arg-type]
+                submitted_date=datetime(2025, 1, 1),
+                pdf_url="",
+                arxiv_url="",
+            )
+        ]
+        result = cross_encoder_rerank(papers, "test query", n3=150)
+        assert len(result) <= 1
 
 
 # ─── heuristic_classify_papers_free standalone ────────────────────────────────

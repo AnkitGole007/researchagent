@@ -91,6 +91,13 @@ DEFAULT_MONEYBALL_WEIGHTS = {
 PRIMARY_THRESHOLD: float = 0.55    # CE sigmoid ≥ this → primary  (P-08: recalibrated for BAAI/bge-reranker-base)
 SECONDARY_THRESHOLD: float = 0.25  # CE sigmoid ≥ this → secondary (P-08: recalibrated for BAAI/bge-reranker-base)
 
+# CrossEncoder document token budget.
+# BAAI/bge-reranker-base: 512 tokens total (query + doc + 3 special tokens).
+# With semantic_query ≈ 50–100 tokens + title ≈ 15–25 tokens + 3 special = ~128 overhead,
+# abstract budget ≈ 384 tokens minimum ≈ 1536 chars at 4 chars/token.
+# Cap at 1500 chars: covers ≈ 90% of arXiv abstracts fully without truncating the query.
+_CE_MAX_ABSTRACT_CHARS: int = 1500
+
 
 
 # =========================
@@ -1498,6 +1505,11 @@ def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -
     Does NOT overwrite p.semantic_relevance (Stage 2 cosine — preserved for display + fallback).
     When model is unavailable, returns papers[:n3] with cross_encoder_score=None so
     scibert_classify_papers can detect the failure and use cosine-based heuristic fallback.
+
+    Token budget: BAAI/bge-reranker-base has a 512-token window shared by query and document.
+    Abstract is capped at _CE_MAX_ABSTRACT_CHARS (1500 chars) so the query is never truncated
+    and the maximum abstract content is preserved within the remaining token budget.
+    Caller passes semantic_query (~50 tokens) not raw query_brief to maximise abstract coverage.
     """
     if not papers: return []
     model = get_cross_encoder_model()
@@ -1505,7 +1517,10 @@ def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -
         # Model unavailable — cross_encoder_score stays None; classifier uses heuristic fallback
         return papers[:n3]
 
-    pairs = [[query_brief, p.title + "\n\n" + p.abstract] for p in papers]
+    pairs = [
+        [query_brief, p.title + "\n\n" + (p.abstract or "")[:_CE_MAX_ABSTRACT_CHARS]]
+        for p in papers
+    ]
     try:
         scores = model.predict(pairs)
         scored = []

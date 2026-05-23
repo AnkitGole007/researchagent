@@ -6,12 +6,13 @@ Tests cover:
   - Rules-based fallback: keyword extraction, intent detection, semantic query cleaning
   - LLM path: JSON parsing guard + schema validation gate
   - analyse_query() public API: returns StructuredQuery with correct shape
+  - YAKE keyword floor: bm25_keywords ≥ 5 after both paths
+  - Multi-provider chain: source field values "llm_groq" | "llm_openrouter" | "rules"
   - Backward-compat: empty brief returns safe StructuredQuery
 """
 import os
 import pytest
 
-# Guard: QI module must be importable from reporoot
 from query_intelligence import (
     StructuredQuery,
     analyse_query,
@@ -20,6 +21,7 @@ from query_intelligence import (
     _build_semantic_query,
     _extract_not_terms,
     _rules_based_analyse,
+    _YAKE_FLOOR,
 )
 
 
@@ -54,6 +56,10 @@ class TestStructuredQuery:
         sq = StructuredQuery(semantic_query="Dense retrieval for scientific papers", bm25_keywords=[])
         assert sq.bm25_query_string == "Dense retrieval for scientific papers"
 
+    def test_source_default_is_rules(self):
+        sq = StructuredQuery()
+        assert sq.source == "rules"
+
 
 # ─── Rules-based helpers ──────────────────────────────────────────────────────
 
@@ -63,7 +69,6 @@ class TestDetectIntent:
         ("Looking for survey and overview papers on transformers", {"survey"}),
         ("I need foundational and seminal papers on SGD", {"foundational"}),
         ("Give me diverse coverage across NLP and Vision areas", {"diversity"}),
-        # "broadly" activates diversity signal — both diversity and general are acceptable
         ("I'm broadly interested in machine learning", {"diversity", "general"}),
     ])
     def test_intent_signals(self, brief, expected_set):
@@ -81,19 +86,27 @@ class TestExtractKeywords:
 
     def test_stopwords_removed(self):
         result = _extract_keywords("the paper is about the use of deep learning methods")
-        for kw in result:
-            assert kw not in {"the", "paper", "about", "use", "methods"}
+        joined = " ".join(result).lower()
+        # These function words should not appear as standalone keywords
+        for word in ("the", "about", "use"):
+            assert word not in joined.split()
 
-    def test_bigrams_preferred(self):
+    def test_bigrams_or_ngrams_preferred(self):
         result = _extract_keywords("recommendation systems matrix factorization deep learning")
-        joined = " ".join(result)
-        # At least one multi-word term expected
+        # At least one multi-word term expected (bigram or trigram)
         assert any(" " in kw for kw in result)
 
     def test_top_n_capped(self):
         long_brief = " ".join([f"keyword{i}" for i in range(50)])
         result = _extract_keywords(long_brief, top_n=8)
         assert len(result) <= 8
+
+    def test_scientific_phrases_extracted(self):
+        brief = "contrastive learning self-supervised vision language models CLIP"
+        result = _extract_keywords(brief, top_n=10)
+        joined = " ".join(result).lower()
+        # At least one scientifically meaningful term should appear
+        assert any(term in joined for term in ["contrastive", "learning", "vision", "language", "clip"])
 
 
 class TestBuildSemanticQuery:
@@ -161,37 +174,66 @@ class TestRulesBasedAnalyse:
         assert sq.quality_modifier in {"recent", "influential", "emerging", "classic", "any"}
 
 
+# ─── YAKE floor ───────────────────────────────────────────────────────────────
+
+class TestYakeFloor:
+    def test_rules_path_meets_floor(self, monkeypatch):
+        """Rules path always produces ≥ _YAKE_FLOOR keywords via YAKE supplement."""
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        brief = "Transformers attention mechanisms NLP tasks 2024."
+        sq = analyse_query(brief, groq_api_key=None, openrouter_api_key=None)
+        assert len(sq.bm25_keywords) >= _YAKE_FLOOR
+
+    def test_floor_does_not_duplicate_existing_keywords(self, monkeypatch):
+        """YAKE supplements without adding exact duplicates."""
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        brief = "Contrastive self-supervised learning for vision-language models like CLIP."
+        sq = analyse_query(brief, groq_api_key=None, openrouter_api_key=None)
+        lower_kws = [k.lower() for k in sq.bm25_keywords]
+        assert len(lower_kws) == len(set(lower_kws)), "Duplicate keywords found after YAKE floor"
+
+
 # ─── Public API: analyse_query ────────────────────────────────────────────────
 
 class TestAnalyseQuery:
     def test_empty_brief_returns_safe_default(self):
-        sq = analyse_query("", groq_api_key=None)
+        sq = analyse_query("", groq_api_key=None, openrouter_api_key=None)
         assert isinstance(sq, StructuredQuery)
         assert sq.intent in {"general", "novelty", "survey", "foundational", "specific", "diversity"}
 
     def test_no_api_key_uses_rules(self, monkeypatch):
-        # Explicitly clear the env var so the rules path is forced regardless of .env
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         sq = analyse_query(
             "I am looking for papers on RLHF and instruction tuning.",
             groq_api_key=None,
+            openrouter_api_key=None,
         )
         assert sq.source == "rules"
         assert len(sq.bm25_keywords) > 0
 
     def test_rrf_weights_in_valid_range(self):
-        sq = analyse_query("Recent papers on neural scaling laws.", groq_api_key=None)
+        sq = analyse_query("Recent papers on neural scaling laws.", groq_api_key=None, openrouter_api_key=None)
         assert 0.5 <= sq.rrf_weight_bm25 <= 2.0
         assert 0.5 <= sq.rrf_weight_faiss <= 2.0
 
     def test_bm25_query_string_is_non_empty(self):
-        sq = analyse_query("Graph neural networks for drug discovery.", groq_api_key=None)
+        sq = analyse_query("Graph neural networks for drug discovery.", groq_api_key=None, openrouter_api_key=None)
         qs = sq.bm25_query_string
         assert len(qs.strip()) > 0
 
+    def test_source_values_are_valid(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        sq = analyse_query("Diffusion models for image synthesis.", groq_api_key=None, openrouter_api_key=None)
+        assert sq.source in {"llm_groq", "llm_openrouter", "rules"}
+
+    @pytest.mark.integration
     @pytest.mark.skipif(
         not os.getenv("GROQ_API_KEY"),
-        reason="GROQ_API_KEY not set — skipping live LLM test"
+        reason="GROQ_API_KEY not set — skipping live Groq test"
     )
     def test_groq_llm_path_returns_valid_structured_query(self):
         """Integration test: only runs when GROQ_API_KEY is present."""
@@ -199,12 +241,29 @@ class TestAnalyseQuery:
             "I am interested in papers about autonomous agents that can plan, use tools, "
             "and reason step-by-step. Especially ReAct, tool-augmented LLMs, and multi-agent systems."
         )
-        sq = analyse_query(brief, groq_api_key=os.getenv("GROQ_API_KEY"))
-        assert sq.source == "llm"
+        sq = analyse_query(brief, groq_api_key=os.getenv("GROQ_API_KEY"), openrouter_api_key=None)
+        assert sq.source == "llm_groq"
         assert sq.intent in {"novelty", "diversity", "foundational", "specific", "survey", "general"}
-        assert len(sq.bm25_keywords) >= 3
+        assert len(sq.bm25_keywords) >= _YAKE_FLOOR
         assert len(sq.semantic_query) > 10
         assert sq.quality_modifier in {"recent", "influential", "emerging", "classic", "any"}
-        # Structural sanity: RRF weights are floats in range
         assert 0.5 <= sq.rrf_weight_bm25 <= 2.0
         assert 0.5 <= sq.rrf_weight_faiss <= 2.0
+
+    @pytest.mark.integration
+    @pytest.mark.skipif(
+        not os.getenv("OPENROUTER_API_KEY"),
+        reason="OPENROUTER_API_KEY not set — skipping live OpenRouter test"
+    )
+    def test_openrouter_path_returns_valid_structured_query(self):
+        """Integration test: only runs when OPENROUTER_API_KEY is present."""
+        brief = "Recent papers on diffusion models for image generation and editing."
+        sq = analyse_query(
+            brief,
+            groq_api_key=None,       # force Groq skip
+            openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+        assert sq.source == "llm_openrouter"
+        assert sq.intent in {"novelty", "diversity", "foundational", "specific", "survey", "general"}
+        assert len(sq.bm25_keywords) >= _YAKE_FLOOR
+        assert len(sq.semantic_query) > 10

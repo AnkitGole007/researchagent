@@ -4,6 +4,7 @@ try:
     load_dotenv()
 except ImportError:
     pass
+import hashlib
 import json
 import logging
 import time
@@ -1549,13 +1550,34 @@ def select_embedding_candidates(
     sq = None
     if analyse_query is not None:
         try:
-            groq_key = os.getenv("GROQ_API_KEY", "").strip()
-            if not groq_key and llm_config and llm_config.provider == "groq" and llm_config.api_key:
-                groq_key = llm_config.api_key.strip()
-            sq = analyse_query(brief=query_brief, groq_api_key=groq_key or None)
-            qil_source = sq.source.upper() if sq else "NONE"
+            # Session cache: avoid redundant LLM calls for identical queries
+            _qil_cache_key = hashlib.md5(query_brief.strip().lower().encode()).hexdigest()
+            if "_qil_cache" not in st.session_state:
+                st.session_state["_qil_cache"] = {}
+            sq = st.session_state["_qil_cache"].get(_qil_cache_key)
+
+            if sq is None:
+                groq_key = os.getenv("GROQ_API_KEY", "").strip()
+                if not groq_key and llm_config and llm_config.provider == "groq" and llm_config.api_key:
+                    groq_key = llm_config.api_key.strip()
+                try:
+                    or_key = (st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")).strip()
+                except Exception:
+                    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+                sq = analyse_query(
+                    brief=query_brief,
+                    groq_api_key=groq_key or None,
+                    openrouter_api_key=or_key or None,
+                )
+                st.session_state["_qil_cache"][_qil_cache_key] = sq
+
+            _source_label = {
+                "llm_groq":       "LLM/Groq",
+                "llm_openrouter": "LLM/OpenRouter",
+                "rules":          "Rules",
+            }.get(sq.source, sq.source.upper())
             st.write(
-                f"⏱ Stage 0 (QIL/{qil_source}): intent=`{sq.intent}` · "
+                f"⏱ Stage 0 (QIL/{_source_label}): intent=`{sq.intent}` · "
                 f"quality=`{sq.quality_modifier}` · "
                 f"keywords=`{', '.join(sq.bm25_keywords[:4])}{'...' if len(sq.bm25_keywords) > 4 else ''}`"
             )

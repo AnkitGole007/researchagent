@@ -2946,11 +2946,11 @@ def _main_body():
                         f"target of {MIN_FOR_PREDICTION}."
                     )
         elif secondary_papers:
-            used_papers = secondary_papers.copy()
-            used_label = "All SECONDARY papers (no PRIMARY matches found)"
+            used_papers = secondary_papers[:20]
+            used_label = f"Top 20 SECONDARY papers (no PRIMARY matches found)"
             st.warning(
-                "No papers were classified as PRIMARY. Using all SECONDARY matches instead. "
-                "These may only partially match your brief."
+                f"No papers were classified as PRIMARY. Using the top 20 SECONDARY matches "
+                f"(out of {len(secondary_papers)} available). These may only partially match your brief."
             )
         else:
             st.error("No candidates were classified as PRIMARY or SECONDARY. Nothing to proceed with.")

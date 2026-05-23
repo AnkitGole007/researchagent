@@ -40,7 +40,8 @@ jobs:
           pytest>=7.4.0 \
           pytest-mock>=3.12.0 \
           scikit-learn>=1.3.0 \
-          numpy>=1.24.0
+          numpy>=1.24.0 \
+          yake>=0.4.8
 
     - name: Write pytest.ini
       run: |

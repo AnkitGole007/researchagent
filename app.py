@@ -14,6 +14,12 @@ import textwrap
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # prevents fork warning
+_MODEL_DTYPE = "float16"
+
+import threading
+_PIPELINE_SEMAPHORE = threading.Semaphore(2)
+
 import io
 import zipfile
 import math
@@ -422,6 +428,17 @@ def download_corpus_artifacts():
         time.sleep(1)
         status.empty()
         st.session_state["_corpus_synced"] = True
+        # === Warm-up: pre-load models immediately after sync ===
+        if not st.session_state.get("_models_warmed"):
+            try:
+                with st.spinner("Pre-loading models (one-time)..."):
+                    get_specter2_model()
+                    get_cross_encoder_model()
+                    get_local_embed_model()
+                st.session_state["_models_warmed"] = True
+                logging.info("[warmup] All models pre-loaded successfully.")
+            except Exception as _e:
+                logging.warning(f"[warmup] Model pre-load failed (non-fatal): {_e}")
 
     except Exception as e:
         # Show a persistent error so it is always visible on-screen
@@ -1261,7 +1278,10 @@ def get_specter2_model():
         # Do NOT pass timeout= to from_pretrained — adapters lib forwards it to
         # BertAdapterModel.__init__() which rejects it with TypeError.
         tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
-        model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
+        model = AutoAdapterModel.from_pretrained(
+            "allenai/specter2_base",
+            torch_dtype=torch.float16,
+        )
 
         # Load and activate the adhoc_query adapter for query-to-paper retrieval
         model.load_adapter(
@@ -1343,7 +1363,7 @@ def specter2_vector_rerank(
             )
             with torch.no_grad():
                 output = model(**inputs)
-            vecs = output.last_hidden_state[:, 0, :].cpu().numpy()
+            vecs = output.last_hidden_state[:, 0, :].cpu().float().numpy()
             all_vecs.append(vecs)
         return np.vstack(all_vecs)
 
@@ -1500,11 +1520,15 @@ def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Opti
 def get_cross_encoder_model():
     try:
         from sentence_transformers import CrossEncoder
+        import torch
         # P-07: Swapped from ms-marco-MiniLM-L-6-v2 to BAAI/bge-reranker-base
         # bge-reranker-base is trained on broader multilingual+scientific corpus;
         # consistently outperforms ms-marco on BEIR scientific subsets (SciFact, TREC-COVID).
         st.info("Loading CrossEncoder model (BAAI/bge-reranker-base) for precision re-ranking (first run only)…")
-        return CrossEncoder("BAAI/bge-reranker-base")
+        return CrossEncoder(
+            "BAAI/bge-reranker-base",
+            automodel_args={"torch_dtype": torch.float16},
+        )
     except Exception as e:
         print(f"CrossEncoder load error: {e}")
         return None
@@ -2834,16 +2858,24 @@ def _main_body():
     else:
         st.subheader("3. Embedding Based Candidate Selection")
         if run_clicked or "candidates" not in st.session_state:
-            with st.spinner("Selecting top candidate papers via embeddings..."):
-                candidates = select_embedding_candidates(
-                    current_papers,
-                    query_brief=query_brief,
-                    llm_config=active_llm_config,
-                    embedding_model=embedding_model_name,
-                    provider=provider,
-                    max_candidates=150,
-                    # P-10: use_hyde retired — QIL semantic_query supersedes HyDE
-                )
+            _acquired = _PIPELINE_SEMAPHORE.acquire(timeout=90)
+            if not _acquired:
+                st.error("⚠️ Server is busy with other requests. Please retry in 30 seconds.")
+                st.stop()
+            try:
+                with st.spinner("Selecting top candidate papers via embeddings..."):
+                    candidates = select_embedding_candidates(
+                        current_papers,
+                        query_brief=query_brief,
+                        llm_config=active_llm_config,
+                        embedding_model=embedding_model_name,
+                        provider=provider,
+                        max_candidates=150,
+                        # P-10: use_hyde retired — QIL semantic_query supersedes HyDE
+                    )
+            finally:
+                _PIPELINE_SEMAPHORE.release()
+
             if not candidates:
                 st.warning("Embedding stage returned no candidates. Using all fetched papers as fallback.")
                 candidates = current_papers
@@ -3131,6 +3163,9 @@ These scores are heuristic and should be used as a guide for exploration rather 
         
         st.session_state["ranked_papers"] = ranked_papers
         st.session_state["has_run_once"] = True
+        # === Release transient memory after pipeline completes ===
+        import gc
+        gc.collect()
     else:
         ranked_papers = st.session_state["ranked_papers"]
 

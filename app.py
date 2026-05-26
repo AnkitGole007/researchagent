@@ -151,6 +151,16 @@ class Paper:
 # Utility functions
 # =========================
 
+def _get_secret(key: str, default: str = "") -> str:
+    """Safely read from st.secrets with os.getenv fallback.
+    Handles Cloud Run (env vars only) and Streamlit Cloud (secrets.toml).
+    """
+    try:
+        val = st.secrets.get(key)
+        return (val or os.getenv(key, default)).strip().strip('\'"')
+    except Exception:
+        return os.getenv(key, default).strip().strip('\'"')
+
 def get_date_range(option: str) -> (date, date):
     today = date.today()
     if option == "Last 3 Days":
@@ -205,10 +215,10 @@ def _check_corpus_freshness():
         return
 
     # 2. Get credentials
-    access_key = st.secrets.get("R2_ACCESS_KEY_ID") or os.environ.get("R2_ACCESS_KEY_ID")
-    secret_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.environ.get("R2_SECRET_ACCESS_KEY")
-    endpoint = st.secrets.get("R2_ENDPOINT") or os.environ.get("R2_ENDPOINT")
-    bucket_name = st.secrets.get("R2_BUCKET") or os.environ.get("R2_BUCKET")
+    access_key  = _get_secret("R2_ACCESS_KEY_ID")
+    secret_key  = _get_secret("R2_SECRET_ACCESS_KEY")
+    endpoint    = _get_secret("R2_ENDPOINT")
+    bucket_name = _get_secret("R2_BUCKET")
 
     if not all([access_key, secret_key, endpoint, bucket_name]):
         return
@@ -276,10 +286,10 @@ def download_corpus_artifacts():
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # 1. Resolve credentials: st.secrets (Streamlit Cloud) → os.getenv (.env / GitHub Actions)
-    key_id    = (st.secrets.get("R2_ACCESS_KEY_ID")     or os.getenv("R2_ACCESS_KEY_ID", "")).strip().strip('\'"')
-    access_key = (st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY", "")).strip().strip('\'"')
-    endpoint   = (st.secrets.get("R2_ENDPOINT")          or os.getenv("R2_ENDPOINT", "")).strip().strip('\'"')
-    bucket     = (st.secrets.get("R2_BUCKET")            or os.getenv("R2_BUCKET", "")).strip().strip('\'"')
+    key_id     = _get_secret("R2_ACCESS_KEY_ID")
+    access_key = _get_secret("R2_SECRET_ACCESS_KEY")
+    endpoint   = _get_secret("R2_ENDPOINT")
+    bucket     = _get_secret("R2_BUCKET")
 
     if not all([key_id, access_key, endpoint, bucket]):
         st.warning("⚠️ R2 credentials not fully configured. Corpus sync skipped.")
@@ -1575,10 +1585,8 @@ def select_embedding_candidates(
                 groq_key = os.getenv("GROQ_API_KEY", "").strip()
                 if not groq_key and llm_config and llm_config.provider == "groq" and llm_config.api_key:
                     groq_key = llm_config.api_key.strip()
-                try:
-                    or_key = (st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")).strip()
-                except Exception:
-                    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+                or_key = _get_secret("OPENROUTER_API_KEY")
+
                 sq = analyse_query(
                     brief=query_brief,
                     groq_api_key=groq_key or None,
@@ -2038,7 +2046,7 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
             pass
     
     # Read S2 key from st.secrets (Streamlit Cloud) with os.getenv fallback (local/.env)
-    s2_key = st.secrets.get("S2_API_KEY") or os.getenv("S2_API_KEY")
+    s2_key = _get_secret("S2_API_KEY")
     progress_bar = st.progress(0)
     
     for i, p in enumerate(target_papers):

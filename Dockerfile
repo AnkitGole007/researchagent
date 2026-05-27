@@ -5,7 +5,8 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 ENV HF_HOME=/app/.cache/huggingface
-ENV TRANSFORMERS_OFFLINE=1        # ← blocks HF network calls at runtime
+ENV TRANSFORMERS_OFFLINE=1
+ENV PORT=8080
 
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt

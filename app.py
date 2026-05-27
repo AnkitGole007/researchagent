@@ -1290,6 +1290,7 @@ def get_specter2_model():
             load_as="specter2_adhoc_query",
             set_active=True,
         )
+        model.set_active_adapters("specter2_adhoc_query")
 
         # Verify adapter is active
         try:

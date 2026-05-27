@@ -16,4 +16,4 @@ boto3>=1.26.0
 scikit-learn>=1.3.0
 adapters>=0.2.0
 yake>=0.4.8
-torch==2.5.1+cpu
+torch==2.7.0+cpu

@@ -5,7 +5,6 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 ENV HF_HOME=/app/.cache/huggingface
-ENV TRANSFORMERS_OFFLINE=1
 ENV PORT=8080
 
 COPY requirements.txt .
@@ -23,8 +22,8 @@ m = AutoAdapterModel.from_pretrained('allenai/specter2_base'); \
 m.load_adapter('allenai/specter2_adhoc_query', source='hf', load_as='specter2_adhoc_query'); \
 print('Models baked successfully')"
 
+ENV TRANSFORMERS_OFFLINE=1
+
 COPY . .
-
 EXPOSE 8080
-
 CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true

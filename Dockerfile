@@ -23,5 +23,7 @@ m.load_adapter('allenai/specter2_adhoc_query', source='hf', load_as='specter2_ad
 print('Models baked successfully')"
 
 COPY . .
+
 EXPOSE 8080
-CMD ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0", "--server.headless=true"]
+
+CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true

@@ -41,38 +41,33 @@ def run_command(cmd, label):
         sys.exit(result.returncode)
 
 
-def push_to_r2():
-    """Sync artifacts to Cloudflare R2 using rclone."""
-    import os
+def push_build_meta_to_r2():
+    """
+    Sync build_meta.json to R2 so the app can detect fresh data and trigger redeploy.
+    LanceDB table lives on R2 directly — no artifact sync needed.
+    """
     bucket = os.getenv("R2_BUCKET")
     remote = os.getenv("RCLONE_REMOTE", "r2")
-    
+
     if not bucket:
-        logger.info("R2_BUCKET not set. Skipping R2 sync.")
+        logger.info("R2_BUCKET not set. Skipping build_meta.json sync.")
         return
 
-    logger.info("--- R2 Push (rclone) ---")
+    logger.info("--- Syncing build_meta.json to R2 ---")
     try:
         rclone_cmd = [
             "rclone", "sync", "data_pipeline/", f"{remote}:{bucket}/corpus/",
-            "--include", "corpus.db",
-            "--include", "corpus.faiss",
-            "--include", "embeddings.npy",
-            "--include", "id_map.json",
             "--include", "build_meta.json",
-            "--include", "bm25_index/**",
             "--transfers", "1",
-            "--s3-upload-concurrency", "1",
             "--retries", "5",
-            "--low-level-retries", "10",
             "--progress",
         ]
         subprocess.run(rclone_cmd, check=True)
-        logger.info("R2 Push complete.")
+        logger.info("build_meta.json synced to R2.")
     except FileNotFoundError:
-        logger.warning("rclone not found on PATH. Skipping R2 push.")
-    except subprocess.CalledProcessError as e:
-        logger.error("rclone sync failed with exit code %d", e.returncode)
+        logger.warning("rclone not found on PATH. Skipping sync.")
+    except subprocess.CalledProcessError as exc:
+        logger.error("rclone sync failed with exit code %d", exc.returncode)
 
 
 def run() -> None:
@@ -107,21 +102,22 @@ def run() -> None:
         last_arxiv = None
         last_s2 = None
 
+        def _parse_ts(meta: dict, key: str):
+            ts = meta.get(key)
+            if not ts:
+                return None
+            ts = ts.replace("Z", "+00:00")
+            # Handle potential doubled +00:00+00:00 from older buggy runs
+            if ts.count("+00:00") > 1:
+                ts = ts.replace("+00:00+00:00", "+00:00")
+            return datetime.fromisoformat(ts)
+
         if os.path.exists(meta_path):
             try:
                 with open(meta_path, "r", encoding="utf-8") as fh:
                     meta = json.load(fh)
-                    if "last_arxiv_at" in meta:
-                        ts = meta["last_arxiv_at"].replace("Z", "+00:00")
-                        # Handle potential doubled +00:00+00:00 from older buggy runs
-                        if ts.count("+00:00") > 1:
-                            ts = ts.replace("+00:00+00:00", "+00:00")
-                        last_arxiv = datetime.fromisoformat(ts)
-                    if "last_s2_at" in meta:
-                        ts = meta["last_s2_at"].replace("Z", "+00:00")
-                        if ts.count("+00:00") > 1:
-                            ts = ts.replace("+00:00+00:00", "+00:00")
-                        last_s2 = datetime.fromisoformat(ts)
+                last_arxiv = _parse_ts(meta, "last_arxiv_at")
+                last_s2 = _parse_ts(meta, "last_s2_at")
             except Exception as e:
                 logger.warning("Could not parse build_meta.json for timestamps: %s", e)
 
@@ -165,7 +161,7 @@ def run() -> None:
         run_command(index_cmd, "Incremental Indexing (S2)")
 
     if run_sync:
-        push_to_r2()
+        push_build_meta_to_r2()
 
     if not (run_arxiv or run_s2 or run_sync):
         logger.info("Nothing to do today. Pipeline complete.")

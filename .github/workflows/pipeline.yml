@@ -1,8 +1,10 @@
 name: Daily Corpus Pipeline
 
 on:
-  schedule:
-    - cron: '0 2 * * *'  # 02:00 UTC daily
+  # Cron disabled during testing phase — no need for daily/weekly corpus sync
+  # yet. Re-enable by uncommenting when ready for scheduled runs:
+  # schedule:
+  #   - cron: '0 2 * * *'  # 02:00 UTC daily
   workflow_dispatch:
     inputs:
       mode:
@@ -69,10 +71,6 @@ jobs:
         endpoint = $R2_ENDPOINT
         acl = private
         EOF
-        
-    - name: Restore from R2
-      run: |
-        python data_pipeline/restore_from_r2.py
         
     - name: Run Pipeline
       run: |

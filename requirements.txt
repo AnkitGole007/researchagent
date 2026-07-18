@@ -1,7 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Core app dependencies
-streamlit>=1.50.0
 requests>=2.31.0
 feedparser>=6.0.10
 openai>=1.55.0
@@ -20,3 +19,7 @@ torch==2.7.0+cpu
 lancedb>=0.6.0
 pyarrow>=12.0.0
 pylance>=0.30.0
+
+# FastAPI backend (F-03) — serves backend/pipeline_core.py's pipeline over SSE
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0

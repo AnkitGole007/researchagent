@@ -26,7 +26,7 @@ import math
 import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, date
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 import numpy as np
 import pathlib
 import tempfile
@@ -58,23 +58,15 @@ except ImportError:
     genai = None  # type: ignore
 
 try:
-    import bm25s
-except ImportError:
-    bm25s = None
-
-try:
-    from query_intelligence import analyse_query, StructuredQuery
+    from query_intelligence import analyse_query
 except ImportError:
     analyse_query = None  # type: ignore
-    StructuredQuery = None  # type: ignore
 
 # =========================
 # Constants
 # =========================
 
 MIN_FOR_PREDICTION = 20
-OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-large"
-GEMINI_EMBEDDING_MODEL_NAME = "text-embedding-004"
 
 # MONEYBALL DEFAULTS
 DEFAULT_MONEYBALL_WEIGHTS = {
@@ -82,6 +74,25 @@ DEFAULT_MONEYBALL_WEIGHTS = {
     "weight_hype": 0.0,
     "weight_sniper": 0.0,
     "weight_utility": 0.16
+}
+
+# QIL quality_modifier -> LanceDB pre-filter (docs/qil-improvements-planner.md B1, Job 1).
+# Fires before vector/FTS search narrows the pool. "any" applies no filter.
+QUALITY_LANCEDB_FILTERS = {
+    "recent":      "year >= 2023",
+    "influential": "citation_count >= 50",
+    "emerging":    "year >= 2023 AND citation_count < 20",
+    "classic":     "year <= 2018",
+}
+
+# QIL quality_modifier -> Moneyball weight override (B1, Job 2). Fires after retrieval,
+# replaces DEFAULT_MONEYBALL_WEIGHTS/moneyball_weights.json for this scoring pass.
+# "recent" has no fixed weight set — it applies an additive recency bonus instead
+# (see RECENCY_BONUS_MAX in predict_citations_direct). "any" leaves weights unchanged.
+QUALITY_MONEYBALL_WEIGHTS = {
+    "influential": {"weight_fame": 0.95, "weight_hype": 0.0, "weight_sniper": 0.0, "weight_utility": 0.05},
+    "emerging":    {"weight_fame": 0.30, "weight_hype": 0.0, "weight_sniper": 0.0, "weight_utility": 0.70},
+    "classic":     {"weight_fame": 0.90, "weight_hype": 0.0, "weight_sniper": 0.0, "weight_utility": 0.10},
 }
 
 # =========================
@@ -137,9 +148,9 @@ class Paper:
     venue: Optional[str] = None
     source: Optional[str] = None
     # ── Task 37: Retrieval provenance (populated by Task 33 RRF hybrid Stage 1) ──
-    retrieval_source: Optional[str] = None   # "bm25_only" | "faiss_only" | "both"
-    bm25_rank: Optional[int] = None          # BM25 rank within top-K BM25 pool (1-indexed)
-    faiss_rank: Optional[int] = None         # FAISS rank within top-K FAISS pool (1-indexed)
+    retrieval_source: Optional[str] = None   # "bm25_only" | "faiss_only" | "both" (LanceDB full-text | vector)
+    bm25_rank: Optional[int] = None          # Full-text search rank within top-K pool (1-indexed)
+    faiss_rank: Optional[int] = None         # Vector search rank within top-K pool (1-indexed)
     rrf_score: Optional[float] = None        # Reciprocal Rank Fusion merged score
     # ── Task 38: Artifact signal detection and paper type tagging ──
     has_code: bool = False                   # True if GitHub URL detected in abstract/comments/pdf_url
@@ -251,10 +262,8 @@ def _check_corpus_freshness():
 
         # 4. If ETag differs, refresh cached resources
         if old_etag:
-            # We only show this if it's an actual update detected since session start
-            msg = st.info("New corpus data available — refreshing index (this takes ~20 seconds)...")
-            st.cache_resource.clear()
-            download_corpus_artifacts()
+            msg = st.info("New corpus data available — refreshing (LanceDB reconnects lazily)...")
+            st.cache_resource.clear()  # clears get_lancedb_table so it reconnects on next query
             msg.empty()
 
         st.session_state["_corpus_etag"] = new_etag
@@ -267,168 +276,46 @@ def _check_corpus_freshness():
 
 def download_corpus_artifacts():
     """
-    Startup sync from Cloudflare R2 with freshness check.
+    Startup check: download build_meta.json from R2 for freshness tracking.
+    LanceDB reads corpus data lazily directly from R2 — no file downloads needed.
     Runs once per Streamlit session using session_state as a guard.
-    Downloads artifacts to get_corpus_dir() if the remote is newer.
     """
-    # Guard: only run once per session (not on every Streamlit re-run)
     if st.session_state.get("_corpus_synced"):
         return
 
-    # ── Local testing override ────────────────────────────────────────────────
-    # If CORPUS_DATA_DIR is explicitly set AND all core artifacts already exist
-    # locally, skip R2 entirely. This lets developers test local SPECTER2 index
-    # files without downloading from R2 or affecting the live Streamlit app.
-    # To re-enable R2 sync, comment out CORPUS_DATA_DIR in your .env file.
+    # Local override: CORPUS_DATA_DIR set → assume local LanceDB already configured
     if os.environ.get("CORPUS_DATA_DIR"):
-        corpus_dir   = get_corpus_dir()
-        _core_files  = ["corpus.db", "embeddings.npy", "corpus.faiss", "id_map.json"]
-        _all_present = all((corpus_dir / f).exists() for f in _core_files)
-        if _all_present:
-            st.session_state["_corpus_synced"] = True
-            return  # All local files present — no R2 sync needed
+        st.session_state["_corpus_synced"] = True
+        return
 
-    import boto3
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    # 1. Resolve credentials: st.secrets (Streamlit Cloud) → os.getenv (.env / GitHub Actions)
     key_id     = _get_secret("R2_ACCESS_KEY_ID")
     access_key = _get_secret("R2_SECRET_ACCESS_KEY")
     endpoint   = _get_secret("R2_ENDPOINT")
     bucket     = _get_secret("R2_BUCKET")
 
     if not all([key_id, access_key, endpoint, bucket]):
-        st.warning("⚠️ R2 credentials not fully configured. Corpus sync skipped.")
         st.session_state["_corpus_synced"] = True
         return
 
     corpus_dir = get_corpus_dir()
     corpus_dir.mkdir(parents=True, exist_ok=True)
     meta_path  = corpus_dir / "build_meta.json"
-    status     = st.empty()
 
     try:
+        import boto3
         from botocore.config import Config
         s3 = boto3.client(
             "s3",
             endpoint_url=endpoint,
             aws_access_key_id=key_id,
             aws_secret_access_key=access_key,
-            region_name="auto",  # Required for Cloudflare R2
+            region_name="auto",
             config=Config(signature_version="s3v4"),
         )
-
-        # 2. Freshness check — compare local vs remote build_meta.json
-        status.info("🔍 Checking for fresh corpus updates on R2...")
-        local_meta = {}
-        if meta_path.exists():
-            try:
-                local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
-            except Exception:
-                pass
-
-        remote_meta_obj = s3.get_object(Bucket=bucket, Key="corpus/build_meta.json")
-        remote_meta     = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
-
-        remote_ts  = remote_meta.get("built_at", "")
-        local_ts   = local_meta.get("built_at", "")
-        remote_ver = remote_meta.get("schema_version", 1)
-        local_ver  = local_meta.get("schema_version", 0)
-
-        if remote_ts == local_ts and remote_ver == local_ver and meta_path.exists():
-            status.empty()
-            st.session_state["_corpus_synced"] = True
-            return  # Already up-to-date
-
-        # 3. Download core flat files in parallel
-        corpus_size = remote_meta.get("corpus_size", "?")
-        status.info(f"🔄 Syncing corpus from R2 ({corpus_size:,} papers)...")
-
-        core_files = [
-            "corpus.db",
-            "corpus.faiss",       # P-03: renamed from index_minilm.faiss
-            "embeddings.npy",     # P-03: renamed from embeddings_minilm.npy
-            "id_map.json",
-            "build_meta.json",
-        ]
-
-        # P-03 transition: FAISS + embeddings filenames changed.
-        # Try new generic names first; fall back to legacy MiniLM names if bucket not yet updated.
-        _faiss_aliases = ("corpus.faiss", "index_minilm.faiss")
-        _emb_aliases   = ("embeddings.npy", "embeddings_minilm.npy")
-
-        def _download_with_fallback(new_name, old_name):
-            """Try new_name first; if 404, fall back to old_name (rename locally)."""
-            dest_new = corpus_dir / new_name
-            try:
-                s3.download_file(bucket, f"corpus/{new_name}", str(dest_new))
-                size_mb = dest_new.stat().st_size / (1024 * 1024)
-                return new_name, size_mb
-            except Exception as primary_exc:
-                if "404" in str(primary_exc) or "NoSuchKey" in str(primary_exc) or "Not Found" in str(primary_exc):
-                    # Bucket still has old MiniLM file — download under old name then rename
-                    dest_old = corpus_dir / old_name
-                    try:
-                        s3.download_file(bucket, f"corpus/{old_name}", str(dest_old))
-                        dest_old.rename(dest_new)  # rename to new generic name locally
-                        size_mb = dest_new.stat().st_size / (1024 * 1024)
-                        print(f"[R2 sync] P-03 transition: downloaded {old_name} → renamed to {new_name}")
-                        return new_name, size_mb
-                    except Exception as fallback_exc:
-                        raise Exception(f"Both {new_name} and {old_name} failed: {primary_exc}; {fallback_exc}")
-                raise  # re-raise non-404 errors
-
-        def _download_file(filename):
-            dest = corpus_dir / filename
-            s3.download_file(bucket, f"corpus/{filename}", str(dest))
-            size_mb = dest.stat().st_size / (1024 * 1024)
-            return filename, size_mb
-
-        # Files that have aliases (transition-aware)
-        aliased_files = {_faiss_aliases[0]: _faiss_aliases[1], _emb_aliases[0]: _emb_aliases[1]}
-        # Files that never changed (no alias needed)
-        stable_files  = [f for f in core_files if f not in aliased_files]
-
-        failed_files = []
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {}
-            for new_name, old_name in aliased_files.items():
-                futures[executor.submit(_download_with_fallback, new_name, old_name)] = new_name
-            for filename in stable_files:
-                futures[executor.submit(_download_file, filename)] = filename
-
-            for future in as_completed(futures):
-                try:
-                    fname, size_mb = future.result()
-                except Exception as exc:
-                    failed_files.append(f"{futures[future]} ({exc})")
-
-        if failed_files:
-            status.error(f"❌ Corpus sync failed for: {', '.join(failed_files)}")
-            return  # Don't mark as synced — allow retry
-
-        # 4. BM25 index directory (non-fatal if missing)
-        bm25_dir = corpus_dir / "bm25_index"
-        bm25_dir.mkdir(exist_ok=True)
-        try:
-            paginator = s3.get_paginator("list_objects_v2")
-            bm25_count = 0
-            for page in paginator.paginate(Bucket=bucket, Prefix="corpus/bm25_index/"):
-                for obj in page.get("Contents", []):
-                    key      = obj["Key"]
-                    filename = key[len("corpus/bm25_index/"):]
-                    if filename:
-                        s3.download_file(bucket, key, str(bm25_dir / filename))
-                        bm25_count += 1
-        except Exception as bm25_err:
-            # BM25 failure is non-fatal — corpus.db + FAISS still work
-            st.warning(f"⚠️ BM25 index sync failed (BM25 retrieval disabled): {bm25_err}")
-
-        status.success("✅ Corpus synced from R2 successfully!")
-        time.sleep(1)
-        status.empty()
+        s3.download_file(bucket, "corpus/build_meta.json", str(meta_path))
         st.session_state["_corpus_synced"] = True
-        # === Warm-up: pre-load models immediately after sync ===
+
+        # Warm-up: pre-load models immediately after startup
         if not st.session_state.get("_models_warmed"):
             try:
                 with st.spinner("Pre-loading models (one-time)..."):
@@ -438,12 +325,14 @@ def download_corpus_artifacts():
                 st.session_state["_models_warmed"] = True
                 logging.info("[warmup] All models pre-loaded successfully.")
             except Exception as _e:
-                logging.warning(f"[warmup] Model pre-load failed (non-fatal): {_e}")
+                logging.warning("[warmup] Model pre-load failed (non-fatal): %s", _e)
 
     except Exception as e:
-        # Show a persistent error so it is always visible on-screen
-        status.error(f"❌ R2 corpus sync error: {e}")
-        # Do NOT set _corpus_synced = True so the next re-run retries
+        # Do NOT set _corpus_synced — next rerun retries. LanceDB still connects to
+        # R2 directly even without build_meta.json, so this only affects freshness
+        # tracking + warm-up timing, not availability.
+        logging.warning("[download_corpus_artifacts] build_meta.json sync failed: %s", e)
+        st.warning(f"⚠️ Corpus freshness check failed ({e}). Retrying next run.")
 
 
 def build_query_brief(research_brief: str, not_looking_for: str) -> str:
@@ -483,94 +372,6 @@ def filter_papers_by_not_terms(papers: List[Paper], not_text: str) -> (List[Pape
             filtered.append(p)
 
     return filtered, removed
-
-
-def semantic_not_filter(
-    papers: List[Paper],
-    not_phrases: List[str],
-    arxiv_to_pos: dict,
-    embeddings: Optional[np.ndarray],
-    threshold: float = 0.65,
-) -> tuple:
-    """
-    P-01: Semantic NOT filter — second-pass after lexical NOT filter.
-    Embeds each NOT phrase via the active embedding model (SPECTER2 or MiniLM).
-    Rejects papers whose vector has cosine similarity >= threshold to any NOT phrase.
-    Falls back to runtime embedding for papers not in the precomputed index.
-    Returns (kept_papers, removed_count).
-    """
-    if not not_phrases or embeddings is None:
-        return papers, 0
-
-    emb_dim = embeddings.shape[1]
-
-    try:
-        if emb_dim == 768:
-            # P-03: SPECTER2 active
-            # SPECTER2 vectors natively sit much closer together on the hypersphere
-            # (unrelated terms often have baseline similarity of 0.70 to 0.85).
-            # We scale the strict MiniLM default threshold to a tight SPECTER2 threshold.
-            if threshold < 0.90:
-                active_threshold = 0.93  # Needs near-identical semantics to reject
-            else:
-                active_threshold = threshold
-
-            model, tok = get_specter2_model()
-            if model is None or tok is None:
-                return papers, 0
-            
-            import torch
-            inputs = tok(not_phrases, padding=True, truncation=True, max_length=512, return_tensors="pt")
-            with torch.no_grad():
-                out = model(**inputs)
-            not_vecs = out.last_hidden_state[:, 0, :].cpu().float().numpy()
-            norms = np.linalg.norm(not_vecs, axis=1, keepdims=True)
-            not_vecs = not_vecs / np.where(norms > 0, norms, 1.0)
-            
-            def embed_paper(p):
-                text = p.title + tok.sep_token + (p.abstract or "")[:400]
-                inp = tok([text], padding=True, truncation=True, max_length=512, return_tensors="pt")
-                with torch.no_grad():
-                    o = model(**inp)
-                v = o.last_hidden_state[:, 0, :].cpu().float().numpy()[0]
-                n = np.linalg.norm(v)
-                return v / n if n > 0 else v
-
-        else:
-            # Legacy fallback: MiniLM (384-dim)
-            active_threshold = threshold
-            model = get_local_embed_model()
-            if model is None:
-                return papers, 0
-            not_vecs = model.encode(not_phrases, normalize_embeddings=True)
-
-            def embed_paper(p):
-                return model.encode([p.title + "\n\n" + (p.abstract or "")], normalize_embeddings=True)[0]
-                
-    except Exception as e:
-        print(f"[semantic_not_filter] embed error: {e} — skipping semantic NOT pass")
-        return papers, 0
-
-    kept: List[Paper] = []
-    removed = 0
-    for p in papers:
-        pos = arxiv_to_pos.get(p.arxiv_id)
-        if pos is not None and pos < embeddings.shape[0]:
-            paper_vec = embeddings[pos]
-        else:
-            try:
-                paper_vec = embed_paper(p)
-            except Exception:
-                kept.append(p)
-                continue
-
-        max_sim = float(np.max(not_vecs @ paper_vec))  # cosine (normalized vectors)
-        if max_sim >= active_threshold:
-            removed += 1
-        else:
-            kept.append(p)
-
-    return kept, removed
 
 
 def filter_papers_by_venue(
@@ -674,104 +475,90 @@ def extract_venue(comment: str) -> Optional[str]:
             return venue
     return None
 
-def build_arxiv_category_query(
-    main_category: str,
-    subcategories: List[str],
-) -> str:
-    """
-    Returns arXiv API query fragment like:
-      (cat:cs.AI OR cat:cs.LG OR cat:stat.ML)
-    If subcategories empty, falls back to all subcats in main_category.
-    If main_category == "All", uses all subcategories across all mains.
-    """
-    if main_category == "All":
-        cats = sorted({c for subs in ARXIV_CATEGORIES.values() for c in subs})
-    else:
-        cats = subcategories if subcategories else ARXIV_CATEGORIES.get(main_category, [])
-
-    # Safety fallback (so your app never crashes)
-    if not cats:
-        cats = ["cs.AI", "cs.LG", "cs.HC"]
-
-    return "(" + " OR ".join([f"cat:{c}" for c in cats]) + ")"
-
 DB_FETCH_LIMIT = 20_000  # Hard cap: prevents OOM on Streamlit Cloud with large date windows
 
 
-def fetch_papers_from_db(
+def fetch_papers_from_lancedb(
     start_date: date,
     end_date: date,
     category_filter: Optional[str] = None,
-    subcats: Optional[List[str]] = None
+    subcats: Optional[List[str]] = None,
 ) -> List[Paper]:
     """
-    Fetch papers from the local SQLite corpus.
-    Filters by submitted_date range, and optionally checks abstract/title
-    for subcategory keyword matches to simulate arXiv category filtering.
-
-    Hard-capped at DB_FETCH_LIMIT rows (most recent first) to prevent OOM
-    on Streamlit Cloud when "All Time" is selected over a 180k+ corpus.
+    Fetch papers from LanceDB on R2. Most-recent first, capped at DB_FETCH_LIMIT.
+    Replaces the old SQLite fetch_papers_from_db — no local file download needed.
     """
-    import os
-    import json
-    import sqlite3 as _sq
-    db_path = get_corpus_dir() / "corpus.db"
-    if not db_path.exists():
+    table = get_lancedb_table()
+    if table is None:
         return []
 
-    conn = _sq.connect(db_path, check_same_thread=False)
-    conn.row_factory = _sq.Row
+    from data_pipeline.schema import _escape_sql
 
-    query = "SELECT * FROM papers WHERE date(submitted_date) >= date(?) AND date(submitted_date) <= date(?)"
-    params = [start_date.isoformat(), end_date.isoformat()]
-
+    filter_parts = [
+        f"submitted_date >= '{start_date.isoformat()}'",
+        f"submitted_date <= '{end_date.isoformat()}T23:59:59'",
+    ]
     if category_filter and category_filter != "All":
-        query += " AND fields_of_study LIKE ?"
-        params.append(f"%{category_filter}%")
+        filter_parts.append(f"fields_of_study LIKE '%{_escape_sql(category_filter)}%'")
 
+    # Subcat keyword match pushed into the filter (not applied post-LIMIT) so the
+    # 20k cap below keeps the most-recent *matching* papers, not the most-recent
+    # papers overall with a narrow subcat filter thinning them out afterward.
     if subcats and category_filter != "All":
         or_clauses = []
         for cat_code in subcats:
             cat_name = ARXIV_CODE_TO_NAME.get(cat_code, cat_code)
-            # Remove minor stop words for better partial match
-            words = [w for w in cat_name.split() if w.lower() not in ('and', 'or', 'of')]
+            words = [w for w in cat_name.split() if w.lower() not in ("and", "or", "of")]
             if words:
-                keyword = words[0]
-                if len(words) > 1:
-                    keyword = " ".join(words[:2]) # e.g. "Artificial Intelligence"
-
-                # Check for either standard keyword simulation OR absolute 100% precision raw arXiv tag
-                or_clauses.append("(title LIKE ? OR abstract LIKE ? OR fields_of_study LIKE ?)")
-                params.extend([f"%{keyword}%", f"%{keyword}%", f"%{cat_code}%"])
-
+                keyword = _escape_sql(words[0] if len(words) == 1 else " ".join(words[:2]))
+                safe_code = _escape_sql(cat_code)
+                or_clauses.append(
+                    f"(title LIKE '%{keyword}%' OR abstract LIKE '%{keyword}%' "
+                    f"OR fields_of_study LIKE '%{safe_code}%')"
+                )
         if or_clauses:
-            query += " AND (" + " OR ".join(or_clauses) + ")"
+            filter_parts.append("(" + " OR ".join(or_clauses) + ")")
 
-    # Always return the most-recent papers first; cap at DB_FETCH_LIMIT to prevent OOM.
-    query += f" ORDER BY submitted_date DESC LIMIT {DB_FETCH_LIMIT}"
+    where_str = " AND ".join(filter_parts)
 
-    rows = conn.execute(query, params).fetchall()
+    cols = [
+        "arxiv_id", "title", "abstract", "authors", "submitted_date",
+        "pdf_url", "arxiv_url", "venue", "source", "fields_of_study",
+    ]
+
+    try:
+        from data_pipeline.schema import query_table
+        # ponytail: no server-side ORDER BY/LIMIT push-down on this lance scan (text
+        # columns only, no vector) — fine at current corpus size; if "All Time" + "All"
+        # category ever OOMs, page via submitted_date instead of scanning-then-head().
+        df = query_table(table, filter=where_str, columns=cols)
+    except Exception as exc:
+        logging.error("[fetch_papers_from_lancedb] Query failed: %s", exc)
+        return []
+
+    df = df.sort_values("submitted_date", ascending=False).head(DB_FETCH_LIMIT)
 
     papers: List[Paper] = []
-    for r in rows:
-        d = dict(r)
-        # Guard: reject NULL, empty, or non-ISO strings like the literal "None"/"None-01-01"
-        raw = d.get("submitted_date") or ""
+    for _, r in df.iterrows():
+        raw = str(r.get("submitted_date") or "")
         date_str = raw if (len(raw) >= 4 and raw[:4].isdigit()) else "2024-01-01"
         if "T" not in date_str:
             date_str = date_str + "T00:00:00"
-            
+        try:
+            submitted = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except Exception:
+            submitted = datetime(2024, 1, 1)
         papers.append(Paper(
-            arxiv_id=d["arxiv_id"],
-            title=d["title"],
-            authors=json.loads(d.get("authors") or "[]"),
+            arxiv_id=str(r.get("arxiv_id") or ""),
+            title=str(r.get("title") or ""),
+            authors=json.loads(str(r.get("authors") or "[]")),
             email_domains=[],
-            abstract=d.get("abstract") or "",
-            submitted_date=datetime.fromisoformat(date_str.replace("Z", "+00:00")),
-            pdf_url=d.get("pdf_url") or "",
-            arxiv_url=d.get("arxiv_url") or "",
-            venue=d.get("venue"),
-            source=d.get("source"),
+            abstract=str(r.get("abstract") or ""),
+            submitted_date=submitted,
+            pdf_url=str(r.get("pdf_url") or ""),
+            arxiv_url=str(r.get("arxiv_url") or ""),
+            venue=r.get("venue") or None,
+            source=r.get("source") or None,
         ))
     return papers
 
@@ -887,56 +674,6 @@ def safe_parse_json_array(raw: str) -> Optional[List[Dict[str, Any]]]:
 # Embeddings
 # =========================
 
-def embed_texts_openai(texts: List[str], llm_config: LLMConfig, embedding_model: str) -> List[List[float]]:
-    if not texts: return []
-    
-    # Robust Init with Retries
-    client_args = {"api_key": llm_config.api_key}
-    if llm_config.api_base and llm_config.api_base.strip():
-        client_args["base_url"] = llm_config.api_base
-    client = OpenAI(**client_args)
-    
-    all_embeddings: List[List[float]] = []
-    batch_size = 100
-    
-    for start in range(0, len(texts), batch_size):
-        batch = texts[start:start + batch_size]
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                resp = client.embeddings.create(model=embedding_model, input=batch)
-                for d in resp.data:
-                    all_embeddings.append(d.embedding)
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    st.error(f"Embedding API call failed: {e}")
-                    raise
-                time.sleep(2 * (attempt + 1))
-                
-    return all_embeddings
-
-
-def embed_texts_gemini(texts: List[str], llm_config: LLMConfig, embedding_model: str) -> List[List[float]]:
-    if not texts: return []
-    if genai is None:
-        st.error("google-genai package missing.")
-        st.stop()
-    client = genai.Client(api_key=llm_config.api_key)
-    all_embeddings: List[List[float]] = []
-    batch_size = 100
-    for start in range(0, len(texts), batch_size):
-        batch = texts[start:start + batch_size]
-        try:
-            response = client.models.embed_content(model=embedding_model, contents=batch)
-        except Exception as e:
-            st.error(f"Gemini embedding API call failed: {e}")
-            raise
-        for emb in getattr(response, "embeddings", []):
-            all_embeddings.append(list(emb.values))
-    return all_embeddings
-
-
 @st.cache_resource(show_spinner=False)
 def get_local_embed_model() -> SentenceTransformer:
     if SentenceTransformer is None:
@@ -966,292 +703,18 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 
 
 @st.cache_resource(show_spinner=False)
-def load_bm25_index():
-    if not bm25s:
-        return None, None
-    base = get_corpus_dir()
-    bm25_path = base / "bm25_index"
-    id_map_path = base / "id_map.json"
-    if not bm25_path.exists() or not id_map_path.exists():
-        return None, None
+def get_lancedb_table():
+    """
+    Connect to LanceDB (R2 via env vars, or local CORPUS_DATA_DIR) and return the papers table.
+    Cached per Streamlit session — cleared by _check_corpus_freshness on corpus update.
+    """
+    local_path = os.environ.get("CORPUS_DATA_DIR") or None
     try:
-        retriever = bm25s.BM25.load(str(bm25_path))
-        with open(id_map_path, "r", encoding="utf-8") as f:
-            id_map = json.load(f)
-        arxiv_to_pos = {v: int(k) for k, v in id_map.items()}
-        return retriever, arxiv_to_pos
-    except Exception as e:
-        print(f"Failed to load BM25 index: {e}")
-        return None, None
-
-
-# =========================
-# Task 33 — RRF Hybrid Retrieval helpers
-# =========================
-
-def _bm25_ranked_pool(
-    papers: List[Paper],
-    query_brief: str,
-    retriever,
-    arxiv_to_pos: dict,
-    top_k: int = 400,
-    bm25_query: Optional[str] = None,
-) -> Dict[str, int]:
-    """BM25 retrieval over papers. Uses QIL keyword string when available.
-    Returns arxiv_id → 1-indexed rank for top-K results."""
-    if not retriever or not papers:
-        return {}
-
-    effective_query = bm25_query if bm25_query else query_brief
-
-    pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
-    paper_ids = {p.arxiv_id for p in papers}
-
-    tokens = bm25s.tokenize([effective_query])
-    try:
-        res, _scores = retriever.retrieve(tokens, k=min(top_k, len(arxiv_to_pos)))
+        from data_pipeline.schema import connect_lancedb, get_or_create_papers_table
+        db = connect_lancedb(local_path)
+        return get_or_create_papers_table(db)
     except Exception as exc:
-        print(f"[BM25] retrieve error: {exc}")
-        return {}
-
-    ranked: Dict[str, int] = {}
-    rank = 1
-    for pos in res[0]:
-        arxiv_id = pos_to_arxiv.get(int(pos))
-        if arxiv_id and arxiv_id in paper_ids and arxiv_id not in ranked:
-            ranked[arxiv_id] = rank
-            rank += 1
-            if rank > top_k:
-                break
-    return ranked
-
-
-def _faiss_ranked_pool(
-    papers: List[Paper],
-    query_brief: str,
-    embeddings: Optional[np.ndarray],
-    arxiv_to_pos: dict,
-    top_k: int = 400,
-    q_vec: Optional[np.ndarray] = None,
-    semantic_query: Optional[str] = None,
-) -> Dict[str, int]:
-    """SPECTER2 adhoc_query cosine retrieval over precomputed embeddings.
-    Uses QIL semantic_query when available; falls back to MiniLM if SPECTER2 unavailable.
-    Returns arxiv_id → 1-indexed cosine rank for top-K results."""
-    if not papers:
-        return {}
-
-    if q_vec is None:
-        encode_text = semantic_query if semantic_query and semantic_query.strip() else query_brief
-        target_dim = embeddings.shape[1] if embeddings is not None else 768
-
-        if target_dim == 768:
-            specter2_model, specter2_tok = get_specter2_model()
-            if specter2_model is not None and specter2_tok is not None:
-                try:
-                    import torch
-                    inputs = specter2_tok(
-                        [encode_text],
-                        padding=True,
-                        truncation=True,
-                        max_length=512,
-                        return_tensors="pt",
-                    )
-                    with torch.no_grad():
-                        out = specter2_model(**inputs)
-                    q_vec = out.last_hidden_state[:, 0, :].cpu().float().numpy()[0]
-                    q_norm = np.linalg.norm(q_vec)
-                    if q_norm > 0:
-                        q_vec = q_vec / q_norm
-                except Exception as exc:
-                    print(f"[FAISS/SPECTER2] query embed error: {exc} — falling back to MiniLM")
-                    q_vec = None
-
-        # Fallback to MiniLM if SPECTER2 failed OR if the index is legacy 384-dim
-        if q_vec is None:
-            try:
-                model = get_local_embed_model()
-                q_vec = model.encode([encode_text], normalize_embeddings=True)[0]
-            except Exception as exc:
-                print(f"[FAISS] query embed error: {exc}")
-                return {}
-
-    if embeddings is not None and arxiv_to_pos:
-        if q_vec.shape[0] != embeddings.shape[1]:
-            print(f"[FAISS] dim mismatch ({q_vec.shape[0]} vs {embeddings.shape[1]}). Rebuild index with build_index.py.")
-            return {}
-
-        # Fix 3: vectorized cosine — single matrix-vector multiply instead of Python loop.
-        # Build parallel arrays: paper IDs and their index positions (-1 = not in index).
-        paper_ids_arr = [p.arxiv_id for p in papers]
-        positions = np.array([arxiv_to_pos.get(pid, -1) for pid in paper_ids_arr], dtype=np.intp)
-        valid_mask = (positions >= 0) & (positions < embeddings.shape[0])
-
-        sims = np.full(len(papers), -1.0, dtype=np.float32)
-        if valid_mask.any():
-            sims[valid_mask] = embeddings[positions[valid_mask]] @ q_vec
-
-        scores_list = list(zip(paper_ids_arr, sims.tolist()))
-    else:
-        # No precomputed index — encode at runtime (slow path)
-        specter2_model, specter2_tok = get_specter2_model()
-        if specter2_model is not None and specter2_tok is not None:
-            import torch
-            texts = [p.title + specter2_tok.sep_token + (p.abstract or "")[:400] for p in papers]
-            try:
-                inputs = specter2_tok(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
-                with torch.no_grad():
-                    out = specter2_model(**inputs)
-                vecs = out.last_hidden_state[:, 0, :].cpu().float().numpy()
-                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-                vecs = vecs / np.where(norms > 0, norms, 1.0)
-            except Exception as exc:
-                print(f"[FAISS] batch embed error: {exc}")
-                return {}
-        else:
-            local_model = get_local_embed_model()
-            texts = [p.title + "\n\n" + p.abstract[:512] for p in papers]
-            try:
-                vecs = local_model.encode(texts, normalize_embeddings=True, batch_size=64)
-            except Exception as exc:
-                print(f"[FAISS] MiniLM embed error: {exc}")
-                return {}
-        scores_list = [(p.arxiv_id, float(np.dot(vecs[i], q_vec))) for i, p in enumerate(papers)]
-    scores_list.sort(key=lambda x: x[1], reverse=True)
-    ranked: Dict[str, int] = {}
-    for rank, (arxiv_id, _sim) in enumerate(scores_list[:top_k], start=1):
-        ranked[arxiv_id] = rank
-    return ranked
-
-
-# RRF constant (standard value from Cormack et al. 2009)
-_RRF_K: int = 60
-
-
-def rrf_merge(
-    papers: List[Paper],
-    bm25_ranks: Dict[str, int],
-    faiss_ranks: Dict[str, int],
-    rrf_weight_bm25: float = 1.0,
-    rrf_weight_faiss: float = 1.0,
-    top_n: int = 600,
-) -> List[Paper]:
-    """
-    Reciprocal Rank Fusion merge of BM25 and FAISS ranked pools.
-
-    For each paper found by at least one retriever:
-      rrf_score = w_bm25 / (k + bm25_rank) + w_faiss / (k + faiss_rank)
-
-    Papers absent from a retriever receive rank = pool_size + 1 for that retriever.
-    Populates p.bm25_rank, p.faiss_rank, p.rrf_score, p.retrieval_source.
-    Returns top_n papers sorted by rrf_score descending.
-    """
-    n_bm25 = len(bm25_ranks)
-    n_faiss = len(faiss_ranks)
-    # Sentinel rank for papers missing from a retriever
-    missing_bm25_rank = n_bm25 + 1
-    missing_faiss_rank = n_faiss + 1
-
-    paper_dict = {p.arxiv_id: p for p in papers}
-    # Union of all paper IDs seen by at least one retriever
-    union_ids = set(bm25_ranks.keys()) | set(faiss_ranks.keys())
-
-    if not union_ids:
-        return []
-
-    scored: List[tuple] = []
-    for arxiv_id in union_ids:
-        p = paper_dict.get(arxiv_id)
-        if p is None:
-            continue  # Not in the current input pool (shouldn't happen, but guard)
-
-        br = bm25_ranks.get(arxiv_id)
-        fr = faiss_ranks.get(arxiv_id)
-
-        rrf = (
-            rrf_weight_bm25 / (_RRF_K + (br if br is not None else missing_bm25_rank))
-            + rrf_weight_faiss / (_RRF_K + (fr if fr is not None else missing_faiss_rank))
-        )
-
-        # Determine retrieval source
-        if br is not None and fr is not None:
-            src = "both"
-        elif br is not None:
-            src = "bm25_only"
-        else:
-            src = "faiss_only"
-
-        # Populate Task 37 provenance fields
-        p.bm25_rank = br
-        p.faiss_rank = fr
-        p.rrf_score = rrf
-        p.retrieval_source = src
-
-        scored.append((rrf, p))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in scored[:top_n]]
-
-
-def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: dict, n1: int = 600) -> List[Paper]:
-    """
-    Legacy BM25-only recall (kept for backward compat / eval harness).
-    For new code, use _bm25_ranked_pool + rrf_merge instead.
-    """
-    if not retriever or not papers:
-        return papers
-    paper_dict = {p.arxiv_id: p for p in papers}
-    tokens = bm25s.tokenize([query_brief])
-    try:
-        res, _scores = retriever.retrieve(tokens, k=n1)
-    except Exception as e:
-        print(f"BM25 retrieve error: {e}")
-        return papers
-    pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
-    recalled_papers = []
-    seen = set()
-    for pos in res[0]:
-        pos_int = int(pos)
-        arxiv_id = pos_to_arxiv.get(pos_int)
-        if arxiv_id and arxiv_id in paper_dict and arxiv_id not in seen:
-            recalled_papers.append(paper_dict[arxiv_id])
-            seen.add(arxiv_id)
-    if len(recalled_papers) < 50:
-        st.info("BM25 recall found fewer than 50 intersecting papers. Skipping strict BM25 pruning.")
-        return papers
-    return recalled_papers
-
-
-@st.cache_resource(show_spinner=False)
-def load_precomputed_embeddings():
-    """
-    P-03: Load SPECTER2 proximity-encoded paper embeddings (dim=768).
-    Falls back to legacy MiniLM file (dim=384) if the new file is absent,
-    so the app stays functional while the offline rebuild is pending.
-    """
-    base = get_corpus_dir()
-    # Primary: SPECTER2 index (P-03)
-    emb_path = base / "embeddings.npy"
-    if not emb_path.exists():
-        # Legacy fallback during transition — remove once rebuild is complete
-        emb_path = base / "embeddings_minilm.npy"
-        if emb_path.exists():
-            # Use ASCII-safe logging to avoid CP1252 UnicodeEncodeError on Windows
-            logging.warning(
-                "[load_precomputed_embeddings] WARN: Using legacy MiniLM embeddings (384-dim). "
-                "Run build_index.py to upgrade to SPECTER2 (768-dim)."
-            )
-        else:
-            return None
-    try:
-        arr = np.load(str(emb_path), mmap_mode='r')
-        logging.info(
-            "[load_precomputed_embeddings] Loaded embeddings %s from %s",
-            arr.shape, emb_path.name
-        )
-        return arr
-    except Exception as e:
-        logging.error("Failed to load precomputed embeddings: %s", e)
+        logging.error("[LanceDB] Connection failed: %s", exc)
         return None
 
 # =========================
@@ -1302,6 +765,10 @@ def get_specter2_model():
         except Exception as e:
             print(f"[SPECTER2] Warning: Could not verify adapter activation: {e}")
 
+        # load_adapter() adds adapter weights in float32 regardless of the base
+        # model's dtype — recast the whole model (base + adapter) so forward
+        # passes don't hit a Half/Float matmul mismatch.
+        model = model.to(torch.float16)
         model.eval()
         return model, tokenizer
     except ImportError:
@@ -1316,21 +783,20 @@ def specter2_vector_rerank(
     papers: List[Paper],
     query_brief: str,
     n2: int = 300,
-    precomputed_embeddings: Optional[np.ndarray] = None,
-    arxiv_to_pos: Optional[dict] = None,
+    paper_vectors: Optional[Dict[str, list]] = None,
 ) -> List[Paper]:
     """
-    Stage 2 reranker — asymmetric SPECTER2 retrieval with precomputed-embedding fast path.
+    Stage 2 reranker — asymmetric SPECTER2 retrieval with a LanceDB-vector fast path.
 
     Encoding protocol (correct SPECTER2 asymmetric format):
       - Query : encode live with adhoc_query adapter (~0.3s, one forward pass)
-      - Paper : look up precomputed proximity-adapter embeddings from embeddings.npy
-                (already built by build_index.py with the correct paper-side adapter).
-                Only papers absent from the index fall back to a live adhoc_query pass,
+      - Paper : look up SPECTER2 proximity-adapter vectors already fetched from LanceDB
+                by _lancedb_hybrid_stage1 (paper_vectors dict).
+                Only papers absent from that dict fall back to a live adhoc_query pass,
                 which is a small minority in practice.
 
-    Fast path:   precomputed_embeddings + arxiv_to_pos provided → ~0.05s for 1200 papers
-    Slow path:   embeddings not provided → live SPECTER2 encode for all papers (~60s/1200)
+    Fast path:   paper_vectors provided → ~0.05s for 1200 papers
+    Slow path:   paper_vectors empty → live SPECTER2 encode for all papers (~60s/1200)
     Fallback:    SPECTER2 model unavailable → return [] so caller uses MiniLM path
 
     Sets p.semantic_relevance on each paper.
@@ -1376,28 +842,24 @@ def specter2_vector_rerank(
         if q_norm > 0:
             q_vec = q_vec / q_norm
 
-        # ── Fast path: use precomputed proximity-adapter embeddings ──────────
-        # build_index.py encoded papers with the proximity adapter (paper-side);
-        # this is the correct SPECTER2 asymmetric pairing with the adhoc_query query.
-        have_precomputed = (
-            precomputed_embeddings is not None
-            and arxiv_to_pos is not None
-            and precomputed_embeddings.shape[1] == q_vec.shape[0]  # dim must match
-        )
+        # ── Fast path: use vectors fetched from LanceDB in Stage 1 ──
+        have_lancedb_vecs = bool(paper_vectors)
 
-        if have_precomputed:
+        if have_lancedb_vecs:
             # Split papers into indexed (fast lookup) and unindexed (live encode)
             indexed_papers: List[Paper] = []
             indexed_vecs_list: List[np.ndarray] = []
             unindexed_papers: List[Paper] = []
 
             for p in papers:
-                pos = arxiv_to_pos.get(p.arxiv_id)
-                if pos is not None and pos < precomputed_embeddings.shape[0]:
-                    indexed_papers.append(p)
-                    indexed_vecs_list.append(precomputed_embeddings[pos])
-                else:
-                    unindexed_papers.append(p)
+                vec = (paper_vectors or {}).get(p.arxiv_id)
+                if vec is not None:
+                    arr = np.array(vec, dtype="float32")
+                    if arr.shape[0] == q_vec.shape[0]:
+                        indexed_papers.append(p)
+                        indexed_vecs_list.append(arr)
+                        continue
+                unindexed_papers.append(p)
 
             # Vectorized cosine for indexed papers — single numpy op
             if indexed_papers:
@@ -1462,60 +924,142 @@ def specter2_vector_rerank(
         return []
 
 
-def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Optional[np.ndarray], arxiv_to_pos: dict, n2: int = 300) -> List[Paper]:
+def minilm_vector_rerank(papers: List[Paper], query_brief: str, n2: int = 300) -> List[Paper]:
+    """Stage 2 MiniLM fallback — runtime-embeds papers + query when SPECTER2 is unavailable."""
     if not papers: return []
-    if embeddings is None or not arxiv_to_pos:
-        # Fallback to runtime embed
-        texts = [p.title + "\n\n" + p.abstract for p in papers]
-        paper_vecs = embed_texts_local(texts)
-        q_vec = embed_texts_local([query_brief])[0]
-        scored = []
-        for p, vec in zip(papers, paper_vecs):
-            sim = cosine_similarity(q_vec, vec)
-            p.semantic_relevance = sim
-            scored.append((sim, p))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        k = min(n2, len(scored))
-        return [p for _, p in scored[:k]]
-        
-    try:
-        model = get_local_embed_model()
-        embs_dim = embeddings.shape[1] if embeddings is not None else 0
-        
-        # If the index dimension is not 384, we can't use it with MiniLM query.
-        # Force runtime fallback.
-        if embs_dim != 384:
-            texts = [p.title + "\n\n" + (p.abstract or "") for p in papers]
-            paper_vecs = model.encode(texts, normalize_embeddings=True, batch_size=64)
-            q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
-            scored = []
-            for p, vec in zip(papers, paper_vecs):
-                sim = float(np.dot(vec, q_vec))
-                p.semantic_relevance = sim
-                scored.append((sim, p))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            return [p for _, p in scored[:n2]]
-
-        q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
-    except Exception as e:
-        print(f"Local query embed error: {e}")
-        return papers
-
+    texts = [p.title + "\n\n" + p.abstract for p in papers]
+    paper_vecs = embed_texts_local(texts)
+    q_vec = embed_texts_local([query_brief])[0]
     scored = []
-    # Collect indices for batch extraction if possible, or dot product individually
-    for p in papers:
-        pos = arxiv_to_pos.get(p.arxiv_id)
-        if pos is not None and pos < embeddings.shape[0]:
-            vec = embeddings[pos]
-            sim = float(np.dot(vec, q_vec))
-        else:
-            sim = 0.0 # Paper not in index
+    for p, vec in zip(papers, paper_vecs):
+        sim = cosine_similarity(q_vec, vec)
         p.semantic_relevance = sim
         scored.append((sim, p))
-        
     scored.sort(key=lambda x: x[0], reverse=True)
     k = min(n2, len(scored))
     return [p for _, p in scored[:k]]
+
+def _lancedb_hybrid_stage1(
+    table,
+    papers: List[Paper],
+    fts_query: str,
+    q_vec: Optional[np.ndarray],
+    top_k: int = 400,
+    quality_where: Optional[str] = None,
+) -> tuple:
+    """
+    LanceDB FTS + vector search with manual RRF.
+
+    Returns (stage1_papers, paper_vectors).
+    paper_vectors: {arxiv_id: list[float]} — SPECTER2 proximity vectors fetched from LanceDB.
+    These are passed to specter2_vector_rerank as the Stage 2 fast path, replacing the old
+    embeddings.npy array. Only vectors for papers with has_embedding=True are included.
+
+    Search scoped globally then intersected with the `papers` pool (already date-filtered).
+    search_k over-fetches to compensate for pool-intersection loss.
+    """
+    if not papers:
+        return [], {}
+
+    paper_ids  = {p.arxiv_id for p in papers}
+    paper_dict = {p.arxiv_id: p for p in papers}
+    fts_ranks:    Dict[str, int]  = {}
+    vec_ranks:    Dict[str, int]  = {}
+    paper_vectors: Dict[str, list] = {}
+
+    search_k = min(top_k * 5, 6000)
+
+    # Derive pool date range to scope global searches — critical for "All Time" mode
+    # where DB_FETCH_LIMIT caps the pool at 20k out of 385k total papers.
+    # Without scoping, only ~5% of global search results land in the pool.
+    pool_date_where: Optional[str] = None
+    if papers:
+        dates = [p.submitted_date.strftime("%Y-%m-%d") for p in papers if p.submitted_date]
+        if dates:
+            min_date, max_date = min(dates), max(dates)
+            pool_date_where = (
+                f"submitted_date >= '{min_date}' AND submitted_date <= '{max_date}T23:59:59'"
+            )
+
+    # QIL quality_modifier pre-filter (year/citation_count), ANDed alongside the date scope.
+    scope_where_parts = [p for p in (pool_date_where, quality_where) if p]
+    scope_where = " AND ".join(f"({p})" for p in scope_where_parts) if scope_where_parts else None
+
+    # ── FTS search (Tantivy, searches all FTS-indexed fields: title + abstract) ──
+    try:
+        fts_q = (
+            table.search(fts_query, query_type="fts")
+            .select(["arxiv_id", "has_embedding", "vector"])
+            .limit(search_k)
+        )
+        if scope_where:
+            fts_q = fts_q.where(scope_where)
+        fts_rows = fts_q.to_list()
+        rank = 1
+        for row in fts_rows:
+            aid = row.get("arxiv_id")
+            if aid and aid in paper_ids and aid not in fts_ranks:
+                fts_ranks[aid] = rank
+                if row.get("has_embedding") and row.get("vector") is not None:
+                    paper_vectors[aid] = row["vector"]
+                rank += 1
+    except Exception as exc:
+        logging.warning("[Stage1/FTS] LanceDB FTS failed: %s", exc)
+
+    # ── Vector search (IvfHnswSq cosine, SPECTER2 proximity vectors) ─────────
+    if q_vec is not None:
+        try:
+            vec_where = "has_embedding = true"
+            if scope_where:
+                vec_where = f"has_embedding = true AND ({scope_where})"
+            vec_rows = (
+                table.search(q_vec.tolist(), query_type="vector")
+                .where(vec_where, prefilter=True)
+                .select(["arxiv_id", "vector"])
+                .limit(search_k)
+                .to_list()
+            )
+            rank = 1
+            for row in vec_rows:
+                aid = row.get("arxiv_id")
+                if aid and aid in paper_ids and aid not in vec_ranks:
+                    vec_ranks[aid] = rank
+                    if aid not in paper_vectors and row.get("vector") is not None:
+                        paper_vectors[aid] = row["vector"]
+                    rank += 1
+        except Exception as exc:
+            logging.warning("[Stage1/Vec] LanceDB vector search failed: %s", exc)
+
+    # ── RRF merge (k=60, equal weights for FTS and vector) ────────────────────
+    _k = 60
+    union_ids = set(fts_ranks.keys()) | set(vec_ranks.keys())
+    n_fts, n_vec = len(fts_ranks), len(vec_ranks)
+
+    scored: List[tuple] = []
+    for aid in union_ids:
+        rrf = (
+            1.0 / (_k + fts_ranks.get(aid, n_fts + 1))
+            + 1.0 / (_k + vec_ranks.get(aid, n_vec + 1))
+        )
+        scored.append((rrf, aid))
+    scored.sort(reverse=True)
+
+    result_papers: List[Paper] = []
+    for rrf_score, aid in scored[:top_k]:
+        p = paper_dict.get(aid)
+        if p:
+            p.bm25_rank  = fts_ranks.get(aid)
+            p.faiss_rank = vec_ranks.get(aid)
+            p.rrf_score  = rrf_score
+            p.retrieval_source = (
+                "both"       if aid in fts_ranks and aid in vec_ranks
+                else "bm25_only"  if aid in fts_ranks
+                else "faiss_only"
+            )
+            result_papers.append(p)
+
+    return result_papers, paper_vectors
+
 
 @st.cache_resource(show_spinner=False)
 def get_cross_encoder_model():
@@ -1526,10 +1070,8 @@ def get_cross_encoder_model():
         # bge-reranker-base is trained on broader multilingual+scientific corpus;
         # consistently outperforms ms-marco on BEIR scientific subsets (SciFact, TREC-COVID).
         st.info("Loading CrossEncoder model (BAAI/bge-reranker-base) for precision re-ranking (first run only)…")
-        return CrossEncoder(
-            "BAAI/bge-reranker-base",
-            automodel_args={"torch_dtype": torch.float16},
-        )
+        return CrossEncoder("BAAI/bge-reranker-base", automodel_args={"torch_dtype": torch.float16})
+
     except Exception as e:
         print(f"CrossEncoder load error: {e}")
         return None
@@ -1574,37 +1116,45 @@ def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -
         return papers[:n3]
 
 
+def _st_emit(msg: str, level: str = "write") -> None:
+    getattr(st, level)(msg)
+
+
 def select_embedding_candidates(
     papers: List[Paper],
     query_brief: str,
     llm_config: Optional[LLMConfig] = None,
-    embedding_model: str = "",
-    provider: str = "",
     max_candidates: int = 150,
-    use_hyde: bool = False,  # retired; kept for call-site backward compat
+    emit: Callable[[str, str], None] = _st_emit,
+    qil_cache: Optional[dict] = None,
 ) -> List[Paper]:
     """
     4-stage hybrid search pipeline:
       Stage 0 — QIL decomposes brief → semantic_query, bm25_keywords, intent
-      Stage 1 — Parallel BM25 + FAISS → RRF → adaptive top-K
+      Stage 1 — LanceDB full-text + vector search → RRF → adaptive top-K
       Stage 2 — SPECTER2 vector rerank → top-400 (MiniLM fallback)
       Stage 3 — CrossEncoder precision rerank → top-150
-    Graceful degradation: BM25-only, FAISS-only, or full-pool fallback.
+    Graceful degradation: full-text-only, vector-only, or full-pool fallback.
+
+    No direct Streamlit calls — `emit(msg, level)` defaults to st.write/info/warning
+    but can be swapped for a plain collector in tests or non-Streamlit callers.
+    `qil_cache` defaults to a fresh per-call dict; pass a persistent dict (e.g.
+    st.session_state) to keep QIL cross-call caching.
     """
     if not papers:
         return []
+    if qil_cache is None:
+        qil_cache = {}
 
-    st.write(f"Starting 3-stage hybrid search from {len(papers)} SQLite candidates...")
+    emit(f"Starting 3-stage hybrid search from {len(papers)} LanceDB candidates...")
 
     # ─── Stage 0: Query Intelligence Layer ────────────────────────────────
     sq = None
     if analyse_query is not None:
         try:
-            # Session cache: avoid redundant LLM calls for identical queries
+            # Cache: avoid redundant LLM calls for identical queries within a session
             _qil_cache_key = hashlib.md5(query_brief.strip().lower().encode()).hexdigest()
-            if "_qil_cache" not in st.session_state:
-                st.session_state["_qil_cache"] = {}
-            sq = st.session_state["_qil_cache"].get(_qil_cache_key)
+            sq = qil_cache.get(_qil_cache_key)
 
             if sq is None:
                 groq_key = os.getenv("GROQ_API_KEY", "").strip()
@@ -1617,14 +1167,14 @@ def select_embedding_candidates(
                     groq_api_key=groq_key or None,
                     openrouter_api_key=or_key or None,
                 )
-                st.session_state["_qil_cache"][_qil_cache_key] = sq
+                qil_cache[_qil_cache_key] = sq
 
             _source_label = {
                 "llm_groq":       "LLM/Groq",
                 "llm_openrouter": "LLM/OpenRouter",
                 "rules":          "Rules",
             }.get(sq.source, sq.source.upper())
-            st.write(
+            emit(
                 f"⏱ Stage 0 (QIL/{_source_label}): intent=`{sq.intent}` · "
                 f"quality=`{sq.quality_modifier}` · "
                 f"keywords=`{', '.join(sq.bm25_keywords[:4])}{'...' if len(sq.bm25_keywords) > 4 else ''}`"
@@ -1635,88 +1185,63 @@ def select_embedding_candidates(
 
     bm25_query     = sq.bm25_query_string if sq and sq.bm25_keywords else None
     semantic_query = sq.semantic_query    if sq and sq.semantic_query  else None
-    intent_rrf_bm25  = sq.rrf_weight_bm25  if sq else 1.0
-    intent_rrf_faiss = sq.rrf_weight_faiss if sq else 1.0
 
-    bm25_retriever, arxiv_to_pos = load_bm25_index()
-    embeddings = load_precomputed_embeddings()
-
-    have_bm25  = bool(bm25_retriever and arxiv_to_pos)
-    have_faiss = embeddings is not None
-
-    # ─── Stage 1: Parallel BM25(keywords) + FAISS(semantic_query) → RRF ──
-    # P-04: Adaptive top-K — 7% of corpus, capped at 1200
+    # ─── Stage 1: LanceDB FTS + vector search → manual RRF ───────────────
+    # P-04: Adaptive top-K — 7% of pool, capped at 1200
     adaptive_k = min(int(len(papers) * 0.07), 1200)
-    adaptive_k = max(adaptive_k, 50)  # floor: never go below 50
-    st.write(f"⏱ Stage 1: Parallel BM25 + FAISS → RRF merge (adaptive_k={adaptive_k}, bm25_w={intent_rrf_bm25:.1f}, faiss_w={intent_rrf_faiss:.1f})...")
+    adaptive_k = max(adaptive_k, 50)
+    emit(f"⏱ Stage 1: LanceDB FTS + vector → RRF merge (adaptive_k={adaptive_k})...")
 
-    if have_bm25 and have_faiss:
-        # ━━━ Full RRF path ━━━
-        bm25_ranks = _bm25_ranked_pool(
-            papers, query_brief, bm25_retriever, arxiv_to_pos,
-            top_k=adaptive_k, bm25_query=bm25_query,
-        )
-        faiss_ranks = _faiss_ranked_pool(
-            papers, query_brief, embeddings, arxiv_to_pos,
-            top_k=adaptive_k, q_vec=None, semantic_query=semantic_query,
-        )
-        stage1_papers = rrf_merge(
-            papers,
-            bm25_ranks=bm25_ranks,
-            faiss_ranks=faiss_ranks,
-            rrf_weight_bm25=intent_rrf_bm25,
-            rrf_weight_faiss=intent_rrf_faiss,
-            top_n=adaptive_k,
-        )
-        n_both = sum(1 for p in stage1_papers if p.retrieval_source == "both")
-        n_bm25_only = sum(1 for p in stage1_papers if p.retrieval_source == "bm25_only")
-        n_faiss_only = sum(1 for p in stage1_papers if p.retrieval_source == "faiss_only")
-        st.write(
-            f"✅ RRF Stage 1: {len(stage1_papers)} candidates — "
-            f"🔵 {n_both} both · 🟠 {n_bm25_only} BM25-only · 🟣 {n_faiss_only} FAISS-only"
-        )
+    # Generate query vector once for both Stage 1 vector search and Stage 2 fast path
+    q_vec_stage1: Optional[np.ndarray] = None
+    try:
+        import torch
+        specter2_model_s1, specter2_tok_s1 = get_specter2_model()
+        if specter2_model_s1 is not None and specter2_tok_s1 is not None:
+            encode_text = semantic_query if semantic_query and semantic_query.strip() else query_brief
+            inputs = specter2_tok_s1(
+                [encode_text], padding=True, truncation=True, max_length=512, return_tensors="pt"
+            )
+            with torch.no_grad():
+                out = specter2_model_s1(**inputs)
+            q_vec_stage1 = out.last_hidden_state[:, 0, :].cpu().float().numpy()[0]
+            norm = np.linalg.norm(q_vec_stage1)
+            if norm > 0:
+                q_vec_stage1 = q_vec_stage1 / norm
+    except Exception as _qv_err:
+        logging.warning("[Stage1] query vector generation failed: %s", _qv_err)
+        q_vec_stage1 = None
 
-    elif have_bm25 and not have_faiss:
-        # ━━━ BM25-only fallback ━━━
-        st.warning("⚠️ FAISS embeddings not available — running BM25-only Stage 1 (no RRF merge).")
-        bm25_ranks = _bm25_ranked_pool(
-            papers, query_brief, bm25_retriever, arxiv_to_pos,
-            top_k=adaptive_k, bm25_query=bm25_query,
-        )
-        stage1_papers = rrf_merge(
-            papers,
-            bm25_ranks=bm25_ranks,
-            faiss_ranks={},
-            rrf_weight_bm25=intent_rrf_bm25,
-            rrf_weight_faiss=0.0,
-            top_n=adaptive_k,
+    fts_query_str = bm25_query if bm25_query else query_brief
+    lancedb_table = get_lancedb_table()
+    paper_vectors: Dict[str, list] = {}
+
+    quality_where = QUALITY_LANCEDB_FILTERS.get(sq.quality_modifier) if sq else None
+    if quality_where:
+        emit(f"⏱ Stage 1: quality filter active — `{quality_where}`")
+
+    if lancedb_table is not None:
+        stage1_papers, paper_vectors = _lancedb_hybrid_stage1(
+            lancedb_table, papers, fts_query_str, q_vec_stage1, top_k=adaptive_k,
+            quality_where=quality_where,
         )
         if len(stage1_papers) < 50:
-            st.info("BM25 Stage 1 returned fewer than 50 papers — using full pool.")
+            emit(
+                f"Stage 1 returned {len(stage1_papers)} candidates (below 50 threshold) "
+                "— using full pool as fallback.",
+                "info",
+            )
             stage1_papers = papers
         else:
-            st.write(f"✅ BM25-only Stage 1: {len(stage1_papers)} candidates.")
-
-    elif not have_bm25 and have_faiss:
-        # ━━━ FAISS-only fallback ━━━
-        st.warning("⚠️ BM25 index not available — running FAISS-only Stage 1 (no RRF merge).")
-        faiss_ranks = _faiss_ranked_pool(
-            papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {},
-            top_k=adaptive_k, q_vec=None, semantic_query=semantic_query,
-        )
-        stage1_papers = rrf_merge(
-            papers,
-            bm25_ranks={},
-            faiss_ranks=faiss_ranks,
-            rrf_weight_bm25=0.0,
-            rrf_weight_faiss=intent_rrf_faiss,
-            top_n=adaptive_k,
-        )
-        st.write(f"✅ FAISS-only Stage 1: {len(stage1_papers)} candidates.")
-
+            n_both     = sum(1 for p in stage1_papers if p.retrieval_source == "both")
+            n_fts_only = sum(1 for p in stage1_papers if p.retrieval_source == "bm25_only")
+            n_vec_only = sum(1 for p in stage1_papers if p.retrieval_source == "faiss_only")
+            emit(
+                f"✅ RRF Stage 1: {len(stage1_papers)} candidates — "
+                f"🔵 {n_both} both · 🟠 {n_fts_only} FTS-only · 🟣 {n_vec_only} vector-only"
+            )
     else:
-        # ━━━ Legacy fallback: both missing ━━━
-        st.warning("⚠️ Neither BM25 nor FAISS index is available — using full pool as Stage 1 fallback.")
+        emit("⚠️ LanceDB unavailable — using full pool as Stage 1 fallback.", "warning")
         stage1_papers = papers
 
     # ─── P-10: QIL not_terms filter — applied once after Stage 1 ──────────
@@ -1732,52 +1257,50 @@ def select_embedding_candidates(
         ]
         removed_not = before_not - len(stage1_papers)
         if removed_not:
-            st.write(f"🚫 QIL not_terms filter removed {removed_not} papers from Stage 1 pool.")
+            emit(f"🚫 QIL not_terms filter removed {removed_not} papers from Stage 1 pool.")
 
     # ─── Stage 2: SPECTER2 adhoc_query → MiniLM fallback ─────────────────
-    # P-00: Pass semantic_query so SPECTER2 encodes the clean statement, not raw prose.
-    # n2=200: halved from 400 — Stage 2 precomputed fast-path makes this near-free,
-    # and halving CE input in Stage 3 cuts CrossEncoder time ~50% (400→200 pairs).
-    # Fix 2: Pass precomputed embeddings so Stage 2 skips live BERT forward passes
-    #        for already-indexed papers (proximity adapter, correct paper-side encoding).
+    # paper_vectors from Stage 1 replaces the old embeddings.npy array.
+    # Only the ~top_k vectors are in RAM (per-query) instead of the full 1.2 GB matrix.
     stage2_query = semantic_query if semantic_query else query_brief
-    st.write("⏱ Stage 2: SPECTER2 semantic reranking (precomputed fast-path active)...")
+    have_stage1_vecs = bool(paper_vectors)
+    emit(
+        f"⏱ Stage 2: SPECTER2 semantic reranking "
+        f"({'LanceDB vector fast-path' if have_stage1_vecs else 'live-encode'})..."
+    )
     stage2_papers = specter2_vector_rerank(
         stage1_papers,
         stage2_query,
         n2=200,
-        precomputed_embeddings=embeddings,
-        arxiv_to_pos=arxiv_to_pos if arxiv_to_pos else {},
+        paper_vectors=paper_vectors,
     )
     if stage2_papers:
-        st.write(
+        emit(
             f"✅ SPECTER2 Stage 2: {len(stage2_papers)} candidates selected "
             f"(scientific asymmetric retrieval)."
         )
     else:
-        # P-06: upgraded from st.write to st.warning so fallback is visually distinct
-        st.warning(
+        emit(
             "⚠️ SPECTER2 unavailable — falling back to MiniLM for Stage 2. "
-            "Retrieval quality may be reduced. Check that `allenai/specter2` is installed."
+            "Retrieval quality may be reduced. Check that `allenai/specter2` is installed.",
+            "warning",
         )
         stage2_papers = minilm_vector_rerank(
             stage1_papers,
             stage2_query,
-            embeddings,
-            arxiv_to_pos if arxiv_to_pos else {},
-            n2=200,  # halved: matches SPECTER2 path; CE Stage 3 input capped at 200
+            n2=200,
         )
-        st.write(f"✅ MiniLM Stage 2 fallback: {len(stage2_papers)} candidates selected.")
+        emit(f"✅ MiniLM Stage 2 fallback: {len(stage2_papers)} candidates selected.")
 
     # ─── Stage 3: CrossEncoder Precision Rerank ───────────────────────
     # P-00: Cross-encoder pairs against semantic_query for a cleaner signal.
     stage3_query = semantic_query if semantic_query else query_brief
-    st.write("⏱ Stage 3: Cross-Encoder precision reranking...")
+    emit("⏱ Stage 3: Cross-Encoder precision reranking...")
     stage3_papers = cross_encoder_rerank(stage2_papers, stage3_query, n3=max_candidates)
-    st.write(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
+    emit(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
 
     # ─── Stage 4: Abstract Highlights Extraction ──────────────────────
-    st.write("⏱ Stage 4: Extracting sentence-level abstract highlights...")
+    emit("⏱ Stage 4: Extracting sentence-level abstract highlights...")
     stage3_papers = extract_abstract_highlights(stage3_papers, stage2_query)
 
     # ─── Stage 5: Artifact signal detection (Task 38) ─────────────────
@@ -1896,78 +1419,6 @@ def enrich_paper_signals(papers: List[Paper]) -> List[Paper]:
 # SciBERT Split Classification (Tasks 41 & 42)
 # =========================
 
-def classify_papers_with_llm(
-    papers: List[Paper],
-    query_brief: str,
-    llm_config: LLMConfig,
-    batch_size: int = 15,
-) -> List[Paper]:
-    if not papers: return papers
-
-    for batch_start in range(0, len(papers), batch_size):
-        batch = papers[batch_start:batch_start + batch_size]
-        paper_blocks = []
-        for idx, p in enumerate(batch):
-            block = textwrap.dedent(f"""
-            Paper {idx}:
-            Title: {p.title}
-            Abstract: {p.abstract}
-            """).strip()
-            paper_blocks.append(block)
-
-        instruction = textwrap.dedent(f"""
-        You are given a user's research brief and a small set of papers.
-        Brief: \"\"\"{query_brief}\"\"\"
-
-        For each paper, decide:
-          1. focus_label: "primary", "secondary", or "off-topic".
-          2. relevance_score: float 0.0-1.0.
-          3. reason: 1-2 sentence explanation.
-
-        Return JSON array:
-          [{{ "index": <int>, "focus_label": "...", "relevance_score": <float>, "reason": "..." }}]
-        """).strip()
-
-        prompt = "\n\n".join([instruction, "PAPERS:", *paper_blocks])
-        
-        try:
-            raw = call_llm(prompt, llm_config, label="classification")
-        except Exception:
-            raw = ""
-
-        parsed = safe_parse_json_array(raw)
-        if parsed is None:
-            continue
-
-        idx_to_info = {}
-        for item in parsed:
-            try:
-                idx = int(item["index"])
-                label = str(item.get("focus_label", "")).strip().lower()
-                if label not in ["primary", "secondary", "off-topic"]:
-                    label = "off-topic"
-                idx_to_info[idx] = {
-                    "focus_label": label,
-                    "relevance_score": float(item.get("relevance_score", 0.0)),
-                    "reason": str(item.get("reason", "")).strip(),
-                }
-            except (KeyError, TypeError, ValueError):
-                continue
-
-        for idx, p in enumerate(batch):
-            info = idx_to_info.get(idx)
-            if info:
-                p.focus_label = info["focus_label"]
-                p.llm_relevance_score = info["relevance_score"]
-                p.semantic_reason = info["reason"]
-            else:
-                p.focus_label = "off-topic"
-                p.llm_relevance_score = 0.0
-
-    return papers
-
-
-
 def scibert_classify_papers(papers: List[Paper]) -> List[Paper]:
     """
     P-10: CrossEncoder threshold classification with explicit heuristic fallback.
@@ -2058,17 +1509,34 @@ def get_s2_citation_stats(paper: Paper, api_key: Optional[str] = None) -> int:
 
     return 0
 
-def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, batch_size: int = 8) -> List[Paper]:
-    """MONEYBALL PREDICTOR: Hybrid Author Data + Custom LLM Narrative."""
-    if not target_papers: return target_papers
+RECENCY_BONUS_MAX = 15.0  # ponytail: additive cap for "recent" quality_modifier, tune if it over/under-shoots
 
-    weights = DEFAULT_MONEYBALL_WEIGHTS
+def resolve_moneyball_weights(quality_modifier: str = "any") -> dict:
+    """
+    QIL quality_modifier weight override (docs/qil-improvements-planner.md B1, Job 2)
+    takes precedence when set (influential/emerging/classic); "any" and "recent" fall
+    through to moneyball_weights.json (trained/calibrated) if present, else the static
+    DEFAULT_MONEYBALL_WEIGHTS.
+    """
+    weights = QUALITY_MONEYBALL_WEIGHTS.get(quality_modifier)
+    if weights is not None:
+        return weights
     if os.path.exists("moneyball_weights.json"):
         try:
             with open("moneyball_weights.json", "r") as f:
-                weights = json.load(f)
+                return json.load(f)
         except (OSError, json.JSONDecodeError):
             pass
+    return DEFAULT_MONEYBALL_WEIGHTS
+
+def predict_citations_direct(
+    target_papers: List[Paper], llm_config: LLMConfig, batch_size: int = 8,
+    quality_modifier: str = "any",
+) -> List[Paper]:
+    """MONEYBALL PREDICTOR: Hybrid Author Data + Custom LLM Narrative."""
+    if not target_papers: return target_papers
+
+    weights = resolve_moneyball_weights(quality_modifier)
     
     # Read S2 key from st.secrets (Streamlit Cloud) with os.getenv fallback (local/.env)
     s2_key = _get_secret("S2_API_KEY")
@@ -2159,10 +1627,12 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
             # SENTINEL VALUE: -1.0 means "Unrated"
             p.predicted_citations = -1.0
         else:
-            score = (h1_fame * weights['weight_fame'] + 
-                     h2_hype * weights['weight_hype'] + 
-                     h3_sniper * weights['weight_sniper'] + 
+            score = (h1_fame * weights['weight_fame'] +
+                     h2_hype * weights['weight_hype'] +
+                     h3_sniper * weights['weight_sniper'] +
                      h4_utility * weights['weight_utility'])
+            if quality_modifier == "recent":
+                score += compute_recency_score(p.submitted_date) * RECENCY_BONUS_MAX
             p.predicted_citations = score
 
         # 5. Construct Final Narrative (3 Bullets)
@@ -2196,33 +1666,6 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
         
     progress_bar.empty()
     return target_papers
-
-
-def compute_keyword_match_score(paper: Paper, query_brief: str) -> float:
-    """
-    Lightweight keyword relevance score in [0, 1].
-    Uses overlap between meaningful query terms and the paper title/abstract.
-    """
-    text = f"{paper.title} {paper.abstract}".lower()
-    query = query_brief.lower()
-
-    stopwords = {
-        "the", "and", "or", "for", "with", "that", "this", "from", "into", "about",
-        "what", "are", "your", "their", "they", "them", "using", "used", "use",
-        "main", "whose", "where", "when", "which", "have", "has", "had", "been",
-        "being", "also", "only", "just", "more", "most", "very", "much", "some",
-        "such", "than", "then", "over", "under", "not", "without", "within",
-        "papers", "paper", "interested", "looking", "brief", "contribution"
-    }
-
-    query_terms = re.findall(r"\b[a-zA-Z][a-zA-Z\-]+\b", query)
-    query_terms = [t for t in query_terms if len(t) > 2 and t not in stopwords]
-
-    if not query_terms:
-        return 0.0
-
-    matched = sum(1 for term in set(query_terms) if term in text)
-    return min(matched / max(len(set(query_terms)), 1), 1.0)
 
 
 def compute_recency_score(submitted_date: datetime, max_days: int = 30) -> float:
@@ -2281,7 +1724,7 @@ Instead of fetching papers live, the agent queries a pre-built local library of 
 
 Retrieval is a three-step funnel designed to be both fast and accurate:
 
-- **Stage 1 — Keyword & Basic Semantic Recall (RRF):** Quickly narrows the corpus using reciprocal rank fusion of BM25 keyword matches and FAISS dense embeddings.
+- **Stage 1 — Hybrid Recall (LanceDB FTS + Vector RRF):** Quickly narrows the corpus using reciprocal rank fusion of full-text search and SPECTER2 vector search from LanceDB.
 - **Stage 2 — Semantic Rethink (SPECTER2):** A powerful document-level embedding model (SPECTER2) re-evaluates the candidate pairs to refine the rankings.
 - **Stage 3 — Precision Reranking (CrossEncoder):** A deep cross-attention model does a final comparison between your brief and each candidate, selecting the best papers to pass to the next stage.
 
@@ -2428,8 +1871,6 @@ def _main_body():
                 format_func=lambda x: f"{ARXIV_CODE_TO_NAME.get(x, x)} ({x})",
                 help="If you choose none, we'll use ALL subcategories from the selected main category."
             )
-        # Build query string to pass into fetch (currently unused by SQL, available for expansions)
-        arxiv_query = build_arxiv_category_query(main_cat, subcats)
 
         # --- Venue Filtering UI ---
 
@@ -2536,8 +1977,11 @@ def _main_body():
             else:
                 model_name = model_choice
 
-            embedding_model_name = OPENAI_EMBEDDING_MODEL_NAME
-            st.caption(f"Embeddings (OpenAI): `{embedding_model_name}`")
+            embedding_model_name = "allenai/specter2 (local, MiniLM fallback)"
+            st.caption(
+                f"Embeddings: `{embedding_model_name}`. Retrieval always runs on local "
+                "SPECTER2/MiniLM embeddings — OpenAI is used for classification & citation scoring only."
+            )
 
         elif provider == "gemini":
             st.markdown("### 🌌 Gemini Settings")
@@ -2569,8 +2013,11 @@ def _main_body():
             else:
                 model_name = gemini_choice
 
-            embedding_model_name = GEMINI_EMBEDDING_MODEL_NAME
-            st.caption(f"Embeddings (Gemini): `{embedding_model_name}`")
+            embedding_model_name = "allenai/specter2 (local, MiniLM fallback)"
+            st.caption(
+                f"Embeddings: `{embedding_model_name}`. Retrieval always runs on local "
+                "SPECTER2/MiniLM embeddings — Gemini is used for classification & citation scoring only."
+            )
 
         elif provider == "groq":
             st.markdown("### ⚡ Groq Settings")
@@ -2613,13 +2060,6 @@ def _main_body():
                 f"Embeddings (local): `{embedding_model_name}`.\n"
                 "Classification and citation impact scoring use simple heuristics. No API key or external calls."
             )
-
-        # ─── Task 35: HyDE retired (P-10) ─────────────────────────────────────
-        # HyDE is superseded by the P-00 Query Intelligence Layer, which generates a
-        # clean semantic_query passed directly to FAISS and SPECTER2/CrossEncoder.
-        # HyDE's MiniLM encoding also causes a 384-vs-768 dim mismatch with the
-        # SPECTER2 FAISS index, silently returning zero FAISS candidates when used.
-        use_hyde = False  # kept for backward-compat signature; never passed True
 
         run_clicked = st.button("🚀 Run Pipeline")
 
@@ -2786,22 +2226,21 @@ def _main_body():
     st.subheader("2. Fetch Current Papers from Corpus")
 
     if run_clicked or "current_papers" not in st.session_state:
-        # --- Primary path: local SQLite corpus ---
-        with st.spinner("Loading papers from local SQLite corpus by date window..."):
-            current_papers = fetch_papers_from_db(
+        with st.spinner("Loading papers from LanceDB by date window..."):
+            current_papers = fetch_papers_from_lancedb(
                 start_date=current_start,
                 end_date=current_end,
                 category_filter=st.session_state.get("last_params", {}).get("main_cat", None),
-                subcats=st.session_state.get("last_params", {}).get("subcats", None)
+                subcats=st.session_state.get("last_params", {}).get("subcats", None),
             )
 
         if current_papers:
-            msg = f"Loaded {len(current_papers)} papers from local corpus in this date range."
+            msg = f"Loaded {len(current_papers)} papers from LanceDB in this date range."
             if date_option == "All Time" and len(current_papers) >= DB_FETCH_LIMIT:
                 msg += f" (capped at {DB_FETCH_LIMIT:,} most-recent — full corpus exceeds memory limits)"
             st.success(msg)
         else:
-            st.info("No papers found in local corpus for this specific date range.")
+            st.info("No papers found in LanceDB for this date range.")
 
         # P-09: Early venue filter REMOVED — was double-filtering and blinding Stage 1.
         # Venue filter now runs correctly post-Stage 3 only (see below, after candidates are selected).
@@ -2820,16 +2259,9 @@ def _main_body():
     if not_text:
         current_papers, removed_count = filter_papers_by_not_terms(current_papers, not_text)
         st.info(f"Excluded {removed_count} papers whose title or abstract contained NOT terms (lexical).")
-        # P-01: Semantic NOT second pass — catches paraphrased/synonym variants
-        not_phrases = [t.strip() for t in not_text.split(",") if t.strip()]
-        if not_phrases:
-            _emb = load_precomputed_embeddings()
-            _, _a2p = load_bm25_index()
-            current_papers, sem_removed = semantic_not_filter(
-                current_papers, not_phrases, _a2p or {}, _emb, threshold=0.65
-            )
-            if sem_removed:
-                st.info(f"Semantic NOT filter removed {sem_removed} additional papers (paraphrase/synonym exclusion).")
+        # ponytail: Semantic NOT second pass retired — ran pre-Stage1, before paper_vectors
+        # exist (LanceDB vectors are only fetched in _lancedb_hybrid_stage1). Re-add if
+        # paraphrase/synonym exclusion matters enough to fetch vectors here too.
 
     st.session_state["current_papers"] = current_papers
 
@@ -2869,10 +2301,8 @@ def _main_body():
                         current_papers,
                         query_brief=query_brief,
                         llm_config=active_llm_config,
-                        embedding_model=embedding_model_name,
-                        provider=provider,
                         max_candidates=150,
-                        # P-10: use_hyde retired — QIL semantic_query supersedes HyDE
+                        qil_cache=st.session_state.setdefault("_qil_cache", {}),
                     )
             finally:
                 _PIPELINE_SEMAPHORE.release()
@@ -3067,16 +2497,16 @@ def _main_body():
             # ── Task 37: Retrieval provenance (visible when Task 33 RRF is active) ──
             if p.retrieval_source is not None:
                 src_label = {
-                    "both": "🔵 BM25 + FAISS (both)",
-                    "bm25_only": "🟠 BM25 only",
-                    "faiss_only": "🟣 FAISS only",
+                    "both": "🔵 Full-text + vector (both)",
+                    "bm25_only": "🟠 Full-text only",
+                    "faiss_only": "🟣 Vector only",
                 }.get(p.retrieval_source, p.retrieval_source)
                 rrf_str = f"{p.rrf_score:.4f}" if p.rrf_score is not None else "N/A"
                 bm25_str = f"#{p.bm25_rank}" if p.bm25_rank is not None else "—"
                 faiss_str = f"#{p.faiss_rank}" if p.faiss_rank is not None else "—"
                 st.caption(
                     f"📡 Retrieval: {src_label} · RRF score: {rrf_str} · "
-                    f"BM25 rank: {bm25_str} · FAISS rank: {faiss_str}"
+                    f"Full-text rank: {bm25_str} · Vector rank: {faiss_str}"
                 )
             st.write("**Abstract:**")
             st.write(p.abstract)
@@ -3103,22 +2533,6 @@ It combines four signals:
 
 **Note on New Papers:** Papers less than 5 days old often lack citation data in Semantic Scholar. These are marked as **"Too new for impact score"** and ranked purely by their relevance to your query.
 """)
-    elif provider == "gemini":
-        st.markdown("""
-**How this step works (Gemini mode)**
-
-For each selected paper, the agent sends the title, authors, and abstract to a Gemini model (for example `gemini-3-pro-preview`) and asks it to assign a 1-year citation impact score. The model bases this score on signals such as how trendy the topic is, how novel and substantial the abstract sounds, how broad the potential audience is, and whether the work appears to come from strong labs or well known authors.
-
-These citation impact scores are heuristic and are best used for ranking within this batch of papers, not as ground truth. They may reflect existing academic and data biases.
-        """)
-    elif provider == "groq":
-        st.markdown("""
-**How this step works (Groq mode)**
-
-For each selected paper, the agent sends the title, authors, and abstract to a model on Groq and asks it to assign a 1-year citation impact score. The model bases this score on signals such as how trendy the topic is, how novel and substantial the abstract sounds, how broad the potential audience is, and whether the work appears to come from strong labs or well known authors.
-
-These citation impact scores are heuristic and are best used for ranking within this batch of papers, not as ground truth.
-        """)
     else:
         st.markdown("""
 **How this step works (free local mode)**
@@ -3130,10 +2544,17 @@ These scores are heuristic and should be used as a guide for exploration rather 
 
     if run_clicked or "ranked_papers" not in st.session_state:
         if provider in ("openai", "gemini", "groq"):
+            # Recover this query's QIL quality_modifier from the cache select_embedding_candidates
+            # populated (same md5 key derivation) so Moneyball weighting matches Stage 1's pre-filter.
+            _qil_key = hashlib.md5(query_brief.strip().lower().encode()).hexdigest()
+            _cached_sq = st.session_state.get("_qil_cache", {}).get(_qil_key)
+            quality_modifier = _cached_sq.quality_modifier if _cached_sq else "any"
+
             with st.spinner("Calling LLM API to compute citation impact scores for selected papers..."):
                 papers_with_pred = predict_citations_direct(
                     target_papers=selected_papers,
                     llm_config=active_llm_config,
+                    quality_modifier=quality_modifier,
                 )
         else:
             with st.spinner("Computing heuristic citation impact scores from relevance signals..."):
@@ -3327,16 +2748,16 @@ These scores are heuristic and should be used as a guide for exploration rather 
         # ── Task 37: Retrieval provenance (visible when Task 33 RRF is active) ──
         if p.retrieval_source is not None:
             src_label = {
-                "both": "🔵 BM25 + FAISS (both)",
-                "bm25_only": "🟠 BM25 only",
-                "faiss_only": "🟣 FAISS only",
+                "both": "🔵 Full-text + vector (both)",
+                "bm25_only": "🟠 Full-text only",
+                "faiss_only": "🟣 Vector only",
             }.get(p.retrieval_source, p.retrieval_source)
             rrf_str = f"{p.rrf_score:.4f}" if p.rrf_score is not None else "N/A"
             bm25_str = f"#{p.bm25_rank}" if p.bm25_rank is not None else "—"
             faiss_str = f"#{p.faiss_rank}" if p.faiss_rank is not None else "—"
             st.caption(
                 f"📡 Retrieval: {src_label} · RRF score: {rrf_str} · "
-                f"BM25 rank: {bm25_str} · FAISS rank: {faiss_str}"
+                f"Full-text rank: {bm25_str} · Vector rank: {faiss_str}"
             )
 
         st.write("**Abstract:**")

@@ -106,9 +106,9 @@ Your browser will open automatically at `http://localhost:8501`.
 
 - **`app.py`:** The entire application logic resides here. It is a single-file Streamlit app designed for portability.
 
-- **Modifying Prompt Logic:** Look for the **Moneyball scoring functions** and `classify_papers_with_llm` in `app.py` to change how the AI judges papers.
+- **Modifying Prompt Logic:** Look for the **Moneyball scoring functions** and `scibert_classify_papers` in `app.py` to change how the AI judges papers.
 
-- **Adding Providers:** The code uses a `LLMConfig` dataclass. To add a new provider (e.g., Anthropic), add the client initialization in `call_llm` and the specific embedding logic in `select_embedding_candidates`.
+- **Adding Providers:** The code uses a `LLMConfig` dataclass. To add a new provider (e.g., Anthropic), add the client initialization in `call_llm`. Retrieval embeddings always run on local SPECTER2/MiniLM regardless of provider — only classification and citation scoring are provider-specific.
 
 ---
 

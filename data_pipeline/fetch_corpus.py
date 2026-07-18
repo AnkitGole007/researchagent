@@ -13,20 +13,21 @@ import time
 import random
 import argparse
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Optional
 
 import requests
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-try:
-    from data_pipeline.schema import PaperRecord, create_db, upsert_paper
-except ImportError:
-    # Script mode: `python data_pipeline/fetch_corpus.py` — project root not on sys.path.
-    # Insert it and retry. This is a no-op when imported as a module.
-    import pathlib
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-    from data_pipeline.schema import PaperRecord, create_db, upsert_paper
+_root = str(Path(__file__).resolve().parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from data_pipeline.schema import (
+    PaperRecord, connect_lancedb, get_or_create_papers_table,
+    upsert_papers_batch, _load_existing_ids, _escape_sql, query_table,
+)
 
 # Load .env so S2_API_KEY is available even when run as a standalone script
 load_dotenv()
@@ -123,20 +124,12 @@ MAX_PAPERS_TO_FETCH = 200_000
     wait=wait_exponential(min=2, max=30),
     reraise=True,
 )
-def _fetch_page(url: str, params: dict, headers: dict) -> dict:
-    """Single paginated GET with retry."""
-    r = requests.get(url, params=params, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-@retry(
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(min=2, max=30),
-    reraise=True,
-)
-def _fetch_batch_post(url: str, payload: dict, params: dict, headers: dict) -> list:
-    """Batch POST fetch with retry."""
-    r = requests.post(url, json=payload, params=params, headers=headers, timeout=45)
+def _fetch_json(url: str, params: dict, headers: dict, payload: dict = None, timeout: int = 30):
+    """GET (payload=None) or POST (payload=dict) with retry. Returns parsed JSON."""
+    if payload is None:
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    else:
+        r = requests.post(url, json=payload, params=params, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
@@ -194,7 +187,7 @@ def fetch_papers_bulk(
             logger.info("Fetching sub-category explicitly: '%s'", q)
             
         while True:
-            data = _fetch_page(_S2_BULK_URL, params, headers)
+            data = _fetch_json(_S2_BULK_URL, params, headers, timeout=30)
             batch = data.get("data") or []
             
             for raw in batch:
@@ -257,7 +250,6 @@ def fetch_fresh_arxiv_papers(days: int = 30) -> List[PaperRecord]:
             url = f"http://export.arxiv.org/api/query?search_query=({quote(query_str)})&sortBy=submittedDate&sortOrder=descending&start={start}&max_results={max_results}"
             
             # Adaptive Stealth 3 & 4: User-Agent Identity & True Exponential Backoff
-            import requests
             try:
                 headers = {"User-Agent": "ResearchAgent/2.0 (mailto:admin@example.com)"}
                 r = requests.get(url, headers=headers, timeout=60)
@@ -374,72 +366,93 @@ def fetch_fresh_arxiv_papers(days: int = 30) -> List[PaperRecord]:
     logger.info("Stage 1 ArXiv Scout finished: %d recent papers fetched.", len(results))
     return results
 
-def enrich_author_citations(conn, api_key: Optional[str] = None) -> int:
+def enrich_author_citations(table, api_key: Optional[str] = None) -> int:
     """
-    Stage 3 'Fame Enricher': The Bulk Search API doesn't support authors.citationCount (causes 400).
-    This function finds papers with missing max_author_citations (0) that have an s2_id,
-    and hits the S2 POST /batch endpoint to backfill them, fixing the Moneyball "Fame" metric gap.
+    Stage 3 'Fame Enricher': finds papers with missing max_author_citations and backfills via S2 batch API.
+    Accepts a LanceDB table instead of a SQLite connection.
     """
     resolved_key = api_key or os.getenv("S2_API_KEY")
     headers = {"x-api-key": resolved_key} if resolved_key else {}
-    
-    # Grab all valid S2 papers where we haven't resolved an author citation count yet
-    cursor = conn.execute("SELECT arxiv_id, s2_id FROM papers WHERE s2_id IS NOT NULL AND s2_id != '' AND max_author_citations = 0")
-    rows = cursor.fetchall()
-    
+
+    # Query LanceDB for papers that need enrichment
+    try:
+        df = query_table(
+            table,
+            filter="s2_id IS NOT NULL AND s2_id != '' AND max_author_citations = 0",
+            columns=["arxiv_id", "s2_id"],
+        )
+        rows = list(zip(df["arxiv_id"].tolist(), df["s2_id"].tolist()))
+    except Exception as exc:
+        logger.error("Stage 3: failed to query LanceDB: %s", exc)
+        return 0
+
     if not rows:
         logger.info("Stage 3 Fame Enricher: No papers require author citation backfilling.")
         return 0
 
-    logger.info("Stage 3 Fame Enricher: Found %d papers missing max_author_citations. Batch processing...", len(rows))
-    
-    batch_size = 300 # S2 batch /paper limit is typically 500
+    logger.info("Stage 3 Fame Enricher: Found %d papers missing max_author_citations.", len(rows))
+
+    batch_size = 300
     updates_made = 0
     url = "https://api.semanticscholar.org/graph/v1/paper/batch"
-    
+
     for i in range(0, len(rows), batch_size):
-        chunk = rows[i:i + batch_size]
+        chunk = rows[i : i + batch_size]
         s2_ids = [r[1] for r in chunk]
-        
+
         try:
-            data = _fetch_batch_post(
-                url=url, 
-                payload={"ids": s2_ids}, 
-                params={"fields": "paperId,authors.citationCount"}, 
-                headers=headers
+            data = _fetch_json(
+                url=url,
+                payload={"ids": s2_ids},
+                params={"fields": "paperId,authors.citationCount"},
+                headers=headers,
+                timeout=45,
             )
-            
-            update_batch = []
+
+            cites_by_id = {}
             for paper_data in data:
                 if not paper_data:
                     continue
                 paper_id = paper_data.get("paperId")
                 authors = paper_data.get("authors") or []
-                max_cites = 0
-                for a in authors:
-                    c = a.get("citationCount") or 0
-                    if c > max_cites:
-                        max_cites = c
-                        
-                if max_cites > 0:
-                    update_batch.append((max_cites, paper_id))
-            
-            if update_batch:
-                conn.executemany("UPDATE papers SET max_author_citations = ? WHERE s2_id = ?", update_batch)
-                conn.commit()
-                updates_made += len(update_batch)
-                
-            logger.info("Batch processed %d/%d (Updated %d total)", min(i + batch_size, len(rows)), len(rows), updates_made)
-            time.sleep(1.5) # Comply with rate limits
-            
-        except Exception as e:
-            logger.error("Batch update failed at chunk %d: %s", i, e)
-            
+                max_cites = max((a.get("citationCount") or 0 for a in authors), default=0)
+                if max_cites > 0 and paper_id:
+                    cites_by_id[str(paper_id)] = max_cites
+
+            if cites_by_id:
+                # lance's update() doesn't support simple-CASE SQL ("CASE col WHEN val THEN ...").
+                # Use the same fetch-mutate-merge_insert pattern as write_vectors_to_lancedb instead.
+                ids_in = ", ".join(f"'{_escape_sql(sid)}'" for sid in cites_by_id)
+                existing_df = query_table(table, filter=f"s2_id IN ({ids_in})")
+                rows_to_write = []
+                for _, row in existing_df.iterrows():
+                    cites = cites_by_id.get(row["s2_id"])
+                    if cites is None:
+                        continue
+                    merged = row.to_dict()
+                    merged["max_author_citations"] = cites
+                    rows_to_write.append(merged)
+                if rows_to_write:
+                    table.merge_insert("arxiv_id").when_matched_update_all().execute(rows_to_write)
+                    updates_made += len(rows_to_write)
+
+            logger.info(
+                "Batch processed %d/%d (Updated %d total)",
+                min(i + batch_size, len(rows)), len(rows), updates_made,
+            )
+            time.sleep(1.5)
+
+        except Exception as exc:
+            logger.error("Batch update failed at chunk %d: %s", i, exc)
+
     logger.info("Stage 3 Fame Enricher complete: %d records backfilled.", updates_made)
     return updates_made
 
+_UPSERT_BATCH = 500  # papers per LanceDB upsert flush
+
+
 def run_ingestion(
-    db_path: str = "data_pipeline/corpus.db",
+    lancedb_local_path: Optional[str] = None,
     max_papers: int = MAX_PAPERS_TO_FETCH,
     incremental: bool = True,
     arxiv_only: bool = False,
@@ -447,62 +460,73 @@ def run_ingestion(
     days: int = 15,
 ) -> int:
     """
-    End-to-end ingestion: fetch papers from arXiv (Scout) and/or S2 (Analyzer), upsert into SQLite.
+    End-to-end ingestion: fetch papers from arXiv (Scout) and/or S2 (Analyzer), upsert into LanceDB.
     Returns total papers processed.
-    """
-    conn = create_db(db_path)
-    total = 0
 
-    # Determine what to run
+    Args:
+        lancedb_local_path: path to local LanceDB dir (for testing). None = use R2.
+    """
+    db = connect_lancedb(lancedb_local_path)
+    table = get_or_create_papers_table(db)
+    # Cache existing IDs once to avoid repeated full-table scans per batch
+    existing_ids = _load_existing_ids(table)
+    logger.info("LanceDB connected. Existing papers: %d", len(existing_ids))
+
+    total = 0
     run_all = not (arxiv_only or s2_only)
 
-    # ----------------------------------------------------
+    # -------------------------------------------------------
     # Stage 1: The 'Scout' (Instant arXiv fetching)
-    # ----------------------------------------------------
+    # -------------------------------------------------------
     if arxiv_only or run_all:
         try:
-            # If not incremental, fetch a large window (e.g. 1 year)
             scout_days = days if incremental else 365
             arxiv_papers = fetch_fresh_arxiv_papers(days=scout_days)
-            for i, paper in enumerate(arxiv_papers):
-                upsert_paper(conn, paper)
-                if i % 1_000 == 0:
-                    conn.commit()
-            conn.commit()
-            logger.info("Stage 1 Complete: %d recent ArXiv papers upserted.", len(arxiv_papers))
+            inserted = updated = 0
+            for start in range(0, len(arxiv_papers), _UPSERT_BATCH):
+                batch = arxiv_papers[start : start + _UPSERT_BATCH]
+                ins, upd = upsert_papers_batch(table, batch, existing_ids)
+                inserted += ins
+                updated += upd
+            logger.info(
+                "Stage 1 Complete: %d arXiv papers — %d new, %d updated.",
+                len(arxiv_papers), inserted, updated,
+            )
             total += len(arxiv_papers)
-        except Exception as e:
-            logger.error("Stage 1 ArXiv fetching failed: %s", e)
+        except Exception as exc:
+            logger.error("Stage 1 ArXiv fetching failed: %s", exc)
 
-    # ----------------------------------------------------
+    # -------------------------------------------------------
     # Stage 2: The 'Analyzer' (S2 semantic enrichment)
-    # ----------------------------------------------------
+    # -------------------------------------------------------
     if s2_only or run_all:
         try:
-            # For incremental S2, we might restrict the volume or rely on the 90-day filter in fetch_papers_bulk
             papers = fetch_papers_bulk(max_papers=max_papers)
-            for i, paper in enumerate(papers):
-                upsert_paper(conn, paper)
-                if i % 1_000 == 0:
-                    conn.commit()
-            conn.commit()
-            logger.info("Stage 2 Complete: %d enriched papers upserted.", len(papers))
+            inserted = updated = 0
+            for start in range(0, len(papers), _UPSERT_BATCH):
+                batch = papers[start : start + _UPSERT_BATCH]
+                ins, upd = upsert_papers_batch(table, batch, existing_ids)
+                inserted += ins
+                updated += upd
+            logger.info(
+                "Stage 2 Complete: %d S2 papers — %d new, %d updated.",
+                len(papers), inserted, updated,
+            )
             total += len(papers)
-        except Exception as e:
-            logger.error("Stage 2 S2 fetching failed: %s", e)
+        except Exception as exc:
+            logger.error("Stage 2 S2 fetching failed: %s", exc)
 
-    # ----------------------------------------------------
+    # -------------------------------------------------------
     # Stage 3: The 'Fame Enricher' (S2 /batch Author Citations)
-    # ----------------------------------------------------
+    # -------------------------------------------------------
     if s2_only or run_all:
         try:
-            enriched_count = enrich_author_citations(conn)
+            enriched_count = enrich_author_citations(table)
             total += enriched_count
-        except Exception as e:
-            logger.error("Stage 3 Fame Enricher failed: %s", e)
-    
-    logger.info("Ingestion session complete. SQLite DB updated at %s", db_path)
-    conn.close()
+        except Exception as exc:
+            logger.error("Stage 3 Fame Enricher failed: %s", exc)
+
+    logger.info("Ingestion session complete. LanceDB updated.")
     return total
 
 
@@ -512,15 +536,17 @@ if __name__ == "__main__":
     parser.add_argument("--arxiv", action="store_true", help="Only fetch from arXiv API (Scout)")
     parser.add_argument("--s2", action="store_true", help="Only fetch from Semantic Scholar (Analyzer)")
     parser.add_argument("--days", type=int, default=15, help="Days to look back for arXiv Scout (default: 15)")
+    parser.add_argument("--local", default=None, metavar="PATH", help="Local LanceDB path (for testing)")
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
-    
+
     run_ingestion(
+        lancedb_local_path=args.local,
         incremental=not args.full,
         arxiv_only=args.arxiv,
         s2_only=args.s2,
-        days=args.days
+        days=args.days,
     )

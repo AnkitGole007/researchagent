@@ -34,11 +34,17 @@ docs/CODE_REVIEW.md
 # Graphify
 graphify-out/
 
-# Data pipeline artifacts (Issue #2) — do not commit large binary indexes
+# Data pipeline artifacts — pre-LanceDB (retired, kept as a safety net)
 data_pipeline/*.faiss
 data_pipeline/*.npy
 data_pipeline/corpus.db
 data_pipeline/corpus_smoke.db
 data_pipeline/bm25_index/
 data_pipeline/id_map.json
+
+# LanceDB local corpus (CORPUS_DATA_DIR override) — multi-GB, never commit
+data_pipeline/lancedb/
+data_pipeline/papers.lance/
+data_pipeline/__manifest/
+
 logs/

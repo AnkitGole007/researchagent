@@ -32,8 +32,6 @@ jobs:
           sentence-transformers>=3.0.0 \
           pandas>=2.0.0 \
           groq>=0.9.0 \
-          faiss-cpu>=1.7.4 \
-          bm25s>=0.2.0 \
           tenacity>=8.2.3 \
           python-dotenv>=1.0.0 \
           boto3>=1.26.0 \
@@ -41,18 +39,11 @@ jobs:
           pytest-mock>=3.12.0 \
           scikit-learn>=1.3.0 \
           numpy>=1.24.0 \
-          yake>=0.4.8
+          yake>=0.4.8 \
+          lancedb>=0.6.0 \
+          pyarrow>=12.0.0 \
+          pylance>=0.30.0
 
-    - name: Write pytest.ini
-      run: |
-        cat > pytest.ini << 'EOF'
-        [pytest]
-        filterwarnings =
-            ignore::DeprecationWarning:importlib.*
-        markers =
-            integration: marks tests as integration tests (deselect with '-m "not integration"')
-        EOF
-        
     - name: Syntax check
       run: |
         python -c "import ast; ast.parse(open('app.py').read()); print('app.py: syntax OK')"

@@ -15,3 +15,6 @@ docs
 tests
 .agent
 .antigravity
+data_pipeline/lancedb
+frontend/dist
+.streamlit

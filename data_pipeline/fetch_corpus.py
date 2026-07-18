@@ -150,7 +150,7 @@ def fetch_papers_bulk(
     start_date_str = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
     try:
-        from app import ARXIV_CODE_TO_NAME, CONFERENCE_KEYWORDS, JOURNAL_KEYWORDS
+        from backend.pipeline_core import ARXIV_CODE_TO_NAME, CONFERENCE_KEYWORDS, JOURNAL_KEYWORDS
         subcats = list(ARXIV_CODE_TO_NAME.values())
     except ImportError:
         subcats = [
@@ -219,7 +219,7 @@ def fetch_fresh_arxiv_papers(days: int = 30) -> List[PaperRecord]:
     from urllib.parse import quote
     
     try:
-        from app import ARXIV_CODE_TO_NAME, extract_venue
+        from backend.pipeline_core import ARXIV_CODE_TO_NAME, extract_venue
         cats = list(ARXIV_CODE_TO_NAME.keys())
         extract_venue_func = extract_venue
     except ImportError:

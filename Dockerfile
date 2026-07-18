@@ -1,3 +1,12 @@
+# ---- Stage 1: build the React frontend ----
+FROM node:20-slim AS frontend-builder
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build
+
+# ---- Stage 2: backend + baked models ----
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -25,5 +34,7 @@ print('Models baked successfully')"
 ENV TRANSFORMERS_OFFLINE=1
 
 COPY . .
+COPY --from=frontend-builder /frontend/dist ./frontend/dist
+
 EXPOSE 8080
-CMD streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true
+CMD uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}

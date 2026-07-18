@@ -25,7 +25,8 @@ jobs:
         python -m pip install --upgrade pip
         # Install only the packages needed for tests (skip heavy GPU deps)
         pip install \
-          streamlit>=1.50.0 \
+          fastapi>=0.110.0 \
+          uvicorn>=0.29.0 \
           requests>=2.31.0 \
           feedparser>=6.0.10 \
           openai>=1.55.0 \
@@ -46,7 +47,9 @@ jobs:
 
     - name: Syntax check
       run: |
-        python -c "import ast; ast.parse(open('app.py').read()); print('app.py: syntax OK')"
+        python -c "import ast; ast.parse(open('backend/pipeline_core.py').read()); print('backend/pipeline_core.py: syntax OK')"
+        python -c "import ast; ast.parse(open('backend/main.py').read()); print('backend/main.py: syntax OK')"
+        python -c "import ast; ast.parse(open('backend/runner.py').read()); print('backend/runner.py: syntax OK')"
         python -c "import ast; ast.parse(open('data_pipeline/scheduler.py').read()); print('scheduler.py: syntax OK')"
         python -c "import ast; ast.parse(open('data_pipeline/build_index.py').read()); print('build_index.py: syntax OK')"
         python -c "import ast; ast.parse(open('data_pipeline/fetch_corpus.py').read()); print('fetch_corpus.py: syntax OK')"

@@ -13,7 +13,7 @@ import pytest
 from datetime import datetime
 from typing import List
 
-from app import (
+from backend.pipeline_core import (
     Paper,
     scibert_classify_papers,
     heuristic_classify_papers_free,

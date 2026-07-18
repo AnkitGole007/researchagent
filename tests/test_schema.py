@@ -1,19 +1,14 @@
-import sqlite3
 import sys
 
 sys.path.insert(0, ".")
-from data_pipeline.schema import create_db, PaperRecord
+from data_pipeline.schema import connect_lancedb, get_or_create_papers_table, PaperRecord
 
 
 def test_db_creates_table(tmp_path):
-    conn = create_db(str(tmp_path / "test.db"))
-    tables = [
-        r[0]
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-    ]
-    assert "papers" in tables
+    db = connect_lancedb(str(tmp_path / "test_lancedb"))
+    table = get_or_create_papers_table(db)
+    assert "papers" in db.list_tables().tables
+    assert "arxiv_id" in table.schema.names
 
 
 def test_paper_record_fields():

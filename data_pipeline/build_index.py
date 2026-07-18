@@ -1,70 +1,77 @@
 """
 data_pipeline/build_index.py
-Build FAISS (inner-product / cosine) and optional BM25 indexes from corpus.db.
+Incremental embedding pipeline: embed unindexed papers and write vectors into LanceDB.
+
+FAISS, embeddings.npy, id_map.json, and bm25_index are no longer used.
+LanceDB on R2 is the sole vector store (has_embedding column tracks which papers are embedded).
 
 Usage:
-    python data_pipeline/build_index.py
+    python data_pipeline/build_index.py               # incremental (papers with has_embedding=False)
+    python data_pipeline/build_index.py --full        # reset all vectors, re-embed everything
+    python data_pipeline/build_index.py --local PATH  # use local LanceDB dir (testing)
 """
+import gc
 import json
 import logging
 import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+
+_root = str(Path(__file__).resolve().parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-import sqlite3
-import sys
-from pathlib import Path
 
-# Hugging Face optimization settings (must be set before importing transformers)
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
-os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
-
-# Ensure project root is on sys.path when run as a script
-_root = str(Path(__file__).resolve().parent.parent)
-if _root not in sys.path:
-    sys.path.insert(0, _root)
-
-import faiss
 import numpy as np
+
+from data_pipeline.schema import (
+    LANCEDB_SCHEMA,
+    TABLE_NAME,
+    VECTOR_DIM,
+    connect_lancedb,
+    get_or_create_papers_table,
+    query_table,
+    _escape_sql,
+)
 
 logger = logging.getLogger(__name__)
 
-try:
-    import bm25s
-
-    HAS_BM25 = True
-except ImportError:
-    HAS_BM25 = False
+EMBED_BATCH = 32   # papers per SPECTER2 inference batch
+WRITE_BATCH = 500  # rows per LanceDB merge_insert flush
 
 
-def load_papers_from_db(db_path: str) -> list:
-    """Return all papers from corpus.db as plain dicts (authors decoded from JSON)."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT * FROM papers ORDER BY submitted_date DESC"
-    ).fetchall()
-    conn.close()
+def load_unindexed_papers(table, force_full: bool = False) -> list:
+    """
+    Return paper dicts (arxiv_id, title, abstract) for papers that need embedding.
+    force_full=True resets all has_embedding flags first.
+    """
+    if force_full:
+        logger.info("force-full: resetting has_embedding=False for all rows…")
+        table.update(where="has_embedding = true", values={"has_embedding": False})
 
-    papers = []
-    for row in rows:
-        d = dict(row)
-        d["authors"] = json.loads(d.get("authors") or "[]")
-        papers.append(d)
+    try:
+        df = query_table(table, filter="has_embedding = false", columns=["arxiv_id", "title", "abstract"])
+    except Exception as exc:
+        logger.error("Failed to query unindexed papers: %s", exc)
+        return []
+
+    papers = df.to_dict("records")
+    logger.info("Papers requiring embedding: %d", len(papers))
     return papers
 
 
-def embed_papers(
-    papers: list,
-    model_name: str = "allenai/specter2_base",
-) -> np.ndarray:
-    """Encode title+abstract for FAISS indexing. Returns float32 ndarray (N, 768), L2-normalised.
-    Uses SPECTER2 proximity adapter (document-side); query-side uses adhoc_query adapter in app.py."""
-    import gc
-
+def embed_papers(papers: list, model_name: str = "allenai/specter2_base") -> np.ndarray:
+    """Encode title+abstract with SPECTER2 proximity adapter. Returns float32 (N, 768), L2-normalised."""
     is_specter2 = "specter2" in model_name
 
     if is_specter2:
@@ -73,264 +80,194 @@ def embed_papers(
         import torch
 
         logger.info("Loading SPECTER2 base model + proximity adapter…")
-        # HF timeout controlled via HF_HUB_DOWNLOAD_TIMEOUT env var — do NOT pass to from_pretrained
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoAdapterModel.from_pretrained(model_name)
         model.load_adapter("allenai/specter2", source="hf", load_as="proximity", set_active=True)
-
-        try:
-            active_adapters = model.active_adapters
-            if "proximity" not in active_adapters:
-                logger.warning("Adapter 'proximity' not active. Active adapters: %s", active_adapters)
-                model.set_active_adapters("proximity")
-        except Exception as e:
-            logger.warning("Could not verify adapter activation: %s", e)
-
         model.eval()
 
-        texts = [
-            (p.get("title") or "") + tokenizer.sep_token + (p.get("abstract") or "")
-            for p in papers
-        ]
-
-        batch_size = 32
+        sep = tokenizer.sep_token
+        texts = [(p.get("title") or "") + sep + (p.get("abstract") or "") for p in papers]
         all_vecs = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            inputs = tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
+
+        for i in range(0, len(texts), EMBED_BATCH):
+            batch = texts[i : i + EMBED_BATCH]
+            inputs = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
             with torch.no_grad():
-                outputs = model(**inputs)
-            # CLS token embedding
-            vecs = outputs.last_hidden_state[:, 0, :]
-            # L2 normalise
+                out = model(**inputs)
+            vecs = out.last_hidden_state[:, 0, :]
             vecs = vecs / (vecs.norm(dim=-1, keepdim=True) + 1e-8)
             all_vecs.append(vecs.cpu().float().numpy())
-            if i % (batch_size * 10) == 0:
+            if i % (EMBED_BATCH * 20) == 0:
                 logger.info("  Embedded %d / %d papers…", i + len(batch), len(texts))
 
         del model
         gc.collect()
-        vecs = np.vstack(all_vecs)
+        return np.vstack(all_vecs).astype("float32")
     else:
-        # Generic SentenceTransformer fallback (kept for testing / CI)
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer(model_name)
-        texts = [
-            (p.get("title") or "") + "\n\n" + (p.get("abstract") or "")
-            for p in papers
-        ]
-        vecs = model.encode(
-            texts,
-            batch_size=64,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
+        texts = [(p.get("title") or "") + "\n\n" + (p.get("abstract") or "") for p in papers]
+        vecs = model.encode(texts, batch_size=64, show_progress_bar=True,
+                            convert_to_numpy=True, normalize_embeddings=True)
         del model
         gc.collect()
-
-    vecs = vecs.astype("float32")
-    logger.info("Embedded %d papers — dim=%d", len(papers), vecs.shape[1])
-    return vecs
+        return vecs.astype("float32")
 
 
-def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
+def write_vectors_to_lancedb(table, papers: list, embeddings: np.ndarray) -> int:
     """
-    Build an exact inner-product (cosine equivalent for normalised vecs) index.
+    Update LanceDB rows with computed embeddings.
+    Uses merge_insert (full-row replace) so vector + has_embedding are written atomically.
+    Returns number of rows updated.
     """
-    idx = faiss.IndexFlatIP(embeddings.shape[1])
-    idx.add(embeddings)
-    return idx
+    if len(papers) != len(embeddings):
+        raise ValueError(f"papers/embeddings length mismatch: {len(papers)} vs {len(embeddings)}")
+
+    # We need full rows for merge_insert. Fetch existing metadata from LanceDB.
+    arxiv_ids = [p["arxiv_id"] for p in papers]
+    id_list = ", ".join(f"'{_escape_sql(aid)}'" for aid in arxiv_ids)
+    filter_str = f"arxiv_id IN ({id_list})"
+
+    try:
+        existing_df = query_table(table, filter=filter_str)
+    except Exception as exc:
+        logger.error("Failed to fetch existing rows for vector write: %s", exc)
+        return 0
+
+    # Build lookup: arxiv_id → existing metadata row (as dict)
+    existing_map = {row["arxiv_id"]: row for _, row in existing_df.iterrows()}
+    pos_map = {p["arxiv_id"]: i for i, p in enumerate(papers)}
+
+    updated = 0
+    rows_to_write = []
+
+    for arxiv_id, idx in pos_map.items():
+        meta = existing_map.get(arxiv_id)
+        if meta is None:
+            logger.warning("arxiv_id %s not found in LanceDB during vector write — skipping.", arxiv_id)
+            continue
+
+        vec = embeddings[idx].tolist()
+        row = meta.to_dict()
+        row["vector"] = vec
+        row["has_embedding"] = True
+        rows_to_write.append(row)
+
+    for start in range(0, len(rows_to_write), WRITE_BATCH):
+        batch = rows_to_write[start : start + WRITE_BATCH]
+        (
+            table.merge_insert("arxiv_id")
+            .when_matched_update_all()
+            .execute(batch)
+        )
+        updated += len(batch)
+        logger.info("  Vectors written %d / %d", min(start + WRITE_BATCH, len(rows_to_write)), len(rows_to_write))
+
+    return updated
 
 
-def save_index(index: faiss.Index, path: str) -> None:
-    """Write FAISS index to disk."""
-    faiss.write_index(index, path)
-    logger.info("FAISS saved: %s (%d vectors)", path, index.ntotal)
+def rebuild_fts_index(table) -> None:
+    """Rebuild FTS indexes (one per field — lancedb 0.25+ requires separate index per field)."""
+    from lancedb.index import FTS
+    logger.info("Rebuilding FTS indexes on title and abstract…")
+    table.create_index("title",    config=FTS(with_position=True), replace=True)
+    table.create_index("abstract", config=FTS(with_position=True), replace=True)
 
 
-def build_bm25_index(papers: list, save_dir: str) -> None:
-    """Build and save a BM25 index over title+abstract text."""
-    if not HAS_BM25:
-        logger.warning("bm25s not installed — skipping BM25 index")
-        return
-
-    corpus = [
-        (p.get("title") or "") + " " + (p.get("abstract") or "")
-        for p in papers
-    ]
-    retriever = bm25s.BM25()
-    retriever.index(bm25s.tokenize(corpus))
-    retriever.save(save_dir)
-    logger.info("BM25 saved: %s/", save_dir)
+def rebuild_vector_index(table) -> None:
+    """Rebuild ANN vector index."""
+    from lancedb.index import IvfHnswSq
+    logger.info("Rebuilding vector index (IVF_HNSW_SQ, cosine)…")
+    table.create_index("vector", config=IvfHnswSq(distance_type="cosine"), replace=True)
 
 
-def run_index_build(
-    db_path: str = "data_pipeline/corpus.db",
-    output_dir: str = "data_pipeline",
-    model_name: str = "allenai/specter2_base",  # P-03: SPECTER2 is now the default
-    force_full: bool = False,
-    update_arxiv_ts: bool = False,
-    update_s2_ts: bool = False,
-) -> None:
-    """
-    Incremental index build pipeline:
-    1. Filter for papers where is_indexed = 0
-    2. Load existing FAISS/NPY/JSON artifacts
-    3. Embed only new papers
-    4. Append to artifacts and save
-    5. Update SQLite is_indexed = 1
-    6. Rebuild BM25 for all indexed papers
-    """
-    from data_pipeline.schema import create_db
-
-    os.makedirs(output_dir, exist_ok=True)
-    emb_path   = os.path.join(output_dir, "embeddings.npy")
-    faiss_path = os.path.join(output_dir, "corpus.faiss")
-    id_map_path = os.path.join(output_dir, "id_map.json")
-
-    conn = create_db(db_path)
-    conn.row_factory = sqlite3.Row
-
-    if force_full:
-        logger.info("Force-full rebuild requested. Resetting is_indexed=0 for all papers.")
-        conn.execute("UPDATE papers SET is_indexed = 0")
-        conn.commit()
-
-    new_papers_rows = conn.execute("SELECT * FROM papers WHERE is_indexed = 0").fetchall()
-    if not new_papers_rows:
-        logger.info("No new papers to index.")
-        conn.close()
-        return
-
-    new_papers = []
-    for row in new_papers_rows:
-        d = dict(row)
-        d["authors"] = json.loads(d.get("authors") or "[]")
-        new_papers.append(d)
-
-    logger.info("Embedding %d new papers…", len(new_papers))
-    new_embeddings = embed_papers(new_papers, model_name)
-
-    has_artifacts = all(os.path.exists(p) for p in [emb_path, faiss_path, id_map_path])
-    
-    if has_artifacts and not force_full:
-        try:
-            # Use mmap_mode='r' to save physical memory on Windows
-            existing_embeddings = np.load(emb_path, mmap_mode='r')
-            existing_index = faiss.read_index(faiss_path)
-            with open(id_map_path, "r", encoding="utf-8") as fh:
-                id_map = json.load(fh)
-            logger.info("Loaded existing index with %d papers.", existing_index.ntotal)
-        except Exception as e:
-            logger.warning("Failed to load artifacts: %s. Starting fresh.", e)
-            existing_embeddings = None
-            existing_index = None
-            id_map = {}
-    else:
-        existing_embeddings = None
-        existing_index = None
-        id_map = {}
-        logger.info("Starting fresh index build.")
-
-    if existing_embeddings is not None:
-        all_embeddings = np.vstack([existing_embeddings, new_embeddings])
-        existing_index.add(new_embeddings)
-        all_index = existing_index
-    else:
-        all_embeddings = new_embeddings
-        all_index = build_faiss_index(new_embeddings)
-
-    start_idx = len(id_map)
-    for i, p in enumerate(new_papers):
-        id_map[str(start_idx + i)] = p["arxiv_id"]
-
-    # Release mmap'd file before overwriting (required on Windows)
-    if existing_embeddings is not None:
-        del existing_embeddings
-        import gc
-        gc.collect()
-
-    np.save(emb_path, all_embeddings.astype("float32"))
-    faiss.write_index(all_index, faiss_path)
-    with open(id_map_path, "w", encoding="utf-8") as fh:
-        json.dump(id_map, fh)
-
-    faiss_ntotal = all_index.ntotal
-
-    del all_embeddings
-    del all_index
-    gc.collect()
-
-    logger.info("Updating database flags...")
-    for p in new_papers:
-        conn.execute("UPDATE papers SET is_indexed = 1 WHERE arxiv_id = ?", (p["arxiv_id"],))
-    conn.commit()
-
-    # BM25 always rebuilt from all indexed papers to maintain global IDF statistics
-    logger.info("Rebuilding BM25 index for all papers...")
-    all_papers_rows = conn.execute("SELECT * FROM papers WHERE is_indexed = 1").fetchall()
-    all_papers = [dict(r) for r in all_papers_rows]
-
-    bm25_dir = os.path.join(output_dir, "bm25_index")
-    build_bm25_index(all_papers, bm25_dir)
-
-    # 8. Write Step Metadata
-    from datetime import datetime
+def write_build_meta(output_dir: str, update_arxiv_ts: bool, update_s2_ts: bool, row_count: int) -> None:
     meta_path = os.path.join(output_dir, "build_meta.json")
-    
-    existing_meta = {}
+    existing = {}
     if os.path.exists(meta_path):
         try:
             with open(meta_path, "r", encoding="utf-8") as fh:
-                existing_meta = json.load(fh)
+                existing = json.load(fh)
         except (OSError, json.JSONDecodeError):
             pass
 
-    last_arxiv = existing_meta.get("last_arxiv_at")
-    last_s2 = existing_meta.get("last_s2_at")
-    from datetime import timezone
-    now_iso = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat() + "Z"
-    
+    now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     meta = {
         "built_at": now_iso,
-        "last_arxiv_at": last_arxiv or now_iso,
-        "last_s2_at": last_s2 or now_iso,
-        "corpus_size": len(all_papers),
-        "faiss_ntotal": faiss_ntotal,
-        "db_size_bytes": os.path.getsize(db_path),
-        "schema_version": 1
+        "last_arxiv_at": existing.get("last_arxiv_at") or now_iso,
+        "last_s2_at": existing.get("last_s2_at") or now_iso,
+        "corpus_size": row_count,
+        "storage": "lancedb",
+        "schema_version": 2,
     }
-    if update_arxiv_ts: meta["last_arxiv_at"] = now_iso
-    if update_s2_ts: meta["last_s2_at"] = now_iso
+    if update_arxiv_ts:
+        meta["last_arxiv_at"] = now_iso
+    if update_s2_ts:
+        meta["last_s2_at"] = now_iso
 
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
-    logger.info("Metadata saved: %s", meta_path)
+    logger.info("Build metadata saved: %s", meta_path)
 
-    conn.close()
-    logger.info("Index update complete. Total indexed: %d", len(all_papers))
+
+def run_index_build(
+    lancedb_local_path: str = None,
+    model_name: str = "allenai/specter2_base",
+    force_full: bool = False,
+    update_arxiv_ts: bool = False,
+    update_s2_ts: bool = False,
+    meta_dir: str = "data_pipeline",
+) -> None:
+    """
+    Incremental index build:
+    1. Query LanceDB for papers with has_embedding=False
+    2. Embed them with SPECTER2 (proximity adapter)
+    3. Write vectors back to LanceDB via merge_insert
+    4. Rebuild FTS + ANN indexes
+    5. Update build_meta.json
+    """
+    db = connect_lancedb(lancedb_local_path)
+    table = get_or_create_papers_table(db)
+
+    papers = load_unindexed_papers(table, force_full=force_full)
+    if not papers:
+        logger.info("No papers to embed. Index is up to date.")
+        row_count = table.count_rows()
+        write_build_meta(meta_dir, update_arxiv_ts, update_s2_ts, row_count)
+        return
+
+    logger.info("Embedding %d papers with %s…", len(papers), model_name)
+    embeddings = embed_papers(papers, model_name)
+
+    updated = write_vectors_to_lancedb(table, papers, embeddings)
+    logger.info("Vectors written: %d", updated)
+
+    del embeddings
+    gc.collect()
+
+    rebuild_fts_index(table)
+    rebuild_vector_index(table)
+
+    row_count = table.count_rows()
+    write_build_meta(meta_dir, update_arxiv_ts, update_s2_ts, row_count)
+    logger.info("Index build complete. Total rows in LanceDB: %d", row_count)
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--full", action="store_true", help="Force full rebuild")
-    parser.add_argument("--update-arxiv", action="store_true", help="Update last_arxiv_at timestamp")
-    parser.add_argument("--update-s2", action="store_true", help="Update last_s2_at timestamp")
+
+    parser = argparse.ArgumentParser(description="Embed papers and write vectors to LanceDB")
+    parser.add_argument("--full",         action="store_true", help="Reset all embeddings and rebuild from scratch")
+    parser.add_argument("--update-arxiv", action="store_true", help="Update last_arxiv_at timestamp in build_meta.json")
+    parser.add_argument("--update-s2",    action="store_true", help="Update last_s2_at timestamp in build_meta.json")
+    parser.add_argument("--local",        default=None, metavar="PATH", help="Local LanceDB dir (for testing, e.g. data_pipeline/lancedb)")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
     run_index_build(
+        lancedb_local_path=args.local,
         force_full=args.full,
         update_arxiv_ts=args.update_arxiv,
-        update_s2_ts=args.update_s2
+        update_s2_ts=args.update_s2,
     )

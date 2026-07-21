@@ -92,6 +92,12 @@ _CE_MAX_ABSTRACT_CHARS: int = 1500
 DB_FETCH_LIMIT = 20_000
 RECENCY_BONUS_MAX = 15.0
 
+# Stage 1 RRF fusion constant. 60 is the common empirical default, but
+# literature on RRF k-tuning shows k=30-46 often outperforms it by giving
+# top-ranked results more relative weight — see docs/relevance-strategy-comparison.md
+# Approach A1. Lower = more weight to top ranks; higher = more consensus-seeking.
+RRF_K = 45
+
 CONFERENCE_KEYWORDS = [
     "EMNLP", "ACL", "NAACL", "EACL",
     "NeurIPS", "ICLR", "ICML",
@@ -872,13 +878,12 @@ def _lancedb_hybrid_stage1(
         except Exception as exc:
             logging.warning("[Stage1/Vec] LanceDB vector search failed: %s", exc)
 
-    _k = 60
     union_ids = set(fts_ranks.keys()) | set(vec_ranks.keys())
     n_fts, n_vec = len(fts_ranks), len(vec_ranks)
 
     scored: List[tuple] = []
     for aid in union_ids:
-        rrf = 1.0 / (_k + fts_ranks.get(aid, n_fts + 1)) + 1.0 / (_k + vec_ranks.get(aid, n_vec + 1))
+        rrf = 1.0 / (RRF_K + fts_ranks.get(aid, n_fts + 1)) + 1.0 / (RRF_K + vec_ranks.get(aid, n_vec + 1))
         scored.append((rrf, aid))
     scored.sort(reverse=True)
 

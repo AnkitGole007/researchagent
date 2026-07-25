@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 EMBED_BATCH = 32   # papers per SPECTER2 inference batch
 WRITE_BATCH = 500  # rows per LanceDB merge_insert flush
+CHECKPOINT_CHUNK = 2000  # papers embedded+written per checkpoint (crash loses at most one chunk, not the whole backlog)
+INDEX_REBUILD_EVERY_N_CHUNKS = 10  # ~20k papers between mid-run index rebuilds on a long backfill
 
 
 def load_unindexed_papers(table, force_full: bool = False) -> list:
@@ -60,30 +62,58 @@ def load_unindexed_papers(table, force_full: bool = False) -> list:
         table.update(where="has_embedding = true", values={"has_embedding": False})
 
     try:
-        df = query_table(table, filter="has_embedding = false", columns=["arxiv_id", "title", "abstract"])
+        df = query_table(
+            table, filter="has_embedding = false",
+            columns=["arxiv_id", "title", "abstract", "submitted_date"],
+        )
     except Exception as exc:
         logger.error("Failed to query unindexed papers: %s", exc)
         return []
 
+    # ponytail: newest-first — same total work, but retrieval on recent-date
+    # queries (the ones actually breaking today) gets fixed soonest instead of
+    # waiting on the full historical backlog.
+    df = df.sort_values("submitted_date", ascending=False)
     papers = df.to_dict("records")
-    logger.info("Papers requiring embedding: %d", len(papers))
+    logger.info("Papers requiring embedding: %d (newest first)", len(papers))
     return papers
 
 
-def embed_papers(papers: list, model_name: str = "allenai/specter2_base") -> np.ndarray:
-    """Encode title+abstract with SPECTER2 proximity adapter. Returns float32 (N, 768), L2-normalised."""
+def load_embedding_model(model_name: str = "allenai/specter2_base"):
+    """
+    Load the embedding model once. Returns (model, tokenizer_or_None, is_specter2).
+    Split out from embed_papers_with_model so a long backfill can reuse one loaded
+    model across many checkpointed chunks instead of reloading it every call.
+    """
     is_specter2 = "specter2" in model_name
 
     if is_specter2:
         from adapters import AutoAdapterModel
         from transformers import AutoTokenizer
-        import torch
 
         logger.info("Loading SPECTER2 base model + proximity adapter…")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoAdapterModel.from_pretrained(model_name)
         model.load_adapter("allenai/specter2", source="hf", load_as="proximity", set_active=True)
+        model.set_active_adapters("proximity")
+        try:
+            active_adapters = model.active_adapters
+            if "proximity" not in active_adapters:
+                logger.warning("[SPECTER2] adapter not active before encode: %s", active_adapters)
+                model.set_active_adapters("proximity")
+        except Exception as e:
+            logger.warning("[SPECTER2] could not verify adapter activation: %s", e)
         model.eval()
+        return model, tokenizer, True
+    else:
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer(model_name), None, False
+
+
+def embed_papers_with_model(papers: list, model, tokenizer, is_specter2: bool) -> np.ndarray:
+    """Encode one chunk of papers with an already-loaded model. Returns float32 (N, 768), L2-normalised."""
+    if is_specter2:
+        import torch
 
         sep = tokenizer.sep_token
         texts = [(p.get("title") or "") + sep + (p.get("abstract") or "") for p in papers]
@@ -98,20 +128,24 @@ def embed_papers(papers: list, model_name: str = "allenai/specter2_base") -> np.
             vecs = vecs / (vecs.norm(dim=-1, keepdim=True) + 1e-8)
             all_vecs.append(vecs.cpu().float().numpy())
             if i % (EMBED_BATCH * 20) == 0:
-                logger.info("  Embedded %d / %d papers…", i + len(batch), len(texts))
+                logger.info("  Embedded %d / %d papers in this chunk…", i + len(batch), len(texts))
 
-        del model
-        gc.collect()
         return np.vstack(all_vecs).astype("float32")
     else:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(model_name)
         texts = [(p.get("title") or "") + "\n\n" + (p.get("abstract") or "") for p in papers]
         vecs = model.encode(texts, batch_size=64, show_progress_bar=True,
                             convert_to_numpy=True, normalize_embeddings=True)
+        return vecs.astype("float32")
+
+
+def embed_papers(papers: list, model_name: str = "allenai/specter2_base") -> np.ndarray:
+    """Backward-compatible one-shot wrapper: load model once, encode all papers, discard model."""
+    model, tokenizer, is_specter2 = load_embedding_model(model_name)
+    try:
+        return embed_papers_with_model(papers, model, tokenizer, is_specter2)
+    finally:
         del model
         gc.collect()
-        return vecs.astype("float32")
 
 
 def write_vectors_to_lancedb(table, papers: list, embeddings: np.ndarray) -> int:
@@ -221,10 +255,16 @@ def run_index_build(
     """
     Incremental index build:
     1. Query LanceDB for papers with has_embedding=False
-    2. Embed them with SPECTER2 (proximity adapter)
-    3. Write vectors back to LanceDB via merge_insert
-    4. Rebuild FTS + ANN indexes
-    5. Update build_meta.json
+    2. Embed + write in checkpointed chunks (CHECKPOINT_CHUNK papers at a time),
+       so a crash mid-run loses at most one chunk, not the whole backlog —
+       everything already written stays committed and load_unindexed_papers()
+       naturally skips it on the next run.
+    3. Rebuild FTS + ANN indexes every INDEX_REBUILD_EVERY_N_CHUNKS chunks (not
+       just once at the very end) — a crash during index rebuild then only
+       costs re-running the rebuild on top of already-embedded rows, not lost
+       embedding work, and newly-embedded papers become searchable well before
+       the whole backlog finishes on a long run.
+    4. Update build_meta.json
     """
     db = connect_lancedb(lancedb_local_path)
     table = get_or_create_papers_table(db)
@@ -236,14 +276,33 @@ def run_index_build(
         write_build_meta(meta_dir, update_arxiv_ts, update_s2_ts, row_count)
         return
 
-    logger.info("Embedding %d papers with %s…", len(papers), model_name)
-    embeddings = embed_papers(papers, model_name)
+    logger.info(
+        "Embedding %d papers with %s (checkpointed every %d, index rebuild every %d chunks)…",
+        len(papers), model_name, CHECKPOINT_CHUNK, INDEX_REBUILD_EVERY_N_CHUNKS,
+    )
+    model, tokenizer, is_specter2 = load_embedding_model(model_name)
 
-    updated = write_vectors_to_lancedb(table, papers, embeddings)
-    logger.info("Vectors written: %d", updated)
+    total_written = 0
+    try:
+        for chunk_i, start in enumerate(range(0, len(papers), CHECKPOINT_CHUNK), start=1):
+            chunk = papers[start : start + CHECKPOINT_CHUNK]
+            embeddings = embed_papers_with_model(chunk, model, tokenizer, is_specter2)
+            total_written += write_vectors_to_lancedb(table, chunk, embeddings)
+            del embeddings
+            gc.collect()
+            logger.info(
+                "Checkpoint: %d / %d papers embedded and written to LanceDB",
+                min(start + CHECKPOINT_CHUNK, len(papers)), len(papers),
+            )
+            if chunk_i % INDEX_REBUILD_EVERY_N_CHUNKS == 0:
+                logger.info("Mid-run index rebuild (chunk %d)…", chunk_i)
+                rebuild_fts_index(table)
+                rebuild_vector_index(table)
+    finally:
+        del model
+        gc.collect()
 
-    del embeddings
-    gc.collect()
+    logger.info("Vectors written: %d", total_written)
 
     rebuild_fts_index(table)
     rebuild_vector_index(table)

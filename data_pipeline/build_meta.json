@@ -1,9 +1,8 @@
 {
-  "built_at": "2026-07-07T19:04:10+00:00",
-  "last_arxiv_at": "2026-04-13T23:53:07Z",
-  "last_s2_at": "2026-04-13T23:53:07Z",
+  "built_at": "2026-07-22T09:25:45+00:00",
+  "last_arxiv_at": "2026-07-22T09:25:45+00:00",
+  "last_s2_at": "2026-07-22T09:25:45+00:00",
   "corpus_size": 385655,
-  "embedded_count": 189573,
   "storage": "lancedb",
   "schema_version": 2
 }

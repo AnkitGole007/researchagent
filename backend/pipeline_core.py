@@ -644,6 +644,12 @@ def get_specter2_model():
             load_as="specter2_adhoc_query",
             set_active=True,
         )
+
+        # load_adapter() adds adapter weights in float32 regardless of the base
+        # model's dtype — recast the whole model (base + adapter) so forward
+        # passes don't hit a Half/Float matmul mismatch. .to() can reset the
+        # adapter routing state, so (re)activate AFTER this, not before.
+        model = model.to(torch.float16)
         model.set_active_adapters("specter2_adhoc_query")
 
         try:
@@ -654,10 +660,6 @@ def get_specter2_model():
         except Exception as e:
             print(f"[SPECTER2] Warning: Could not verify adapter activation: {e}")
 
-        # load_adapter() adds adapter weights in float32 regardless of the base
-        # model's dtype — recast the whole model (base + adapter) so forward
-        # passes don't hit a Half/Float matmul mismatch.
-        model = model.to(torch.float16)
         model.eval()
         return model, tokenizer
     except ImportError:

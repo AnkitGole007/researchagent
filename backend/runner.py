@@ -29,6 +29,7 @@ import hashlib
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from . import pipeline_core as pc
@@ -94,6 +95,20 @@ def _stream_call(fn, *args, **kwargs) -> Generator[Tuple[str, Any, Optional[str]
     if "error" in outcome:
         raise outcome["error"]
     yield ("result", outcome.get("value"), None)
+
+
+def _predict_citations_with_emit(used_papers, llm_config, quality_modifier, emit):
+    """Adapts predict_citations_direct's (done, total) on_progress into _stream_call's
+    emit(msg, level) — T-68: without this, Stage 5's concurrent I/O phase ran silently,
+    the UI showing no change for the entire wait. Throttled to every 10th paper + the
+    last one, matching how the two calls per paper compound into progress ticks."""
+    def on_progress(done: int, total: int) -> None:
+        if done == total or done % 10 == 0:
+            emit(f"Impact Score: {done}/{total} papers scored", "info")
+
+    return pc.predict_citations_direct(
+        used_papers, llm_config, quality_modifier=quality_modifier, on_progress=on_progress,
+    )
 
 
 def _provider_to_internal(provider: str) -> str:
@@ -255,7 +270,13 @@ def pipeline_events(req):
     if is_llm:
         cached_sq = _QIL_CACHE.get(qil_key)
         quality_modifier = cached_sq.quality_modifier if cached_sq else "any"
-        used_papers = pc.predict_citations_direct(used_papers, llm_config, quality_modifier=quality_modifier)
+        for kind, payload, _level in _stream_call(
+            _predict_citations_with_emit, used_papers, llm_config, quality_modifier,
+        ):
+            if kind == "msg":
+                yield _stage(5, "start", STAGE_NAMES[5], payload)
+            elif kind == "result":
+                used_papers = payload
     else:
         used_papers = pc.assign_heuristic_citations_free(used_papers)
 
@@ -270,11 +291,17 @@ def pipeline_events(req):
     top_n = min(req.top_n, len(ranked))
     summaries: Dict[str, Optional[str]] = {}
     if is_llm:
-        for p in ranked[:top_n]:
+        def _summarize(p: "pc.Paper") -> Tuple[str, Optional[str]]:
             try:
-                summaries[p.arxiv_id] = pc.summarize_paper_plain_english(p, llm_config)
+                return p.arxiv_id, pc.summarize_paper_plain_english(p, llm_config)
             except Exception:
-                summaries[p.arxiv_id] = None
+                return p.arxiv_id, None
+
+        # T-69: same serial-per-paper LLM pattern as Stage 5, smaller scale (top_n <= 10)
+        # — reuses Stage 5's LLM concurrency budget rather than a separate pool.
+        with ThreadPoolExecutor(max_workers=pc.LLM_MAX_CONCURRENCY) as pool:
+            for arxiv_id, summary in pool.map(_summarize, ranked[:top_n]):
+                summaries[arxiv_id] = summary
     yield _stage(6, "done", STAGE_NAMES[6], f"Top {top_n} summarized" if is_llm else "Heuristic mode — no summaries")
 
     papers_out = [_to_paper_out(p, i + 1, summaries.get(p.arxiv_id)) for i, p in enumerate(ranked)]

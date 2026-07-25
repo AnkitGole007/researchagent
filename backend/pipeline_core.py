@@ -26,9 +26,11 @@ import hashlib
 import json
 import logging
 import math
+import random
 import re
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -36,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
@@ -97,6 +100,14 @@ RECENCY_BONUS_MAX = 15.0
 # top-ranked results more relative weight — see docs/relevance-strategy-comparison.md
 # Approach A1. Lower = more weight to top ranks; higher = more consensus-seeking.
 RRF_K = 45
+
+# Stage 5/6/7 concurrency budgets (T-68/T-69, docs/reranking-stage-latency-design.md).
+# Two separate pools, never one shared: a stalled/rate-limited LLM provider must
+# not starve S2 fetches and vice versa. S2's authenticated-tier rate limit isn't
+# documented anywhere in this repo (only the 1 req/sec unauthenticated/Bulk-API
+# limit, B-09) so this stays conservative and env-tunable rather than guessed.
+S2_MAX_CONCURRENCY = int(os.getenv("S2_MAX_CONCURRENCY", "2"))
+LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "5"))
 
 CONFERENCE_KEYWORDS = [
     "EMNLP", "ACL", "NAACL", "EACL",
@@ -559,7 +570,8 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
             if attempt == max_retries - 1:
                 print(f"LLM call failed ({label}): {e}")
                 raise e
-            time.sleep(2 * (attempt + 1))
+            base = 2 * (attempt + 1)
+            time.sleep(base + random.uniform(0, base * 0.5))
 
 
 def safe_parse_json_array(raw: str) -> Optional[List[Dict[str, Any]]]:
@@ -1287,22 +1299,35 @@ def heuristic_classify_papers_free(candidates: List[Paper]) -> List[Paper]:
 # MONEYBALL Impact Scoring
 # =========================
 
+@lru_cache(maxsize=1)
+def _get_s2_session() -> requests.Session:
+    """Shared, connection-pool-sized session for concurrent S2 calls (T-68) —
+    pool_maxsize matches S2_MAX_CONCURRENCY so urllib3's default pool (10)
+    doesn't become an invisible serialization point under concurrency."""
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_maxsize=S2_MAX_CONCURRENCY, pool_connections=S2_MAX_CONCURRENCY)
+    session.mount("https://", adapter)
+    return session
+
+
 def get_s2_citation_stats(paper: Paper, api_key: Optional[str] = None) -> int:
     """Return max author citation count from Semantic Scholar; 0 if unavailable."""
     headers = {"x-api-key": api_key} if api_key else {}
     max_retries = 2
+    session = _get_s2_session()
 
     def fetch(url, params):
         for attempt in range(max_retries + 1):
             try:
-                r = requests.get(url, headers=headers, params=params, timeout=10)
+                r = session.get(url, headers=headers, params=params, timeout=10)
                 if r.status_code == 200:
                     return r.json()
                 if r.status_code == 429:
-                    time.sleep(2 * (attempt + 1))
+                    base = 2 * (attempt + 1)
+                    time.sleep(base + random.uniform(0, base * 0.5))
             except requests.RequestException:
                 if attempt < max_retries:
-                    time.sleep(1)
+                    time.sleep(1 + random.uniform(0, 0.5))
         return None
 
     if paper.arxiv_id:
@@ -1347,19 +1372,77 @@ def resolve_moneyball_weights(quality_modifier: str = "any") -> dict:
 def predict_citations_direct(
     target_papers: List[Paper],
     llm_config: LLMConfig,
-    batch_size: int = 8,
     quality_modifier: str = "any",
     on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> List[Paper]:
-    """MONEYBALL PREDICTOR: Hybrid Author Data + Custom LLM Narrative."""
+    """MONEYBALL PREDICTOR: Hybrid Author Data + Custom LLM Narrative.
+
+    S2 citation lookups and LLM narrative calls run concurrently across two
+    separate bounded pools (T-68, docs/reranking-stage-latency-design.md) —
+    S2_MAX_CONCURRENCY stays small/conservative since no verified authenticated-
+    tier rate limit exists for it in this repo; LLM_MAX_CONCURRENCY is shared
+    with Stage 7's summarization call. The scoring math below stays serial —
+    it's pure CPU, no reason to parallelize it.
+    """
     if not target_papers:
         return target_papers
 
     weights = resolve_moneyball_weights(quality_modifier)
     s2_key = _get_secret("S2_API_KEY")
+    has_llm = bool(llm_config and llm_config.api_key and llm_config.api_key.strip())
+
+    def _fetch_s2(p: Paper) -> int:
+        n = get_s2_citation_stats(p, s2_key)
+        if not s2_key:
+            time.sleep(0.3)  # unauthenticated tier: stay well under 1 req/sec per worker
+        return n
+
+    def _fetch_narrative(p: Paper) -> str:
+        if not has_llm:
+            return ""
+        prompt = textwrap.dedent(f"""
+            Analyze this abstract.
+            1. Rate 'Citation Potential' (0-10) based on market fit (Broad/Hot = High, Niche = Low).
+            2. Write 2 short, plain English sentences explaining the score.
+               - Sentence 1 (Market Fit): Why is this topic hot or niche? (Do NOT start with "Market Fit:")
+               - Sentence 2 (Contribution): What is the specific value? (Do NOT start with "Contribution:")
+
+            Title: {p.title}
+            Abstract: {p.abstract[:800]}...
+
+            Return JSON: {{ "score": <int>, "bullets": ["string", "string"] }}
+        """)
+        try:
+            return call_llm(prompt, llm_config, label="moneyball_narrative")
+        except Exception as e:
+            # One paper's provider hiccup must not kill the whole batch (Skeptic
+            # review, T-68) — fall back to the heuristic content_bullets below.
+            logging.warning("[Stage6] moneyball_narrative call failed, using heuristic fallback: %s", e)
+            return ""
+
+    max_auth_cites_by_idx: List[int] = [0] * len(target_papers)
+    raw_by_idx: List[str] = [""] * len(target_papers)
+    completed_subtasks = 0
+    last_reported = 0
+
+    with ThreadPoolExecutor(max_workers=S2_MAX_CONCURRENCY) as s2_pool, \
+            ThreadPoolExecutor(max_workers=LLM_MAX_CONCURRENCY) as llm_pool:
+        s2_futures = {s2_pool.submit(_fetch_s2, p): i for i, p in enumerate(target_papers)}
+        llm_futures = {llm_pool.submit(_fetch_narrative, p): i for i, p in enumerate(target_papers)}
+
+        for future in as_completed(list(s2_futures) + list(llm_futures)):
+            if future in s2_futures:
+                max_auth_cites_by_idx[s2_futures[future]] = future.result()
+            else:
+                raw_by_idx[llm_futures[future]] = future.result()
+            completed_subtasks += 1
+            papers_done = completed_subtasks // 2
+            if on_progress and papers_done > last_reported:
+                last_reported = papers_done
+                on_progress(papers_done, len(target_papers))
 
     for i, p in enumerate(target_papers):
-        max_auth_cites = get_s2_citation_stats(p, s2_key)
+        max_auth_cites = max_auth_cites_by_idx[i]
 
         is_fresh = False
         try:
@@ -1379,9 +1462,6 @@ def predict_citations_direct(
             h1_fame = 0.0
             fame_label = "none"
 
-        if not s2_key:
-            time.sleep(0.3)
-
         t_lower = p.title.lower()
         h2_hype = 0
         if "benchmark" in t_lower or "dataset" in t_lower:
@@ -1398,19 +1478,6 @@ def predict_citations_direct(
         if any(n in t_lower for n in niche):
             h3_sniper -= 20
 
-        prompt = textwrap.dedent(f"""
-            Analyze this abstract.
-            1. Rate 'Citation Potential' (0-10) based on market fit (Broad/Hot = High, Niche = Low).
-            2. Write 2 short, plain English sentences explaining the score.
-               - Sentence 1 (Market Fit): Why is this topic hot or niche? (Do NOT start with "Market Fit:")
-               - Sentence 2 (Contribution): What is the specific value? (Do NOT start with "Contribution:")
-
-            Title: {p.title}
-            Abstract: {p.abstract[:800]}...
-
-            Return JSON: {{ "score": <int>, "bullets": ["string", "string"] }}
-        """)
-
         h4_utility = 50.0
         content_bullets = [
             "The topic appears relevant to current research trends.",
@@ -1418,10 +1485,7 @@ def predict_citations_direct(
         ]
 
         try:
-            raw = ""
-            if llm_config and llm_config.api_key and llm_config.api_key.strip():
-                raw = call_llm(prompt, llm_config, label="moneyball_narrative")
-
+            raw = raw_by_idx[i]
             if raw:
                 if "```" in raw:
                     parts = raw.split("```json")
@@ -1474,9 +1538,6 @@ def predict_citations_direct(
             final_bullets.append(f"💡 **Contribution:** {content_bullets[1]}")
 
         p.prediction_explanations = final_bullets
-
-        if on_progress:
-            on_progress(i + 1, len(target_papers))
 
     return target_papers
 

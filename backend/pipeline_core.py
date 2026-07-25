@@ -1062,10 +1062,24 @@ def select_embedding_candidates(
         if len(stage1_papers) < 50:
             emit(
                 f"Stage 1 returned {len(stage1_papers)} candidates (below 50 threshold) "
-                "— using full pool as fallback.",
+                "— retrying with a wider search before falling back.",
                 "info",
             )
-            stage1_papers = papers
+            # Reuses _lancedb_hybrid_stage1's own search_k cap (min(top_k*5, 6000));
+            # top_k=1200 pushes it to the max, so this is just a wider single query,
+            # not a new query mechanism.
+            stage1_papers, paper_vectors = _lancedb_hybrid_stage1(
+                lancedb_table, papers, fts_query_str, q_vec_stage1, top_k=1200,
+                quality_where=quality_where,
+            )
+            if len(stage1_papers) < 50:
+                emit(
+                    f"Stage 1 still only {len(stage1_papers)} candidates after widening "
+                    "— using full pool as fallback.",
+                    "info",
+                )
+                stage1_papers = papers
+                paper_vectors = {}
         else:
             n_both = sum(1 for p in stage1_papers if p.retrieval_source == "both")
             n_fts_only = sum(1 for p in stage1_papers if p.retrieval_source == "bm25_only")

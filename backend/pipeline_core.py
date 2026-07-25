@@ -911,8 +911,12 @@ def get_cross_encoder_model():
     try:
         from sentence_transformers import CrossEncoder
         import torch
-        logging.info("[CrossEncoder] Loading BAAI/bge-reranker-base for precision re-ranking (first run only)...")
-        return CrossEncoder("BAAI/bge-reranker-base", automodel_args={"torch_dtype": torch.float16})
+        # A2 (docs/relevance-strategy-comparison.md): swapped from bge-reranker-base
+        # to bge-reranker-v2-m3 - same family, real BEIR nDCG@10 ~56.4 vs ~49.5,
+        # and a higher recommended max_length (1024 vs 512) so less of each
+        # abstract gets truncated. model_kwargs replaces the deprecated automodel_args.
+        logging.info("[CrossEncoder] Loading BAAI/bge-reranker-v2-m3 for precision re-ranking (first run only)...")
+        return CrossEncoder("BAAI/bge-reranker-v2-m3", model_kwargs={"torch_dtype": torch.float16})
     except Exception as e:
         print(f"CrossEncoder load error: {e}")
         return None

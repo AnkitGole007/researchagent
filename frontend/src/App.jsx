@@ -17,16 +17,36 @@ const STEPS = [
 ];
 
 // Chat models offered per provider (mirrors the Streamlit app). The first
-// entry is the default. "free" needs no key or model.
+// entry is the default. "free" and "ollama_local" need no key or model.
+// An empty list means "free-text model input" instead of a fixed dropdown --
+// used for catalogs too large (openrouter) or too user-specific (ollama) to
+// hardcode.
 const MODELS = {
   openai: ["gpt-5.2", "gpt-5", "gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini", "o1"],
   gemini: ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-pro"],
   groq: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+  anthropic: ["claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5-20251001"],
+  openrouter: [],
+  ollama_local: [],
+  ollama_cloud: [],
+};
+const MODEL_PLACEHOLDER = {
+  openrouter: "e.g. anthropic/claude-sonnet-4.5",
+  ollama_local: "e.g. llama3.2 (must be pulled locally)",
+  ollama_cloud: "e.g. gpt-oss:120b",
+};
+const PROVIDER_LABELS = {
+  openai: "OpenAI", gemini: "Gemini", groq: "Groq", free: "Local",
+  anthropic: "Anthropic", openrouter: "OpenRouter",
+  ollama_local: "Ollama (Local)", ollama_cloud: "Ollama (Cloud)",
 };
 const KEY_HELP = {
   openai: "Used in memory for this session only — never stored or sent anywhere but OpenAI.",
   gemini: "Get a key from Google AI Studio. Kept in memory for this session only.",
   groq: "Free at console.groq.com. Kept in memory for this session only.",
+  anthropic: "Get a key from console.anthropic.com. Kept in memory for this session only.",
+  openrouter: "Get a key from openrouter.ai/keys. Proxies most model providers through one API. Kept in memory for this session only.",
+  ollama_cloud: "Get a key from ollama.com. Kept in memory for this session only.",
 };
 
 const Chev = ({open,s=14}) => <svg width={s} height={s} viewBox="0 0 16 16" fill="none" style={{transform:open?"rotate(180deg)":"none",transition:"transform 0.2s"}}><path d="M4 6L8 10L12 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>;
@@ -118,12 +138,12 @@ export default function App() {
   const [error, setError] = useState(null);
   const ref = useRef(null);
 
-  const needsKey = provider !== "free";
+  const needsKey = provider !== "free" && provider !== "ollama_local";
   const canSearch = q.trim() && (!needsKey || apiKey.trim());
 
   const changeProvider = (next) => {
     setProvider(next);
-    setModel(next === "free" ? "" : MODELS[next][0]);
+    setModel(next === "free" ? "" : (MODELS[next][0] || ""));
   };
 
   const search = () => {
@@ -135,7 +155,7 @@ export default function App() {
       {
         query: q, exclude, date_range: range, provider, top_n: 5,
         api_key: needsKey ? apiKey : null,
-        model: needsKey ? (model || MODELS[provider][0]) : null,
+        model: provider !== "free" ? (model || MODELS[provider][0] || "") : null,
       },
       {
         onStage: (ev) => { if (ev.status === "done") setStep(ev.index + 1); },
@@ -155,7 +175,7 @@ export default function App() {
 
   const exportResults = () => {
     let md = `# Research Agent — Results\n\n`;
-    md += `**Query:** ${q}\n**Date range:** ${range}\n**Provider:** ${provider}\n\n---\n\n`;
+    md += `**Query:** ${q}\n**Date range:** ${range}\n**Provider:** ${PROVIDER_LABELS[provider] || provider}\n\n---\n\n`;
     papers.forEach(p => {
       md += `## #${p.rank}: ${p.title}\n\n`;
       md += `- **Authors:** ${p.authors.join(", ")}\n`;
@@ -334,11 +354,11 @@ export default function App() {
                 <select value={range} onChange={e=>setRange(e.target.value)} style={{
                   padding:"6px 10px", borderRadius:8, border:"1px solid var(--line)",
                   fontSize:12, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", cursor:"pointer",
-                }}><option>Last 3 Days</option><option>Last Week</option><option>Last Month</option></select>
+                }}><option>Last 3 Days</option><option>Last Week</option><option>Last Month</option><option>Last 3 Months</option><option>All Time</option></select>
                 <select value={provider} onChange={e=>changeProvider(e.target.value)} style={{
                   padding:"6px 10px", borderRadius:8, border:"1px solid var(--line)",
                   fontSize:12, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", cursor:"pointer",
-                }}><option value="free">Free Local</option><option value="openai">OpenAI</option><option value="gemini">Gemini 3</option><option value="groq">Groq</option></select>
+                }}><option value="free">Free Local</option><option value="openai">OpenAI</option><option value="gemini">Gemini 3</option><option value="groq">Groq</option><option value="anthropic">Anthropic</option><option value="openrouter">OpenRouter</option><option value="ollama_local">Ollama (Local)</option><option value="ollama_cloud">Ollama (Cloud)</option></select>
                 <button onClick={() => setShowExclude(!showExclude)} style={{
                   background:"none", border:"none", cursor:"pointer",
                   fontSize:11, color:"var(--dim)", fontFamily:"var(--sans)", padding:"6px 2px",
@@ -357,21 +377,30 @@ export default function App() {
                   Search
                 </button>
               </div>
-              {needsKey && (
+              {provider !== "free" && (
                 <div style={{ padding:"0 14px 12px", display:"flex", flexDirection:"column", gap:7, animation:"up 0.2s ease" }}>
                   <div style={{ display:"flex", gap:8 }}>
-                    <input value={apiKey} onChange={e=>setApiKey(e.target.value)} type="password"
-                      placeholder={`${provider==="openai"?"OpenAI":provider==="gemini"?"Gemini":"Groq"} API key`}
-                      style={{ flex:1, padding:"8px 10px", borderRadius:8, border:"1px solid var(--line)", fontSize:12, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)" }}
-                    />
-                    <select value={model} onChange={e=>setModel(e.target.value)} style={{
-                      padding:"8px 10px", borderRadius:8, border:"1px solid var(--line)",
-                      fontSize:12, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", cursor:"pointer",
-                    }}>
-                      {MODELS[provider].map(m => <option key={m} value={m}>{m}</option>)}
-                    </select>
+                    {needsKey && (
+                      <input value={apiKey} onChange={e=>setApiKey(e.target.value)} type="password"
+                        placeholder={`${PROVIDER_LABELS[provider]} API key`}
+                        style={{ flex:1, padding:"8px 10px", borderRadius:8, border:"1px solid var(--line)", fontSize:12, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)" }}
+                      />
+                    )}
+                    {MODELS[provider].length > 0 ? (
+                      <select value={model} onChange={e=>setModel(e.target.value)} style={{
+                        padding:"8px 10px", borderRadius:8, border:"1px solid var(--line)",
+                        fontSize:12, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", cursor:"pointer",
+                      }}>
+                        {MODELS[provider].map(m => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                    ) : (
+                      <input value={model} onChange={e=>setModel(e.target.value)} type="text"
+                        placeholder={MODEL_PLACEHOLDER[provider] || "model name"}
+                        style={{ flex: needsKey ? "0 0 220px" : 1, padding:"8px 10px", borderRadius:8, border:"1px solid var(--line)", fontSize:12, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)" }}
+                      />
+                    )}
                   </div>
-                  <div style={{ fontSize:10.5, color:"var(--dim)", lineHeight:1.45 }}>🔒 {KEY_HELP[provider]}</div>
+                  {needsKey && <div style={{ fontSize:10.5, color:"var(--dim)", lineHeight:1.45 }}>🔒 {KEY_HELP[provider]}</div>}
                 </div>
               )}
               {showExclude && (
@@ -478,7 +507,7 @@ export default function App() {
                   </div>
                 ))}
                 <div style={{ marginTop:8, fontSize:11, color:"var(--teal)", background:"var(--teal-soft)", padding:"8px 12px", borderRadius:8, fontWeight:500 }}>
-                  Total: {meta ? meta.total_seconds : "—"}s · {provider==="openai"?"OpenAI":provider==="gemini"?"Gemini":provider==="groq"?"Groq":"Local"}
+                  Total: {meta ? meta.total_seconds : "—"}s · {PROVIDER_LABELS[provider] || "Local"}
                 </div>
               </div>
             )}

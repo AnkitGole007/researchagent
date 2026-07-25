@@ -205,6 +205,8 @@ def get_date_range(option: str) -> (date, date):
         return today - timedelta(days=7), today
     elif option == "Last Month":
         return today - timedelta(days=30), today
+    elif option == "Last 3 Months":
+        return today - timedelta(days=90), today
     elif option == "All Time":
         return date(2000, 1, 1), today
     else:
@@ -494,7 +496,9 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            if llm_config.provider == "openai":
+            if llm_config.provider in ("openai", "openrouter", "ollama_local", "ollama_cloud"):
+                # All four speak the same OpenAI-compatible chat-completions API --
+                # only the base_url (set per-provider in runner.py) differs.
                 from openai import OpenAI
                 client_args = {"api_key": llm_config.api_key}
                 if llm_config.api_base and llm_config.api_base.strip():
@@ -510,6 +514,17 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
                     kwargs["temperature"] = 0.2
                 resp = client.chat.completions.create(**kwargs)
                 return resp.choices[0].message.content
+
+            elif llm_config.provider == "anthropic":
+                from anthropic import Anthropic
+                client = Anthropic(api_key=llm_config.api_key)
+                resp = client.messages.create(
+                    model=llm_config.model,
+                    max_tokens=1024,
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return "".join(block.text for block in resp.content if block.type == "text")
 
             elif llm_config.provider == "gemini":
                 if genai is None:

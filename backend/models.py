@@ -10,8 +10,11 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-Provider = Literal["openai", "gemini", "groq", "free"]
-DateRange = Literal["Last 3 Days", "Last Week", "Last Month", "All Time"]
+Provider = Literal[
+    "openai", "gemini", "groq", "free",
+    "anthropic", "openrouter", "ollama_local", "ollama_cloud",
+]
+DateRange = Literal["Last 3 Days", "Last Week", "Last Month", "Last 3 Months", "All Time"]
 
 
 class SearchRequest(BaseModel):

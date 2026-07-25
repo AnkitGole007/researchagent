@@ -100,11 +100,26 @@ def _provider_to_internal(provider: str) -> str:
     return "free_local" if provider == "free" else provider
 
 
+# Default base URL per provider. openrouter/ollama_local/ollama_cloud all speak
+# the OpenAI-compatible chat-completions API, so call_llm() routes them through
+# the same "openai" client branch as openai itself -- only the base_url differs.
+_PROVIDER_API_BASE = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "ollama_local": "http://localhost:11434/v1",
+    "ollama_cloud": "https://ollama.com/v1",
+}
+
+
 def _make_llm_config(req) -> pc.LLMConfig:
     provider = _provider_to_internal(req.provider)
-    api_base = "https://api.openai.com/v1" if provider == "openai" else ""
+    api_base = _PROVIDER_API_BASE.get(provider, "")
+    # ollama_local needs no real key -- the OpenAI-compatible endpoint doesn't
+    # validate it, but call_llm()'s "no key -> skip LLM call" guard would
+    # otherwise treat this provider as unconfigured.
+    api_key = req.api_key or ("ollama" if provider == "ollama_local" else "")
     return pc.LLMConfig(
-        api_key=req.api_key or "",
+        api_key=api_key,
         model=req.model or "",
         api_base=api_base,
         provider=provider,
@@ -167,7 +182,7 @@ STAGE_NAMES = [
 def pipeline_events(req):
     """Synchronous generator yielding SSE event dicts. See module docstring for the stage mapping."""
     t0 = time.perf_counter()
-    is_llm = req.provider in ("openai", "gemini", "groq")
+    is_llm = req.provider in ("openai", "gemini", "groq", "anthropic", "openrouter", "ollama_local", "ollama_cloud")
     llm_config = _make_llm_config(req)
 
     brief = (req.query or "").strip()

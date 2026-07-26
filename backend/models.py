@@ -44,8 +44,28 @@ class PaperOut(BaseModel):
     too_new: bool
     focus: Literal["primary", "secondary", "off-topic"]
     relevance: float  # 0..1
+    # "cross_encoder" = focus/relevance came from an absolute threshold on a real
+    # reranker score (scibert_classify_papers) — safe to show the number. "embedding"
+    # = the CrossEncoder was unavailable and focus came from heuristic_classify_papers_free's
+    # rank-percentile fallback instead (top 30% = primary) — same field, different
+    # meaning, not calibrated against the same thresholds. See docs/asta-ui-comparison-design.md §4.
+    relevance_basis: Literal["cross_encoder", "embedding"] = "embedding"
+    evidence: List[str] = Field(default_factory=list)  # top matched abstract sentences (docs/asta-ui-comparison-design.md §5)
     why: List[str] = Field(default_factory=list)
     summary: Optional[str] = None  # plain-English summary (LLM providers only, top_n papers only)
+
+
+class QueryUnderstanding(BaseModel):
+    """What QIL (query_intelligence.py) actually produced for this query, shown to
+    the user as "How your query was read" — NOT styled as a per-paper relevance
+    rubric, since we never score individual papers against these fields (unlike
+    Asta's per-criterion evidence). See docs/asta-ui-comparison-design.md §3."""
+
+    intent: str = "general"
+    search_terms: List[str] = Field(default_factory=list)
+    excluded_terms: List[str] = Field(default_factory=list)
+    quality_modifier: str = "any"
+    source: str = "rules"  # "llm_groq" | "llm_openrouter" | "rules"
 
 
 class Stage(BaseModel):
@@ -74,6 +94,7 @@ class DoneEvent(BaseModel):
     secondary_count: int
     total_seconds: float
     provider: Provider
+    query_understanding: Optional[QueryUnderstanding] = None
 
 
 class ErrorEvent(BaseModel):

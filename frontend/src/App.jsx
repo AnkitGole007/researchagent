@@ -40,6 +40,16 @@ const PROVIDER_LABELS = {
   anthropic: "Anthropic", openrouter: "OpenRouter",
   ollama_local: "Ollama (Local)", ollama_cloud: "Ollama (Cloud)",
 };
+
+// Relevance tag labels in user language (docs/asta-ui-comparison-design.md §4).
+// The numeric score is only ever shown alongside "Relevant" — never for
+// "Somewhat Relevant"/"Off-topic" — because it's only calibrated on the
+// cross_encoder path (see Card's relevance_basis check).
+const FOCUS_LABELS = { primary: "Relevant", secondary: "Somewhat Relevant", "off-topic": "Off-topic" };
+
+// QIL's `source` field, for the "How your query was read" panel (§3) — not
+// technical jargon, just which pass produced the query breakdown.
+const QIL_SOURCE_LABELS = { llm_groq: "Groq", llm_openrouter: "OpenRouter", rules: "keyword rules" };
 const KEY_HELP = {
   openai: "Used in memory for this session only — never stored or sent anywhere but OpenAI.",
   gemini: "Get a key from Google AI Studio. Kept in memory for this session only.",
@@ -74,16 +84,41 @@ function Card({ p, i }) {
         }}>{p.rank}</div>
         <div style={{ flex:1, minWidth:0 }}>
           <div style={{ display:"flex", gap:8, marginBottom:4, flexWrap:"wrap", alignItems:"center" }}>
-            <span style={{
-              fontSize:9, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em",
-              color: p.focus==="primary" ? "var(--teal)" : "var(--dim)",
-              background: p.focus==="primary" ? "var(--teal-soft)" : "var(--line)",
-              padding:"2px 7px", borderRadius:4,
-            }}>{p.focus}</span>
+            {/* relevance_basis: only "cross_encoder" carries a calibrated score
+                (absolute threshold); "embedding" is a rank-percentile fallback with
+                a different meaning for the same field — no number shown for that
+                path. See docs/asta-ui-comparison-design.md §4. */}
+            <span
+              className="rel-tag"
+              tabIndex={p.relevance_basis === "cross_encoder" ? 0 : -1}
+              style={{
+                fontSize:9, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.08em",
+                color: p.focus==="primary" ? "var(--teal)" : "var(--dim)",
+                background: p.focus==="primary" ? "var(--teal-soft)" : "var(--line)",
+                padding:"2px 7px", borderRadius:4,
+                cursor: p.relevance_basis === "cross_encoder" ? "help" : "default",
+              }}
+            >
+              {FOCUS_LABELS[p.focus] || p.focus}
+              {p.relevance_basis === "cross_encoder" && (
+                <span className="rel-score">{Math.round(p.rel*100)}% relevant</span>
+              )}
+            </span>
             {p.venue && <span style={{ fontSize:10, color:"var(--dim)", fontWeight:500 }}>{p.venue}</span>}
           </div>
           <h3 style={{ fontSize:14, fontWeight:600, color:"var(--fg)", margin:"2px 0 5px", lineHeight:1.4, fontFamily:"var(--serif)" }}>{p.title}</h3>
           <div style={{ fontSize:11, color:"var(--dim)" }}>{p.authors.slice(0,3).join(", ")}{p.authors.length>3?" et al.":""}</div>
+          {/* Collapsed-only triage snippet — not repeated in the expanded card,
+              where it would just duplicate text already visible in the abstract. */}
+          {!open && p.evidence && p.evidence[0] && (
+            <p style={{
+              fontSize:11.5, color:"var(--dim)", fontStyle:"italic", fontFamily:"var(--serif)",
+              margin:"6px 0 0", lineHeight:1.5, opacity:0.8,
+              display:"-webkit-box", WebkitLineClamp:2, WebkitBoxOrient:"vertical", overflow:"hidden",
+            }}>
+              "{p.evidence[0]}"
+            </p>
+          )}
         </div>
         <div style={{ textAlign:"right", flexShrink:0 }}>
           <div style={{ fontSize:20, fontWeight:700, fontFamily:"var(--mono)", color:p.tooNew?"var(--warm)":"var(--teal)" }}>{p.tooNew?"—":p.score}</div>
@@ -125,7 +160,8 @@ export default function App() {
   const [q, setQ] = useState("");
   const [menu, setMenu] = useState(false);
   const [about, setAbout] = useState(false);
-  const [pipeline, setPipeline] = useState(false);
+  const [pipeline, setPipeline] = useState(false); // unused now the panel below is commented out (T-65) — left in place in case it's revisited
+  const [showQuery, setShowQuery] = useState(false);
   const [showExclude, setShowExclude] = useState(false);
   const [step, setStep] = useState(0);
   const [provider, setProvider] = useState("free");
@@ -231,6 +267,15 @@ export default function App() {
         input:focus,textarea:focus,select:focus{outline:none}
         ::selection{background:var(--teal-soft);color:var(--teal-dark)}
         textarea{font-family:var(--sans)}
+        .rel-tag{position:relative}
+        .rel-score{
+          position:absolute; bottom:calc(100% + 6px); left:0;
+          background:var(--fg); color:#fff; font-family:var(--mono); font-size:10px; font-weight:600;
+          padding:3px 7px; border-radius:5px; white-space:nowrap;
+          opacity:0; pointer-events:none; transform:translateY(3px);
+          transition:opacity 0.15s ease, transform 0.15s ease;
+        }
+        .rel-tag:hover .rel-score, .rel-tag:focus-visible .rel-score{ opacity:1; transform:translateY(0); }
       `}</style>
 
       {/* ── NAV ── */}
@@ -488,7 +533,15 @@ export default function App() {
 
           {papers.map((p,i) => <Card key={i} p={p} i={i}/>)}
 
-          {/* Pipeline dropdown */}
+          {/*
+          T-65: "How these results were found" panel removed 2026-07-25
+          (docs/asta-ui-comparison-design.md §6) — its per-stage timings (STEPS[].t)
+          were hardcoded fiction, not measured. Real per-stage instrumentation for
+          stages 1-3 was judged not worth building (they're inferred by
+          substring-matching internal log messages in runner.py, not real
+          boundaries — see the design doc). Left commented, not deleted, in case
+          real timing instrumentation is added later.
+
           <div style={{ marginTop:16 }}>
             <button onClick={() => setPipeline(!pipeline)} style={{
               background:"none", border:"none", cursor:"pointer", fontFamily:"var(--sans)",
@@ -512,6 +565,48 @@ export default function App() {
               </div>
             )}
           </div>
+          */}
+
+          {/* "How your query was read" — QIL's actual output, not a per-paper
+              rubric (we never score papers against these fields individually).
+              docs/asta-ui-comparison-design.md §3. */}
+          {meta?.query_understanding && (
+            <div style={{ marginTop:16 }}>
+              <button onClick={() => setShowQuery(!showQuery)} style={{
+                background:"none", border:"none", cursor:"pointer", fontFamily:"var(--sans)",
+                fontSize:12, color:"var(--dim)", display:"flex", alignItems:"center", gap:5, padding:"8px 0", fontWeight:500,
+              }}>
+                How your query was read <Chev open={showQuery} s={12}/>
+              </button>
+              {showQuery && (
+                <div style={{ padding:"12px 0", animation:"up 0.2s ease", fontSize:12 }}>
+                  <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
+                    <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Intent</span>
+                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.intent}</span>
+                  </div>
+                  <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
+                    <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Search terms</span>
+                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.search_terms.join(", ") || "—"}</span>
+                  </div>
+                  {meta.query_understanding.excluded_terms.length > 0 && (
+                    <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
+                      <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Excluded</span>
+                      <span style={{ color:"var(--dim)" }}>{meta.query_understanding.excluded_terms.join(", ")}</span>
+                    </div>
+                  )}
+                  {meta.query_understanding.quality_modifier !== "any" && (
+                    <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
+                      <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Quality filter</span>
+                      <span style={{ color:"var(--dim)" }}>{meta.query_understanding.quality_modifier}</span>
+                    </div>
+                  )}
+                  <div style={{ marginTop:8, fontSize:10.5, color:"var(--dim)" }}>
+                    Parsed via {QIL_SOURCE_LABELS[meta.query_understanding.source] || meta.query_understanding.source}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

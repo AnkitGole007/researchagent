@@ -180,8 +180,10 @@ class Paper:
     prediction_explanations: Optional[List[str]] = None
     semantic_relevance: Optional[float] = None
     semantic_reason: Optional[str] = None
+    matched_sentences: Optional[List[str]] = None  # full sentences behind semantic_reason's truncated display string
     focus_label: Optional[str] = None
     llm_relevance_score: Optional[float] = None
+    relevance_basis: Optional[str] = None  # "cross_encoder" | "embedding" — which classifier path set llm_relevance_score/focus_label
     venue: Optional[str] = None
     source: Optional[str] = None
     retrieval_source: Optional[str] = None   # "bm25_only" | "faiss_only" | "both" (LanceDB full-text | vector)
@@ -1200,6 +1202,7 @@ def extract_abstract_highlights(papers: List[Paper], query_brief: str) -> List[P
             scores = [float(np.dot(vec, q_vec)) for vec in s_vecs]
             scored_sentences = sorted(zip(scores, sentences), key=lambda x: x[0], reverse=True)
             top_sents = [s for _, s in scored_sentences[:2]]
+            p.matched_sentences = top_sents
             if len(top_sents) == 1:
                 p.semantic_reason = f"Matched: '{top_sents[0][:120]}...'"
             else:
@@ -1270,6 +1273,7 @@ def scibert_classify_papers(papers: List[Paper]) -> List[Paper]:
     for p in papers:
         score = p.cross_encoder_score if p.cross_encoder_score is not None else 0.0
         p.llm_relevance_score = score
+        p.relevance_basis = "cross_encoder"
         if score >= PRIMARY_THRESHOLD:
             p.focus_label = "primary"
         elif score >= SECONDARY_THRESHOLD:
@@ -1289,6 +1293,7 @@ def heuristic_classify_papers_free(candidates: List[Paper]) -> List[Paper]:
     top_k = max(1, min(n, max(10, int(0.3 * n))))
     for idx, p in enumerate(ranked):
         p.llm_relevance_score = p.semantic_relevance or 0.0
+        p.relevance_basis = "embedding"
         p.focus_label = "primary" if idx < top_k else "secondary"
         if p.semantic_reason is None:
             p.semantic_reason = "Heuristic classification based on embedding similarity."

@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from . import pipeline_core as pc
-from .models import PaperOut
+from .models import PaperOut, QueryUnderstanding
 
 # Persistent QIL cache across requests within this process — same role as
 # app.py's st.session_state["_qil_cache"], just process-scoped instead of
@@ -165,8 +165,26 @@ def _to_paper_out(p: "pc.Paper", rank: int, summary: Optional[str]) -> PaperOut:
         too_new=too_new,
         focus=(p.focus_label if p.focus_label in ("primary", "secondary", "off-topic") else "off-topic"),
         relevance=relevance,
+        relevance_basis=(p.relevance_basis if p.relevance_basis == "cross_encoder" else "embedding"),
+        evidence=p.matched_sentences or [],
         why=_clean_bullets(p.prediction_explanations),
         summary=summary,
+    )
+
+
+def _to_query_understanding(sq) -> Optional[QueryUnderstanding]:
+    """Builds the "How your query was read" payload straight from what QIL
+    produced — deliberately just the fields that exist (intent, search terms,
+    excluded terms, quality modifier), not a per-paper rubric. See
+    docs/asta-ui-comparison-design.md §3 for why the two are not the same thing."""
+    if sq is None:
+        return None
+    return QueryUnderstanding(
+        intent=sq.intent,
+        search_terms=list(sq.bm25_keywords),
+        excluded_terms=list(sq.hard_filters.get("not_terms", [])),
+        quality_modifier=sq.quality_modifier,
+        source=sq.source,
     )
 
 
@@ -242,6 +260,13 @@ def pipeline_events(req):
             candidates = payload or []
     yield _stage(current_ui_stage, "done", STAGE_NAMES[current_ui_stage], f"{len(candidates)} candidates")
 
+    # select_embedding_candidates writes its StructuredQuery into _QIL_CACHE under
+    # this same key (pipeline_core.py's Stage 0) — fetched once here and reused
+    # below, regardless of provider (QIL's own Groq/OpenRouter key is independent
+    # of the reasoning provider the user picked).
+    cached_sq = _QIL_CACHE.get(qil_key)
+    query_understanding = _to_query_understanding(cached_sq)
+
     if not candidates:
         candidates = current  # same fallback app.py uses when embedding stage returns nothing
 
@@ -268,7 +293,6 @@ def pipeline_events(req):
     # ---- Stage 5: Moneyball impact scoring ----
     yield _stage(5, "start", STAGE_NAMES[5])
     if is_llm:
-        cached_sq = _QIL_CACHE.get(qil_key)
         quality_modifier = cached_sq.quality_modifier if cached_sq else "any"
         for kind, payload, _level in _stream_call(
             _predict_citations_with_emit, used_papers, llm_config, quality_modifier,
@@ -312,4 +336,5 @@ def pipeline_events(req):
         "secondary_count": len(secondaries),
         "total_seconds": round(time.perf_counter() - t0, 1),
         "provider": req.provider,
+        "query_understanding": query_understanding.model_dump() if query_understanding else None,
     }

@@ -52,8 +52,10 @@ except ImportError:
 
 try:
     from google import genai  # type: ignore
+    from google.genai import types as genai_types  # type: ignore
 except ImportError:
     genai = None  # type: ignore
+    genai_types = None  # type: ignore
 
 try:
     from query_intelligence import analyse_query
@@ -108,6 +110,14 @@ RRF_K = 45
 # limit, B-09) so this stays conservative and env-tunable rather than guessed.
 S2_MAX_CONCURRENCY = int(os.getenv("S2_MAX_CONCURRENCY", "2"))
 LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "5"))
+
+# Every LLM SDK used in call_llm() defaults to a 600s (10 minute!) read timeout,
+# with its own internal retries on top of that -- discovered live 2026-07-26 when
+# an OpenRouter free-tier model call stalled well past what T-68's concurrency
+# fix could account for. A slow/stuck provider call was free to block far longer
+# than call_llm()'s own bounded outer retry loop was ever designed for. This caps
+# each individual attempt; call_llm's own loop (with jitter) owns all retrying.
+LLM_CALL_TIMEOUT_S = int(os.getenv("LLM_CALL_TIMEOUT_S", "45"))
 
 CONFERENCE_KEYWORDS = [
     "EMNLP", "ACL", "NAACL", "EACL",
@@ -513,7 +523,14 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
                 # All four speak the same OpenAI-compatible chat-completions API --
                 # only the base_url (set per-provider in runner.py) differs.
                 from openai import OpenAI
-                client_args = {"api_key": llm_config.api_key}
+                client_args = {
+                    "api_key": llm_config.api_key,
+                    "timeout": LLM_CALL_TIMEOUT_S,
+                    # The SDK's own internal retries would stack multiplicatively
+                    # with our outer retry loop below (each outer attempt re-running
+                    # the SDK's own retries) — this loop already owns all retry/backoff.
+                    "max_retries": 0,
+                }
                 if llm_config.api_base and llm_config.api_base.strip():
                     client_args["base_url"] = llm_config.api_base
                 client = OpenAI(**client_args)
@@ -530,7 +547,7 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
 
             elif llm_config.provider == "anthropic":
                 from anthropic import Anthropic
-                client = Anthropic(api_key=llm_config.api_key)
+                client = Anthropic(api_key=llm_config.api_key, timeout=LLM_CALL_TIMEOUT_S, max_retries=0)
                 resp = client.messages.create(
                     model=llm_config.model,
                     max_tokens=1024,
@@ -542,7 +559,10 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
             elif llm_config.provider == "gemini":
                 if genai is None:
                     raise RuntimeError("Gemini provider selected but google-genai package is not installed.")
-                client = genai.Client(api_key=llm_config.api_key)
+                client = genai.Client(
+                    api_key=llm_config.api_key,
+                    http_options=genai_types.HttpOptions(timeout=LLM_CALL_TIMEOUT_S * 1000),
+                )
                 response = client.models.generate_content(model=llm_config.model, contents=prompt)
                 if hasattr(response, "candidates") and response.candidates:
                     cand = response.candidates[0]
@@ -554,7 +574,7 @@ def call_llm(prompt: str, llm_config: LLMConfig, label: str = "") -> str:
 
             elif llm_config.provider == "groq":
                 from groq import Groq
-                client = Groq(api_key=llm_config.api_key)
+                client = Groq(api_key=llm_config.api_key, timeout=LLM_CALL_TIMEOUT_S, max_retries=0)
                 response = client.chat.completions.create(
                     model=llm_config.model,
                     messages=[
@@ -1061,6 +1081,14 @@ def select_embedding_candidates(
         import torch
         specter2_model_s1, specter2_tok_s1 = get_specter2_model()
         if specter2_model_s1 is not None and specter2_tok_s1 is not None:
+            # get_specter2_model() is a process-wide @lru_cache singleton — reassert
+            # the active adapter before every forward pass here too, mirroring
+            # specter2_vector_rerank's own reassert (B-16: adapter state on this
+            # shared model has been observed reset between load and use).
+            try:
+                specter2_model_s1.set_active_adapters("specter2_adhoc_query")
+            except Exception as _adapter_err:
+                logging.warning("[Stage1] could not reassert SPECTER2 adapter: %s", _adapter_err)
             encode_text = semantic_query if semantic_query and semantic_query.strip() else query_brief
             inputs = specter2_tok_s1(
                 [encode_text], padding=True, truncation=True, max_length=512, return_tensors="pt"
@@ -1304,13 +1332,24 @@ def heuristic_classify_papers_free(candidates: List[Paper]) -> List[Paper]:
 # MONEYBALL Impact Scoring
 # =========================
 
+# _get_s2_session() is a process-wide singleton (@lru_cache), so its pool has to
+# cover every concurrent SEARCH REQUEST at once, not just one request's own
+# S2_MAX_CONCURRENCY workers -- sizing it to S2_MAX_CONCURRENCY alone (as this
+# originally did) undersizes it the moment two searches overlap, which urllib3
+# surfaces as "Connection pool is full, discarding connection" (observed live
+# 2026-07-26 while testing two overlapping requests). Not a functional bug --
+# urllib3 just falls back to an unpooled connection -- but it pays a fresh
+# TCP+TLS handshake each time instead of reusing one. Sized for a handful of
+# concurrent searches rather than S2_MAX_CONCURRENCY workers from just one.
+_S2_POOL_SIZE = max(S2_MAX_CONCURRENCY * 5, 10)
+
+
 @lru_cache(maxsize=1)
 def _get_s2_session() -> requests.Session:
-    """Shared, connection-pool-sized session for concurrent S2 calls (T-68) —
-    pool_maxsize matches S2_MAX_CONCURRENCY so urllib3's default pool (10)
-    doesn't become an invisible serialization point under concurrency."""
+    """Shared session for concurrent S2 calls (T-68); see _S2_POOL_SIZE for why
+    its pool is sized larger than any single request's own worker count."""
     session = requests.Session()
-    adapter = HTTPAdapter(pool_maxsize=S2_MAX_CONCURRENCY, pool_connections=S2_MAX_CONCURRENCY)
+    adapter = HTTPAdapter(pool_maxsize=_S2_POOL_SIZE, pool_connections=_S2_POOL_SIZE)
     session.mount("https://", adapter)
     return session
 
@@ -1335,7 +1374,22 @@ def get_s2_citation_stats(paper: Paper, api_key: Optional[str] = None) -> int:
                     time.sleep(1 + random.uniform(0, 0.5))
         return None
 
-    if paper.arxiv_id:
+    # arxiv_id is either a real arXiv ID or "s2:<hash>" for S2-native records
+    # that never had an arXiv paper (~most of the live corpus, in practice --
+    # confirmed live 2026-07-26). Querying those as "ARXIV:s2:<hash>" always
+    # 404s before falling through to the fuzzy title search below; querying the
+    # S2 ID directly is both cheaper (no wasted round trip) and more accurate
+    # (exact match instead of a fuzzy title guess).
+    if paper.arxiv_id and paper.arxiv_id.startswith("s2:"):
+        data = fetch(
+            f"https://api.semanticscholar.org/graph/v1/paper/{paper.arxiv_id[len('s2:'):]}",
+            {"fields": "authors.citationCount"},
+        )
+        if data:
+            auth_cites = [a.get("citationCount", 0) for a in data.get("authors", []) if a.get("citationCount")]
+            if auth_cites:
+                return max(auth_cites)
+    elif paper.arxiv_id:
         data = fetch(
             f"https://api.semanticscholar.org/graph/v1/paper/ARXIV:{paper.arxiv_id.split('v')[0]}",
             {"fields": "authors.citationCount"},
@@ -1497,7 +1551,18 @@ def predict_citations_direct(
                     raw = parts[1].split("```")[0] if len(parts) > 1 else raw.split("```")[1].split("```")[0]
 
                 parsed = json.loads(raw.strip())
-                h4_utility = float(parsed.get("score", 5) * 10)
+                # dict.get(key, default) only falls back on a MISSING key, not an
+                # explicit `"score": null` -- observed live from a reasoning model
+                # (OpenRouter nemotron) that sometimes emits exactly that, which
+                # crashed here with "NoneType * int". Also guards against a
+                # numeric-looking string (e.g. "7"), which would otherwise silently
+                # string-repeat under `*` instead of raising.
+                score_val = parsed.get("score")
+                try:
+                    score_val = float(score_val) if score_val is not None else 5.0
+                except (TypeError, ValueError):
+                    score_val = 5.0
+                h4_utility = score_val * 10
 
                 if "bullets" in parsed and isinstance(parsed["bullets"], list):
                     content_bullets = [

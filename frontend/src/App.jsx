@@ -66,15 +66,13 @@ const Ext = () => <svg width="10" height="10" viewBox="0 0 12 12" fill="none" st
 
 function Card({ p, i }) {
   const [open, setOpen] = useState(false);
+  const [showAbstract, setShowAbstract] = useState(false);
   return (
-    <div onClick={() => setOpen(!open)} style={{
-      padding:"18px 20px", marginBottom:10, cursor:"pointer",
+    <div style={{
+      padding:"18px 20px", marginBottom:10,
       background:"var(--card)", borderRadius:14, border:"1px solid var(--line)",
       opacity:0, animation:`up 0.35s ease ${i*0.06}s forwards`,
-      transition:"box-shadow 0.2s",
-    }}
-    onMouseEnter={e => e.currentTarget.style.boxShadow="0 2px 12px rgba(43,107,96,0.06)"}
-    onMouseLeave={e => e.currentTarget.style.boxShadow="none"}>
+    }}>
       <div style={{ display:"flex", gap:14, alignItems:"flex-start" }}>
         <div style={{
           width:32, height:32, borderRadius:8,
@@ -106,15 +104,18 @@ function Card({ p, i }) {
             </span>
             {p.venue && <span style={{ fontSize:10, color:"var(--dim)", fontWeight:500 }}>{p.venue}</span>}
           </div>
-          <h3 style={{ fontSize:14, fontWeight:600, color:"var(--fg)", margin:"2px 0 5px", lineHeight:1.4, fontFamily:"var(--serif)" }}>{p.title}</h3>
+          <a href={p.arxiv} target="_blank" rel="noopener noreferrer" style={{
+            fontSize:14, fontWeight:600, color:"var(--teal)", textDecoration:"none",
+            margin:"2px 0 5px", lineHeight:1.4, fontFamily:"var(--serif)",
+            display:"inline-flex", alignItems:"baseline", gap:2,
+          }}>{p.title}<Ext/></a>
           <div style={{ fontSize:11, color:"var(--dim)" }}>{p.authors.slice(0,3).join(", ")}{p.authors.length>3?" et al.":""}</div>
-          {/* Collapsed-only triage snippet — not repeated in the expanded card,
-              where it would just duplicate text already visible in the abstract. */}
+          {/* Collapsed-only triage snippet — no clamp, so the full matched
+              sentence is readable without needing to expand (docs/asta-ui-comparison-design.md §5). */}
           {!open && p.evidence && p.evidence[0] && (
             <p style={{
               fontSize:11.5, color:"var(--dim)", fontStyle:"italic", fontFamily:"var(--serif)",
               margin:"6px 0 0", lineHeight:1.5, opacity:0.8,
-              display:"-webkit-box", WebkitLineClamp:2, WebkitBoxOrient:"vertical", overflow:"hidden",
             }}>
               "{p.evidence[0]}"
             </p>
@@ -125,18 +126,47 @@ function Card({ p, i }) {
           <div style={{ fontSize:8, color:"var(--dim)", textTransform:"uppercase", letterSpacing:"0.06em", marginTop:2 }}>{p.tooNew?"new":"impact"}</div>
         </div>
       </div>
+
       {open && (
         <div style={{ marginTop:14, paddingTop:14, borderTop:"1px solid var(--line)", animation:"up 0.2s ease" }}>
           {p.summary && (
             <p style={{ fontSize:13, lineHeight:1.7, color:"var(--fg)", margin:"0 0 12px", fontWeight:500 }}>{p.summary}</p>
           )}
-          <p style={{ fontSize:13, lineHeight:1.7, color:"var(--fg)", margin:"0 0 12px", opacity:0.85 }}>{p.abstract}</p>
+          {p.evidence && p.evidence.length > 0 && (
+            <div style={{ marginBottom:12 }}>
+              {p.evidence.map((e,j) => (
+                <p key={j} style={{
+                  fontSize:12.5, color:"var(--fg)", fontStyle:"italic", fontFamily:"var(--serif)",
+                  lineHeight:1.6, opacity:0.85, margin:j===0?"0 0 8px":"8px 0 0",
+                }}>"{e}"</p>
+              ))}
+            </div>
+          )}
           <div style={{ marginBottom:12 }}>
             {p.why.map((w,j) => <div key={j} style={{ fontSize:11, color:"var(--fg)", marginBottom:3, paddingLeft:10, borderLeft:"2px solid var(--teal-soft)", opacity:0.75, lineHeight:1.5 }}>{w}</div>)}
           </div>
-          <a href={p.arxiv} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize:11, color:"var(--teal)", textDecoration:"none", fontWeight:600, display:"inline-flex", alignItems:"center" }}>Open on arXiv <Ext/></a>
+          <button onClick={() => setShowAbstract(!showAbstract)} style={{
+            width:"100%", background:"var(--cream)", border:"1px solid var(--line)", borderRadius:8,
+            padding:"9px 12px", cursor:"pointer", fontFamily:"var(--sans)", fontSize:12, fontWeight:600,
+            color:"var(--fg)", display:"flex", alignItems:"center", justifyContent:"space-between",
+          }}>
+            Abstract <Chev open={showAbstract} s={12}/>
+          </button>
+          {showAbstract && (
+            <p style={{ fontSize:13, lineHeight:1.7, color:"var(--fg)", margin:"10px 0 0", opacity:0.85, animation:"up 0.2s ease" }}>{p.abstract}</p>
+          )}
         </div>
       )}
+
+      <div style={{ display:"flex", justifyContent:"flex-end" }}>
+        <button onClick={() => setOpen(!open)} style={{
+          background:"none", border:"none", cursor:"pointer", fontFamily:"var(--sans)",
+          fontSize:11, fontWeight:600, color:"var(--teal)", padding:"10px 0 0",
+          display:"flex", alignItems:"center", gap:4,
+        }}>
+          {open ? "Collapse" : "Show Evidence"} <Chev open={open} s={11}/>
+        </button>
+      </div>
     </div>
   );
 }

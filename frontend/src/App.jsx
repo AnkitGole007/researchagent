@@ -164,6 +164,7 @@ export default function App() {
   const [showQuery, setShowQuery] = useState(false);
   const [showExclude, setShowExclude] = useState(false);
   const [step, setStep] = useState(0);
+  const [stageDetails, setStageDetails] = useState({}); // stage index -> latest live detail string from the backend
   const [provider, setProvider] = useState("free");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
@@ -187,6 +188,7 @@ export default function App() {
     setError(null);
     setView("loading");
     setStep(0);
+    setStageDetails({});
     streamSearch(
       {
         query: q, exclude, date_range: range, provider, top_n: 5,
@@ -194,7 +196,10 @@ export default function App() {
         model: provider !== "free" ? (model || MODELS[provider][0] || "") : null,
       },
       {
-        onStage: (ev) => { if (ev.status === "done") setStep(ev.index + 1); },
+        onStage: (ev) => {
+          if (ev.detail) setStageDetails(prev => ({ ...prev, [ev.index]: ev.detail }));
+          if (ev.status === "done") setStep(ev.index + 1);
+        },
         onDone: (res) => {
           setPapers(res.papers);
           setMeta(res);
@@ -204,7 +209,7 @@ export default function App() {
       }
     );
   };
-  const reset = () => { setView("home"); setQ(""); setPipeline(false); setStep(0); setError(null); };
+  const reset = () => { setView("home"); setQ(""); setPipeline(false); setStep(0); setStageDetails({}); setError(null); };
 
   const primaryCount = meta ? meta.primary_count : papers.filter(p=>p.focus==="primary").length;
   const secondaryCount = meta ? meta.secondary_count : papers.filter(p=>p.focus==="secondary").length;
@@ -500,7 +505,7 @@ export default function App() {
                 }}>{i<step?"✓":s.n}</div>
                 <div style={{ flex:1 }}>
                   <span style={{ fontSize:13, fontWeight:600, color:"var(--fg)" }}>{s.name}</span>
-                  <span style={{ fontSize:11, color:"var(--dim)", marginLeft:8 }}>{s.d}</span>
+                  <span style={{ fontSize:11, color:"var(--dim)", marginLeft:8 }}>{stageDetails[i] || s.d}</span>
                 </div>
                 {i===step && <div style={{ width:6, height:6, borderRadius:"50%", background:"var(--teal)", animation:"pulse 1s infinite" }}/>}
               </div>

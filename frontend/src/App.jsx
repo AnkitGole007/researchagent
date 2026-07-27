@@ -50,6 +50,28 @@ const FOCUS_LABELS = { primary: "Relevant", secondary: "Somewhat Relevant", "off
 // QIL's `source` field, for the "How your query was read" panel (§3) — not
 // technical jargon, just which pass produced the query breakdown.
 const QIL_SOURCE_LABELS = { llm_groq: "Groq", llm_openrouter: "OpenRouter", rules: "keyword rules" };
+// Phase 1 split-pane layout (docs/asta-ui-comparison-design.md §10): results
+// are paginated in flat rank order, independent of primary/secondary grouping.
+const PAGE_SIZE = 10;
+
+// Truncated page-number list for the pagination footer, e.g. [1,'…',4,5,6,'…',12].
+// Always keeps the first/last page and a small window around the current one so
+// the footer stays a fixed height regardless of how many pages there are.
+function pageNumbers(total, current) {
+  const nums = [];
+  for (let i = 1; i <= total; i++) {
+    if (i === 1 || i === total || Math.abs(i - current) <= 1) nums.push(i);
+  }
+  const out = [];
+  let prev = 0;
+  for (const n of nums) {
+    if (prev && n - prev > 1) out.push("…");
+    out.push(n);
+    prev = n;
+  }
+  return out;
+}
+
 const KEY_HELP = {
   openai: "Used in memory for this session only — never stored or sent anywhere but OpenAI.",
   gemini: "Get a key from Google AI Studio. Kept in memory for this session only.",
@@ -185,13 +207,151 @@ function Drawer({ open, onClose, title, children, width=300 }) {
   </>;
 }
 
+// "Thinking process" rail (docs/asta-ui-comparison-design.md §10) — during an
+// active search it shows live stage progress; once results land it collapses
+// to a thin strip (click to re-expand) and, when open, doubles as the
+// search-again panel + the "How your query was read" QIL summary that used
+// to live inline in the results column.
+function Rail({
+  mode, open, onToggle,
+  q, setQ, range, setRange, provider, changeProvider, apiKey, setApiKey, model, setModel,
+  needsKey, exclude, setExclude, showExclude, setShowExclude, canSearch, onSearch, error,
+  step, stageDetails, meta,
+}) {
+  if (!open) {
+    return (
+      <button onClick={onToggle} className="rail-collapsed" style={{
+        flexShrink:0, background:"var(--card)", border:"none", borderLeft:"1px solid var(--line)",
+        cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", padding:"20px 0",
+      }}>
+        <span className="rail-collapsed-label" style={{
+          fontSize:11, fontWeight:600, color:"var(--dim)", letterSpacing:"0.06em", textTransform:"uppercase",
+        }}>Thinking process</span>
+      </button>
+    );
+  }
+  return (
+    <div className="rail" style={{
+      flexShrink:0, background:"var(--card)", borderLeft:"1px solid var(--line)",
+      padding:"20px 18px 40px", animation:"up 0.25s ease",
+    }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <span style={{ fontFamily:"var(--serif)", fontSize:14, fontWeight:600 }}>Thinking process</span>
+        {mode === "results" && (
+          <button onClick={onToggle} style={{ background:"none", border:"none", cursor:"pointer", color:"var(--dim)", padding:2 }}><XIcon/></button>
+        )}
+      </div>
+
+      {mode === "loading" && (
+        <>
+          <div style={{ fontSize:12, color:"var(--dim)", marginBottom:16, lineHeight:1.5 }}>{q}</div>
+          {STEPS.map((s,i) => (
+            <div key={i} style={{ display:"flex", alignItems:"center", gap:9, padding:"7px 0", opacity:i<step?1:i===step?0.5:0.15, transition:"opacity 0.3s" }}>
+              <div style={{
+                width:22, height:22, borderRadius:"50%", flexShrink:0,
+                background:i<step?"var(--teal)":"var(--line)", color:i<step?"#fff":"var(--dim)",
+                display:"flex", alignItems:"center", justifyContent:"center",
+                fontSize:10, fontFamily:"var(--mono)", fontWeight:600, transition:"all 0.3s",
+              }}>{i<step?"✓":s.n}</div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontSize:12, fontWeight:600 }}>{s.name}</div>
+                <div style={{ fontSize:10.5, color:"var(--dim)" }}>{stageDetails[i] || s.d}</div>
+              </div>
+              {i===step && <div style={{ width:5, height:5, borderRadius:"50%", background:"var(--teal)", animation:"pulse 1s infinite", flexShrink:0 }}/>}
+            </div>
+          ))}
+        </>
+      )}
+
+      {mode === "results" && (
+        <>
+          <textarea value={q} onChange={e=>setQ(e.target.value)} rows={3}
+            onKeyDown={e => { if(e.key==="Enter" && !e.shiftKey){e.preventDefault(); onSearch();} }}
+            style={{ width:"100%", padding:"10px 12px", borderRadius:8, border:"1px solid var(--line)", fontSize:13, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", resize:"none", lineHeight:1.5, marginBottom:8 }}
+          />
+          <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:8 }}>
+            <select value={range} onChange={e=>setRange(e.target.value)} style={{ padding:"6px 8px", borderRadius:7, border:"1px solid var(--line)", fontSize:11, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", cursor:"pointer" }}>
+              <option>Last 3 Days</option><option>Last Week</option><option>Last Month</option><option>Last 3 Months</option><option>All Time</option>
+            </select>
+            <select value={provider} onChange={e=>changeProvider(e.target.value)} style={{ padding:"6px 8px", borderRadius:7, border:"1px solid var(--line)", fontSize:11, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", cursor:"pointer" }}>
+              <option value="free">Free Local</option><option value="openai">OpenAI</option><option value="gemini">Gemini 3</option><option value="groq">Groq</option><option value="anthropic">Anthropic</option><option value="openrouter">OpenRouter</option><option value="ollama_local">Ollama (Local)</option><option value="ollama_cloud">Ollama (Cloud)</option>
+            </select>
+          </div>
+          {provider !== "free" && (
+            <div style={{ display:"flex", flexDirection:"column", gap:6, marginBottom:8 }}>
+              {needsKey && (
+                <input value={apiKey} onChange={e=>setApiKey(e.target.value)} type="password" placeholder={`${PROVIDER_LABELS[provider]} API key`}
+                  style={{ padding:"7px 9px", borderRadius:7, border:"1px solid var(--line)", fontSize:11, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)" }}
+                />
+              )}
+              {MODELS[provider].length > 0 ? (
+                <select value={model} onChange={e=>setModel(e.target.value)} style={{ padding:"7px 9px", borderRadius:7, border:"1px solid var(--line)", fontSize:11, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", cursor:"pointer" }}>
+                  {MODELS[provider].map(m => <option key={m} value={m}>{m}</option>)}
+                </select>
+              ) : (
+                <input value={model} onChange={e=>setModel(e.target.value)} type="text" placeholder={MODEL_PLACEHOLDER[provider] || "model name"}
+                  style={{ padding:"7px 9px", borderRadius:7, border:"1px solid var(--line)", fontSize:11, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)" }}
+                />
+              )}
+            </div>
+          )}
+          <button onClick={() => setShowExclude(!showExclude)} style={{ background:"none", border:"none", cursor:"pointer", fontSize:11, color:"var(--dim)", fontFamily:"var(--sans)", padding:"2px 0 8px", display:"flex", alignItems:"center", gap:3 }}>
+            Exclude topics <Chev open={showExclude} s={10}/>
+          </button>
+          {showExclude && (
+            <input value={exclude} onChange={e=>setExclude(e.target.value)} placeholder="e.g. math reasoning, scaling laws..."
+              style={{ width:"100%", padding:"7px 9px", borderRadius:7, border:"1px solid var(--line)", fontSize:11, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", marginBottom:8 }}
+            />
+          )}
+          {error && <div style={{ padding:"8px 10px", borderRadius:8, background:"#FBEAEA", border:"1px solid #E9C4C4", color:"#8A2B2B", fontSize:11, lineHeight:1.4, marginBottom:8 }}>{error}</div>}
+          <button onClick={onSearch} disabled={!canSearch} style={{
+            width:"100%", background:canSearch?"var(--teal)":"var(--line)", color:canSearch?"#fff":"var(--dim)",
+            border:"none", borderRadius:8, padding:"9px 0", fontSize:12.5, fontWeight:600, cursor:canSearch?"pointer":"default",
+            fontFamily:"var(--sans)", marginBottom:18,
+          }}>Search again</button>
+
+          {meta?.query_understanding && (
+            <div style={{ paddingTop:14, borderTop:"1px solid var(--line)" }}>
+              <div style={{ fontSize:11, fontWeight:700, color:"var(--dim)", textTransform:"uppercase", letterSpacing:"0.06em", marginBottom:10 }}>How your query was read</div>
+              <div style={{ fontSize:12 }}>
+                <div style={{ display:"flex", gap:8, padding:"3px 0" }}>
+                  <span style={{ fontWeight:600, color:"var(--fg)", width:70, flexShrink:0 }}>Intent</span>
+                  <span style={{ color:"var(--dim)" }}>{meta.query_understanding.intent}</span>
+                </div>
+                <div style={{ display:"flex", gap:8, padding:"3px 0" }}>
+                  <span style={{ fontWeight:600, color:"var(--fg)", width:70, flexShrink:0 }}>Terms</span>
+                  <span style={{ color:"var(--dim)" }}>{meta.query_understanding.search_terms.join(", ") || "—"}</span>
+                </div>
+                {meta.query_understanding.excluded_terms.length > 0 && (
+                  <div style={{ display:"flex", gap:8, padding:"3px 0" }}>
+                    <span style={{ fontWeight:600, color:"var(--fg)", width:70, flexShrink:0 }}>Excluded</span>
+                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.excluded_terms.join(", ")}</span>
+                  </div>
+                )}
+                {meta.query_understanding.quality_modifier !== "any" && (
+                  <div style={{ display:"flex", gap:8, padding:"3px 0" }}>
+                    <span style={{ fontWeight:600, color:"var(--fg)", width:70, flexShrink:0 }}>Quality</span>
+                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.quality_modifier}</span>
+                  </div>
+                )}
+                <div style={{ marginTop:8, fontSize:10, color:"var(--dim)" }}>
+                  Parsed via {QIL_SOURCE_LABELS[meta.query_understanding.source] || meta.query_understanding.source}
+                </div>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [view, setView] = useState("home");
   const [q, setQ] = useState("");
   const [menu, setMenu] = useState(false);
   const [about, setAbout] = useState(false);
   const [pipeline, setPipeline] = useState(false); // unused now the panel below is commented out (T-65) — left in place in case it's revisited
-  const [showQuery, setShowQuery] = useState(false);
   const [showExclude, setShowExclude] = useState(false);
   const [step, setStep] = useState(0);
   const [stageDetails, setStageDetails] = useState({}); // stage index -> latest live detail string from the backend
@@ -203,6 +363,8 @@ export default function App() {
   const [papers, setPapers] = useState([]);
   const [meta, setMeta] = useState(null);
   const [error, setError] = useState(null);
+  const [page, setPage] = useState(0);
+  const [railOpen, setRailOpen] = useState(true);
   const ref = useRef(null);
 
   const needsKey = provider !== "free" && provider !== "ollama_local";
@@ -219,6 +381,8 @@ export default function App() {
     setView("loading");
     setStep(0);
     setStageDetails({});
+    setPage(0);
+    setRailOpen(true);
     streamSearch(
       {
         query: q, exclude, date_range: range, provider, top_n: 5,
@@ -233,16 +397,22 @@ export default function App() {
         onDone: (res) => {
           setPapers(res.papers);
           setMeta(res);
-          setTimeout(() => setView("results"), 400);
+          setTimeout(() => { setView("results"); setRailOpen(false); }, 400);
         },
         onError: (msg) => { setError(msg); setView("home"); },
       }
     );
   };
-  const reset = () => { setView("home"); setQ(""); setPipeline(false); setStep(0); setStageDetails({}); setError(null); };
+  const reset = () => { setView("home"); setQ(""); setPipeline(false); setStep(0); setStageDetails({}); setError(null); setPage(0); setRailOpen(true); };
 
   const primaryCount = meta ? meta.primary_count : papers.filter(p=>p.focus==="primary").length;
   const secondaryCount = meta ? meta.secondary_count : papers.filter(p=>p.focus==="secondary").length;
+
+  // Flat rank-order pagination (docs/asta-ui-comparison-design.md §10/§11 #1) —
+  // page boundaries ignore primary/secondary grouping, matching the list's
+  // existing sort (rank, not group).
+  const totalPages = Math.max(1, Math.ceil(papers.length / PAGE_SIZE));
+  const pagedPapers = papers.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
 
   const exportResults = () => {
     let md = `# Research Agent — Results\n\n`;
@@ -311,6 +481,17 @@ export default function App() {
           transition:opacity 0.15s ease, transform 0.15s ease;
         }
         .rel-tag:hover .rel-score, .rel-tag:focus-visible .rel-score{ opacity:1; transform:translateY(0); }
+        .split-shell{ height:calc(100vh - 54px); overflow:hidden; }
+        .rail{ width:360px; height:100%; overflow-y:auto; }
+        .rail-collapsed{ width:44px; height:100%; }
+        .rail-collapsed-label{ writing-mode:vertical-rl; text-orientation:mixed; }
+        .results-scroll{ scrollbar-gutter:stable; }
+        @media (max-width:860px){
+          .split-shell{ flex-direction:column; height:auto; overflow:visible; }
+          .rail, .rail-collapsed{ width:100%; height:auto; overflow-y:visible; }
+          .rail-collapsed{ padding:10px 0 !important; }
+          .rail-collapsed-label{ writing-mode:horizontal-tb; text-orientation:initial; }
+        }
       `}</style>
 
       {/* ── NAV ── */}
@@ -513,135 +694,117 @@ export default function App() {
         </div>
       )}
 
-      {/* ═══════ LOADING ═══════ */}
-      {view === "loading" && (
-        <div style={{ maxWidth:"var(--max)", margin:"0 auto", padding:"64px 20px 0", animation:"fadeIn 0.3s ease" }}>
-          <div style={{ textAlign:"center", marginBottom:36 }}>
-            <div style={{ fontFamily:"var(--serif)", fontSize:20, fontWeight:600, marginBottom:4 }}>Searching...</div>
-            <div style={{ fontSize:13, color:"var(--dim)", maxWidth:400, margin:"0 auto" }}>{q}</div>
-          </div>
-          <div style={{ maxWidth:380, margin:"0 auto" }}>
-            {STEPS.map((s,i) => (
-              <div key={i} style={{
-                display:"flex", alignItems:"center", gap:10, padding:"9px 0",
-                opacity:i<step?1:i===step?0.5:0.15, transition:"opacity 0.3s",
-              }}>
-                <div style={{
-                  width:26, height:26, borderRadius:"50%", flexShrink:0,
-                  background:i<step?"var(--teal)":"var(--line)",
-                  color:i<step?"#fff":"var(--dim)",
-                  display:"flex", alignItems:"center", justifyContent:"center",
-                  fontSize:11, fontFamily:"var(--mono)", fontWeight:600, transition:"all 0.3s",
-                }}>{i<step?"✓":s.n}</div>
-                <div style={{ flex:1 }}>
-                  <span style={{ fontSize:13, fontWeight:600, color:"var(--fg)" }}>{s.name}</span>
-                  <span style={{ fontSize:11, color:"var(--dim)", marginLeft:8 }}>{stageDetails[i] || s.d}</span>
-                </div>
-                {i===step && <div style={{ width:6, height:6, borderRadius:"50%", background:"var(--teal)", animation:"pulse 1s infinite" }}/>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ═══════ RESULTS ═══════ */}
-      {view === "results" && (
-        <div style={{ maxWidth:"var(--max)", margin:"0 auto", padding:"24px 20px 80px", animation:"fadeIn 0.3s ease" }}>
-          <div style={{ marginBottom:20, paddingBottom:16, borderBottom:"1px solid var(--line)" }}>
-            <div style={{ fontSize:12, color:"var(--dim)", marginBottom:4, textTransform:"uppercase", letterSpacing:"0.06em", fontWeight:600 }}>Results for</div>
-            <div style={{ fontSize:17, fontFamily:"var(--serif)", fontWeight:600, lineHeight:1.3, marginBottom:8 }}>{q}</div>
-            <div style={{ fontSize:11, color:"var(--dim)", display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
-              <span>{range}</span>
-              <span style={{opacity:0.3}}>·</span>
-              <span>{primaryCount} primary, {secondaryCount} secondary</span>
-              <span style={{opacity:0.3}}>·</span>
-              <span>ranked by impact</span>
-              <span style={{ marginLeft:"auto" }}>
-                <button onClick={exportResults} style={{
-                  background:"none", border:"1px solid var(--line)", borderRadius:8,
-                  padding:"5px 12px", fontSize:10, color:"var(--dim)", cursor:"pointer",
-                  fontFamily:"var(--sans)", fontWeight:600,
-                }}>↓ Export</button>
-              </span>
-            </div>
-          </div>
-
-          {papers.map((p,i) => <Card key={i} p={p} i={i}/>)}
-
-          {/*
-          T-65: "How these results were found" panel removed 2026-07-25
-          (docs/asta-ui-comparison-design.md §6) — its per-stage timings (STEPS[].t)
-          were hardcoded fiction, not measured. Real per-stage instrumentation for
-          stages 1-3 was judged not worth building (they're inferred by
-          substring-matching internal log messages in runner.py, not real
-          boundaries — see the design doc). Left commented, not deleted, in case
-          real timing instrumentation is added later.
-
-          <div style={{ marginTop:16 }}>
-            <button onClick={() => setPipeline(!pipeline)} style={{
-              background:"none", border:"none", cursor:"pointer", fontFamily:"var(--sans)",
-              fontSize:12, color:"var(--dim)", display:"flex", alignItems:"center", gap:5, padding:"8px 0", fontWeight:500,
-            }}>
-              How these results were found <Chev open={pipeline} s={12}/>
-            </button>
-            {pipeline && (
-              <div style={{ padding:"12px 0", animation:"up 0.2s ease" }}>
-                {STEPS.map((s,i) => (
-                  <div key={i} style={{ display:"flex", gap:8, padding:"4px 0", fontSize:11, color:"var(--dim)" }}>
-                    <span style={{ fontFamily:"var(--mono)", fontWeight:600, color:"var(--teal)", width:12 }}>{s.n}</span>
-                    <span style={{ fontWeight:600, color:"var(--fg)", width:88 }}>{s.name}</span>
-                    <span>{s.d}</span>
-                    <span style={{ marginLeft:"auto", fontFamily:"var(--mono)" }}>{s.t}</span>
-                  </div>
-                ))}
-                <div style={{ marginTop:8, fontSize:11, color:"var(--teal)", background:"var(--teal-soft)", padding:"8px 12px", borderRadius:8, fontWeight:500 }}>
-                  Total: {meta ? meta.total_seconds : "—"}s · {PROVIDER_LABELS[provider] || "Local"}
-                </div>
+      {/* ═══════ LOADING + RESULTS (split-pane, docs/asta-ui-comparison-design.md §10) ═══════ */}
+      {(view === "loading" || view === "results") && (
+        <div className="split-shell" style={{ display:"flex", alignItems:"stretch", animation:"fadeIn 0.3s ease" }}>
+          <div style={{ flex:1, minWidth:0, display:"flex", flexDirection:"column", height:"100%", minHeight:0 }}>
+            {view === "loading" && (
+              <div style={{ textAlign:"center", padding:"96px 20px", color:"var(--dim)", fontSize:13 }}>
+                Results will appear on the left once the search finishes — track progress in the rail.
               </div>
             )}
-          </div>
-          */}
 
-          {/* "How your query was read" — QIL's actual output, not a per-paper
-              rubric (we never score papers against these fields individually).
-              docs/asta-ui-comparison-design.md §3. */}
-          {meta?.query_understanding && (
-            <div style={{ marginTop:16 }}>
-              <button onClick={() => setShowQuery(!showQuery)} style={{
-                background:"none", border:"none", cursor:"pointer", fontFamily:"var(--sans)",
-                fontSize:12, color:"var(--dim)", display:"flex", alignItems:"center", gap:5, padding:"8px 0", fontWeight:500,
-              }}>
-                How your query was read <Chev open={showQuery} s={12}/>
-              </button>
-              {showQuery && (
-                <div style={{ padding:"12px 0", animation:"up 0.2s ease", fontSize:12 }}>
-                  <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
-                    <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Intent</span>
-                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.intent}</span>
-                  </div>
-                  <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
-                    <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Search terms</span>
-                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.search_terms.join(", ") || "—"}</span>
-                  </div>
-                  {meta.query_understanding.excluded_terms.length > 0 && (
-                    <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
-                      <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Excluded</span>
-                      <span style={{ color:"var(--dim)" }}>{meta.query_understanding.excluded_terms.join(", ")}</span>
-                    </div>
-                  )}
-                  {meta.query_understanding.quality_modifier !== "any" && (
-                    <div style={{ display:"flex", gap:8, padding:"4px 0" }}>
-                      <span style={{ fontWeight:600, color:"var(--fg)", width:88, flexShrink:0 }}>Quality filter</span>
-                      <span style={{ color:"var(--dim)" }}>{meta.query_understanding.quality_modifier}</span>
-                    </div>
-                  )}
-                  <div style={{ marginTop:8, fontSize:10.5, color:"var(--dim)" }}>
-                    Parsed via {QIL_SOURCE_LABELS[meta.query_understanding.source] || meta.query_understanding.source}
+            {view === "results" && (
+              <>
+                {/* Fixed header — stays in place while the list below scrolls. */}
+                <div style={{ padding:"20px 20px 14px", borderBottom:"1px solid var(--line)", flexShrink:0 }}>
+                  <div style={{ fontSize:12, color:"var(--dim)", marginBottom:4, textTransform:"uppercase", letterSpacing:"0.06em", fontWeight:600 }}>Results for</div>
+                  <div style={{ fontSize:17, fontFamily:"var(--serif)", fontWeight:600, lineHeight:1.3, marginBottom:8 }}>{q}</div>
+                  <div style={{ fontSize:11, color:"var(--dim)", display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+                    <span>{range}</span>
+                    <span style={{opacity:0.3}}>·</span>
+                    <span>{primaryCount} primary, {secondaryCount} secondary</span>
+                    <span style={{opacity:0.3}}>·</span>
+                    <span>ranked by impact</span>
+                    <span style={{ marginLeft:"auto" }}>
+                      <button onClick={exportResults} style={{
+                        background:"none", border:"1px solid var(--line)", borderRadius:8,
+                        padding:"5px 12px", fontSize:10, color:"var(--dim)", cursor:"pointer",
+                        fontFamily:"var(--sans)", fontWeight:600,
+                      }}>↓ Export</button>
+                    </span>
                   </div>
                 </div>
-              )}
-            </div>
-          )}
+
+                {/* Scrollable list — the only part of the shell that scrolls; rail and header/footer stay put. */}
+                <div className="results-scroll" style={{ flex:1, minHeight:0, overflowY:"auto", padding:"16px 20px" }}>
+                  {pagedPapers.map((p,i) => <Card key={page*PAGE_SIZE+i} p={p} i={i}/>)}
+
+                  {/*
+                  T-65: "How these results were found" panel removed 2026-07-25
+                  (docs/asta-ui-comparison-design.md §6) — its per-stage timings (STEPS[].t)
+                  were hardcoded fiction, not measured. Real per-stage instrumentation for
+                  stages 1-3 was judged not worth building (they're inferred by
+                  substring-matching internal log messages in runner.py, not real
+                  boundaries — see the design doc). Left commented, not deleted, in case
+                  real timing instrumentation is added later.
+
+                  <div style={{ marginTop:16 }}>
+                    <button onClick={() => setPipeline(!pipeline)} style={{
+                      background:"none", border:"none", cursor:"pointer", fontFamily:"var(--sans)",
+                      fontSize:12, color:"var(--dim)", display:"flex", alignItems:"center", gap:5, padding:"8px 0", fontWeight:500,
+                    }}>
+                      How these results were found <Chev open={pipeline} s={12}/>
+                    </button>
+                    {pipeline && (
+                      <div style={{ padding:"12px 0", animation:"up 0.2s ease" }}>
+                        {STEPS.map((s,i) => (
+                          <div key={i} style={{ display:"flex", gap:8, padding:"4px 0", fontSize:11, color:"var(--dim)" }}>
+                            <span style={{ fontFamily:"var(--mono)", fontWeight:600, color:"var(--teal)", width:12 }}>{s.n}</span>
+                            <span style={{ fontWeight:600, color:"var(--fg)", width:88 }}>{s.name}</span>
+                            <span>{s.d}</span>
+                            <span style={{ marginLeft:"auto", fontFamily:"var(--mono)" }}>{s.t}</span>
+                          </div>
+                        ))}
+                        <div style={{ marginTop:8, fontSize:11, color:"var(--teal)", background:"var(--teal-soft)", padding:"8px 12px", borderRadius:8, fontWeight:500 }}>
+                          Total: {meta ? meta.total_seconds : "—"}s · {PROVIDER_LABELS[provider] || "Local"}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  */}
+                </div>
+
+                {/* Fixed footer — Prev/Next arrows + numbered pages, doesn't scroll with the list. */}
+                {totalPages > 1 && (
+                  <div style={{ flexShrink:0, borderTop:"1px solid var(--line)", padding:"10px 20px", display:"flex", justifyContent:"center", alignItems:"center", gap:5 }}>
+                    <button onClick={() => setPage(p => p-1)} disabled={page===0} style={{
+                      background:"none", border:"none", borderRadius:7, width:28, height:28,
+                      fontSize:13, fontWeight:600, fontFamily:"var(--sans)", cursor: page===0 ? "default" : "pointer",
+                      color: page===0 ? "var(--dim)" : "var(--fg)", opacity: page===0?0.4:1,
+                    }}>←</button>
+                    {pageNumbers(totalPages, page+1).map((n, i) => n === "…" ? (
+                      <span key={`e${i}`} style={{ fontSize:12, color:"var(--dim)", padding:"0 2px" }}>…</span>
+                    ) : (
+                      <button key={n} onClick={() => setPage(n-1)} style={{
+                        background: n===page+1 ? "var(--teal)" : "none",
+                        color: n===page+1 ? "#fff" : "var(--fg)",
+                        border: n===page+1 ? "none" : "1px solid var(--line)",
+                        borderRadius:7, width:28, height:28, fontSize:12, fontWeight:600,
+                        fontFamily:"var(--sans)", cursor:"pointer",
+                      }}>{n}</button>
+                    ))}
+                    <button onClick={() => setPage(p => p+1)} disabled={page>=totalPages-1} style={{
+                      background:"none", border:"none", borderRadius:7, width:28, height:28,
+                      fontSize:13, fontWeight:600, fontFamily:"var(--sans)", cursor: page>=totalPages-1 ? "default" : "pointer",
+                      color: page>=totalPages-1 ? "var(--dim)" : "var(--fg)", opacity: page>=totalPages-1?0.4:1,
+                    }}>→</button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          <Rail
+            mode={view} open={railOpen} onToggle={() => setRailOpen(o => !o)}
+            q={q} setQ={setQ} range={range} setRange={setRange}
+            provider={provider} changeProvider={changeProvider}
+            apiKey={apiKey} setApiKey={setApiKey} model={model} setModel={setModel}
+            needsKey={needsKey} exclude={exclude} setExclude={setExclude}
+            showExclude={showExclude} setShowExclude={setShowExclude}
+            canSearch={canSearch} onSearch={search} error={error}
+            step={step} stageDetails={stageDetails} meta={meta}
+          />
         </div>
       )}
     </div>

@@ -83,6 +83,8 @@ const KEY_HELP = {
 
 const Chev = ({open,s=14}) => <svg width={s} height={s} viewBox="0 0 16 16" fill="none" style={{transform:open?"rotate(180deg)":"none",transition:"transform 0.2s"}}><path d="M4 6L8 10L12 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>;
 const XIcon = () => <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><path d="M5 5L15 15M15 5L5 15" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>;
+const SunIcon = () => <svg width="17" height="17" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="4" stroke="currentColor" strokeWidth="1.5"/><path d="M10 1.5V3.5M10 16.5V18.5M18.5 10H16.5M3.5 10H1.5M15.9 4.1L14.5 5.5M5.5 14.5L4.1 15.9M15.9 15.9L14.5 14.5M5.5 5.5L4.1 4.1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>;
+const MoonIcon = () => <svg width="17" height="17" viewBox="0 0 20 20" fill="none"><path d="M17 12.5A7.5 7.5 0 1 1 7.5 3a6 6 0 0 0 9.5 9.5Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"/></svg>;
 const MenuIcon = () => <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 6H17M3 10H17M3 14H17" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>;
 const Ext = () => <svg width="10" height="10" viewBox="0 0 12 12" fill="none" style={{marginLeft:3,opacity:0.4}}><path d="M4.5 1.5H2C1.72 1.5 1.5 1.72 1.5 2V10C1.5 10.28 1.72 10.5 2 10.5H10C10.28 10.5 10.5 10.28 10.5 10V7.5M7 1.5H10.5V5M10.5 1.5L5.5 6.5" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round"/></svg>;
 
@@ -90,7 +92,7 @@ function Card({ p, i }) {
   const [open, setOpen] = useState(false);
   const [showAbstract, setShowAbstract] = useState(false);
   return (
-    <div style={{
+    <div className="result-card" style={{
       padding:"18px 20px", marginBottom:10,
       background:"var(--card)", borderRadius:14, border:"1px solid var(--line)",
       opacity:0, animation:`up 0.35s ease ${i*0.06}s forwards`,
@@ -245,6 +247,28 @@ function Rail({
       {mode === "loading" && (
         <>
           <div style={{ fontSize:12, color:"var(--dim)", marginBottom:16, lineHeight:1.5 }}>{q}</div>
+
+          {/* Real animated progress bar (docs/asta-ui-comparison-design.md Phase 2) — driven
+              by the same live `step` index as the checklist below, not a fake timer. The
+              per-stage checklist stays too: it carries real live detail text (stageDetails)
+              that a bar alone can't show, so this is additive, not a literal replacement. */}
+          <div style={{ marginBottom:18 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", fontSize:10.5, color:"var(--dim)", marginBottom:6 }}>
+              <span>Step {Math.min(step, STEPS.length)} of {STEPS.length}</span>
+              <span>{Math.round((Math.min(step, STEPS.length) / STEPS.length) * 100)}%</span>
+            </div>
+            <div style={{ height:6, borderRadius:3, background:"var(--line)", overflow:"hidden" }}>
+              <div
+                className={step < STEPS.length ? "progress-fill" : ""}
+                style={{
+                  width:`${Math.min(100, (step / STEPS.length) * 100)}%`, height:"100%", borderRadius:3,
+                  background:"linear-gradient(90deg, var(--teal), var(--teal-grad-3))",
+                  transition:"width 0.5s cubic-bezier(0.4,0,0.2,1)",
+                }}
+              />
+            </div>
+          </div>
+
           {STEPS.map((s,i) => (
             <div key={i} style={{ display:"flex", alignItems:"center", gap:9, padding:"7px 0", opacity:i<step?1:i===step?0.5:0.15, transition:"opacity 0.3s" }}>
               <div style={{
@@ -303,7 +327,7 @@ function Rail({
               style={{ width:"100%", padding:"7px 9px", borderRadius:7, border:"1px solid var(--line)", fontSize:11, fontFamily:"var(--sans)", background:"var(--cream)", color:"var(--fg)", marginBottom:8 }}
             />
           )}
-          {error && <div style={{ padding:"8px 10px", borderRadius:8, background:"#FBEAEA", border:"1px solid #E9C4C4", color:"#8A2B2B", fontSize:11, lineHeight:1.4, marginBottom:8 }}>{error}</div>}
+          {error && <div style={{ padding:"8px 10px", borderRadius:8, background:"var(--error-bg)", border:"1px solid var(--error-border)", color:"var(--error-fg)", fontSize:11, lineHeight:1.4, marginBottom:8 }}>{error}</div>}
           <button onClick={onSearch} disabled={!canSearch} style={{
             width:"100%", background:canSearch?"var(--teal)":"var(--line)", color:canSearch?"#fff":"var(--dim)",
             border:"none", borderRadius:8, padding:"9px 0", fontSize:12.5, fontWeight:600, cursor:canSearch?"pointer":"default",
@@ -365,7 +389,13 @@ export default function App() {
   const [error, setError] = useState(null);
   const [page, setPage] = useState(0);
   const [railOpen, setRailOpen] = useState(true);
+  const [theme, setTheme] = useState(() =>
+    localStorage.getItem("theme") ||
+    (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+  );
   const ref = useRef(null);
+
+  useEffect(() => { localStorage.setItem("theme", theme); }, [theme]);
 
   const needsKey = provider !== "free" && provider !== "ollama_local";
   const canSearch = q.trim() && (!needsKey || apiKey.trim());
@@ -443,7 +473,7 @@ export default function App() {
   useEffect(() => { if (view==="home" && ref.current) ref.current.focus(); }, [view]);
 
   return (
-    <div style={{ minHeight:"100vh", background:"var(--cream)", color:"var(--fg)", fontFamily:"var(--sans)" }}>
+    <div className="app-root" data-theme={theme} style={{ minHeight:"100vh", background:"var(--cream)", color:"var(--fg)", fontFamily:"var(--sans)" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap');
         :root {
@@ -459,10 +489,34 @@ export default function App() {
           --teal-grad-2: #2B6B60;
           --teal-grad-3: #4A9B8E;
           --warm: #B8860B;
+          --nav-bg: rgba(250,247,242,0.92);
+          --card-shadow: 0 6px 20px rgba(28,48,65,0.10);
+          --error-bg: #FBEAEA;
+          --error-border: #E9C4C4;
+          --error-fg: #8A2B2B;
           --serif: 'Source Serif 4', Georgia, serif;
           --sans: 'DM Sans', system-ui, sans-serif;
           --mono: 'JetBrains Mono', monospace;
           --max: 620px;
+        }
+        [data-theme="dark"] {
+          --cream: #12181D;
+          --card: #1B232B;
+          --fg: #E7ECEE;
+          --dim: #8C99A3;
+          --line: #2B343C;
+          --teal: #4FB3A0;
+          --teal-dark: #6BC7B6;
+          --teal-soft: #1E3630;
+          --teal-grad-1: #0B1620;
+          --teal-grad-2: #1B332F;
+          --teal-grad-3: #3E8B7D;
+          --warm: #E0AC4B;
+          --nav-bg: rgba(18,24,29,0.85);
+          --card-shadow: 0 6px 20px rgba(0,0,0,0.45);
+          --error-bg: #3A2020;
+          --error-border: #5C3232;
+          --error-fg: #E8A5A5;
         }
         @keyframes up { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
         @keyframes fadeIn { from{opacity:0} to{opacity:1} }
@@ -475,8 +529,13 @@ export default function App() {
         .rel-tag{position:relative}
         .rel-score{
           position:absolute; bottom:calc(100% + 6px); left:0;
-          background:var(--fg); color:#fff; font-family:var(--mono); font-size:10px; font-weight:600;
-          padding:3px 7px; border-radius:5px; white-space:nowrap;
+          /* --fg/--cream are always an opposite-luminance pair in both themes (dark
+             navy fg / near-white cream in light mode; near-white fg / near-black cream
+             in dark mode) — pairing them here keeps the chip readable in both instead
+             of the old hardcoded white text, which went near-invisible against --fg's
+             light dark-mode value. */
+          background:var(--fg); color:var(--cream); font-family:var(--mono); font-size:10px; font-weight:600;
+          padding:3px 7px; border-radius:5px; white-space:nowrap; box-shadow:0 4px 12px rgba(0,0,0,0.25);
           opacity:0; pointer-events:none; transform:translateY(3px);
           transition:opacity 0.15s ease, transform 0.15s ease;
         }
@@ -486,6 +545,18 @@ export default function App() {
         .rail-collapsed{ width:44px; height:100%; }
         .rail-collapsed-label{ writing-mode:vertical-rl; text-orientation:mixed; }
         .results-scroll{ scrollbar-gutter:stable; }
+        .progress-fill{ position:relative; overflow:hidden; }
+        .progress-fill::after{
+          content:""; position:absolute; inset:0;
+          background:linear-gradient(90deg, transparent, rgba(255,255,255,0.45), transparent);
+          background-size:200% 100%; animation:shimmer 1.4s linear infinite;
+        }
+        @keyframes shimmer{ 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        .app-root{ transition:background-color 0.2s ease, color 0.2s ease; }
+        .result-card{ transition:transform 0.15s ease, box-shadow 0.15s ease; }
+        .result-card:hover{ transform:translateY(-2px); box-shadow:var(--card-shadow); }
+        button:not(:disabled){ transition:transform 0.08s ease; }
+        button:not(:disabled):active{ transform:scale(0.96); }
         @media (max-width:860px){
           .split-shell{ flex-direction:column; height:auto; overflow:visible; }
           .rail, .rail-collapsed{ width:100%; height:auto; overflow-y:visible; }
@@ -498,7 +569,7 @@ export default function App() {
       <nav style={{
         position:"sticky", top:0, zIndex:50, height:54,
         display:"flex", alignItems:"center", justifyContent:"space-between",
-        padding:"0 22px", background:"rgba(250,247,242,0.92)", backdropFilter:"blur(10px)",
+        padding:"0 22px", background:"var(--nav-bg)", backdropFilter:"blur(10px)",
         borderBottom:"1px solid var(--line)",
       }}>
         <div onClick={reset} style={{ cursor:"pointer", display:"flex", alignItems:"center", gap:9 }}>
@@ -510,7 +581,12 @@ export default function App() {
           }}>b²</div>
           <span style={{ fontFamily:"var(--serif)", fontSize:16, fontWeight:600, color:"var(--fg)" }}>Research Agent</span>
         </div>
-        <button onClick={() => setMenu(true)} style={{ background:"none", border:"none", cursor:"pointer", color:"var(--fg)", padding:4 }}><MenuIcon/></button>
+        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+          <button onClick={() => setTheme(t => t==="dark" ? "light" : "dark")} title="Toggle dark mode" style={{ background:"none", border:"none", cursor:"pointer", color:"var(--fg)", padding:4, display:"flex" }}>
+            {theme==="dark" ? <SunIcon/> : <MoonIcon/>}
+          </button>
+          <button onClick={() => setMenu(true)} style={{ background:"none", border:"none", cursor:"pointer", color:"var(--fg)", padding:4 }}><MenuIcon/></button>
+        </div>
       </nav>
 
       {/* ── MENU DRAWER ── */}
@@ -675,7 +751,7 @@ export default function App() {
             </div>
 
             {error && (
-              <div style={{ marginTop:16, padding:"10px 14px", borderRadius:10, background:"#FBEAEA", border:"1px solid #E9C4C4", color:"#8A2B2B", fontSize:12.5, lineHeight:1.5 }}>
+              <div style={{ marginTop:16, padding:"10px 14px", borderRadius:10, background:"var(--error-bg)", border:"1px solid var(--error-border)", color:"var(--error-fg)", fontSize:12.5, lineHeight:1.5 }}>
                 {error}
               </div>
             )}

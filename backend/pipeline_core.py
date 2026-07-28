@@ -852,18 +852,38 @@ def minilm_vector_rerank(papers: List[Paper], query_brief: str, n2: int = 300) -
     return [p for _, p in scored[:k]]
 
 
+STAGE1_MIN_CANDIDATES = 50
+
+
+def _join_where(*parts: Optional[str]) -> Optional[str]:
+    """AND-join the non-empty clauses, each parenthesised. None when all are empty."""
+    kept = [p for p in parts if p]
+    return " AND ".join(f"({p})" for p in kept) if kept else None
+
+
 def _lancedb_hybrid_stage1(
     table,
     papers: List[Paper],
     fts_query: str,
     q_vec: Optional[np.ndarray],
     top_k: int = 400,
-    quality_where: Optional[str] = None,
+    extra_where: Optional[str] = None,
+    w_fts: float = 1.0,
+    w_vec: float = 1.0,
 ) -> tuple:
     """
     LanceDB FTS + vector search with manual RRF.
     Returns (stage1_papers, paper_vectors). paper_vectors: {arxiv_id: list[float]}.
     Search scoped globally then intersected with the `papers` pool (already date-filtered).
+
+    `w_fts`/`w_vec` scale each RRF arm — QIL's intent-derived weights
+    (`StructuredQuery.rrf_weight_bm25`/`.rrf_weight_faiss`, B4/Gap 9). 1.0/1.0 is
+    the neutral default, i.e. the plain RRF this used before intent was wired.
+
+    `extra_where` is AND-ed with the pool's own date bounds and applied to both
+    arms (the vector arm prefilters, so it narrows ANN candidates rather than
+    trimming afterwards). The caller composes it from the quality modifier and
+    QIL's hard filters — see `_stage1_where_parts`.
     """
     if not papers:
         return [], {}
@@ -883,7 +903,7 @@ def _lancedb_hybrid_stage1(
             min_date, max_date = min(dates), max(dates)
             pool_date_where = f"submitted_date >= '{min_date}' AND submitted_date <= '{max_date}T23:59:59'"
 
-    scope_where_parts = [p for p in (pool_date_where, quality_where) if p]
+    scope_where_parts = [p for p in (pool_date_where, extra_where) if p]
     scope_where = " AND ".join(f"({p})" for p in scope_where_parts) if scope_where_parts else None
 
     try:
@@ -934,7 +954,10 @@ def _lancedb_hybrid_stage1(
 
     scored: List[tuple] = []
     for aid in union_ids:
-        rrf = 1.0 / (RRF_K + fts_ranks.get(aid, n_fts + 1)) + 1.0 / (RRF_K + vec_ranks.get(aid, n_vec + 1))
+        rrf = (
+            w_fts / (RRF_K + fts_ranks.get(aid, n_fts + 1))
+            + w_vec / (RRF_K + vec_ranks.get(aid, n_vec + 1))
+        )
         scored.append((rrf, aid))
     scored.sort(reverse=True)
 
@@ -1111,33 +1134,61 @@ def select_embedding_candidates(
     if quality_where:
         emit(f"⏱ Stage 1: quality filter active — `{quality_where}`")
 
+    # R6/R7: brief-sourced filters. Kept separate from quality_where because they
+    # relax in a defined order when the pool starves — see the attempt ladder below.
+    date_where = sq.hard_filters.to_lancedb_filter() if sq else None
+    entity_where = sq.hard_filters.to_entity_filter() if sq else None
+    if date_where:
+        emit(f"⏱ Stage 1: date window from brief — `{date_where}` (on top of the UI window)")
+    if entity_where:
+        emit(f"⏱ Stage 1: author/venue filter from brief — `{entity_where}`")
+
+    # Gap 9 / R4: intent finally reaches retrieval. These two properties existed on
+    # StructuredQuery since QIL was written but had no call site — every intent
+    # scored identically until now.
+    w_fts = sq.rrf_weight_bm25 if sq else 1.0
+    w_vec = sq.rrf_weight_faiss if sq else 1.0
+    if sq and (w_fts != 1.0 or w_vec != 1.0):
+        emit(f"⏱ Stage 1: intent `{sq.intent}` → RRF weights FTS×{w_fts} · vector×{w_vec}")
+
     if lancedb_table is not None:
-        stage1_papers, paper_vectors = _lancedb_hybrid_stage1(
-            lancedb_table, papers, fts_query_str, q_vec_stage1, top_k=adaptive_k,
-            quality_where=quality_where,
-        )
-        if len(stage1_papers) < 50:
-            emit(
-                f"Stage 1 returned {len(stage1_papers)} candidates (below 50 threshold) "
-                "— retrying with a wider search before falling back.",
-                "info",
+        # Relax ladder, narrowest first. Widening top_k comes before dropping any
+        # filter (a wider search still honours what the user asked for). Entity
+        # filters relax before dates: `authors` is a JSON-encoded column, so a
+        # common surname over-matches, whereas a stated year is rarely accidental.
+        # The UI date window lives in `pool_date_where` and is never dropped here.
+        # Reuses _lancedb_hybrid_stage1's own search_k cap (min(top_k*5, 6000));
+        # top_k=1200 pushes it to the max, so these are wider single queries,
+        # not a new query mechanism.
+        attempts: List[tuple] = [
+            (None, adaptive_k, (quality_where, date_where, entity_where)),
+            ("a wider search", 1200, (quality_where, date_where, entity_where)),
+        ]
+        if entity_where:
+            attempts.append(
+                ("the author/venue filter dropped", 1200, (quality_where, date_where))
             )
-            # Reuses _lancedb_hybrid_stage1's own search_k cap (min(top_k*5, 6000));
-            # top_k=1200 pushes it to the max, so this is just a wider single query,
-            # not a new query mechanism.
-            stage1_papers, paper_vectors = _lancedb_hybrid_stage1(
-                lancedb_table, papers, fts_query_str, q_vec_stage1, top_k=1200,
-                quality_where=quality_where,
+        if date_where:
+            attempts.append(
+                ("the brief's date window dropped, UI window kept", 1200, (quality_where,))
             )
-            if len(stage1_papers) < 50:
+
+        stage1_papers: List[Paper] = []
+        for relax_label, attempt_k, where_parts in attempts:
+            if relax_label:
                 emit(
-                    f"Stage 1 still only {len(stage1_papers)} candidates after widening "
-                    "— using full pool as fallback.",
+                    f"Stage 1 returned {len(stage1_papers)} candidates "
+                    f"(below {STAGE1_MIN_CANDIDATES} threshold) — retrying with {relax_label}.",
                     "info",
                 )
-                stage1_papers = papers
-                paper_vectors = {}
-        else:
+            stage1_papers, paper_vectors = _lancedb_hybrid_stage1(
+                lancedb_table, papers, fts_query_str, q_vec_stage1, top_k=attempt_k,
+                extra_where=_join_where(*where_parts), w_fts=w_fts, w_vec=w_vec,
+            )
+            if len(stage1_papers) >= STAGE1_MIN_CANDIDATES:
+                break
+
+        if len(stage1_papers) >= STAGE1_MIN_CANDIDATES:
             n_both = sum(1 for p in stage1_papers if p.retrieval_source == "both")
             n_fts_only = sum(1 for p in stage1_papers if p.retrieval_source == "bm25_only")
             n_vec_only = sum(1 for p in stage1_papers if p.retrieval_source == "faiss_only")
@@ -1145,12 +1196,20 @@ def select_embedding_candidates(
                 f"✅ RRF Stage 1: {len(stage1_papers)} candidates — "
                 f"🔵 {n_both} both · 🟠 {n_fts_only} FTS-only · 🟣 {n_vec_only} vector-only"
             )
+        else:
+            emit(
+                f"Stage 1 still only {len(stage1_papers)} candidates after relaxing "
+                "— using full pool as fallback.",
+                "info",
+            )
+            stage1_papers = papers
+            paper_vectors = {}
     else:
         emit("⚠️ LanceDB unavailable — using full pool as Stage 1 fallback.", "warning")
         stage1_papers = papers
 
     # ─── P-10: QIL not_terms filter — applied once after Stage 1 ──────────
-    qil_not_terms = (sq.hard_filters.get("not_terms", []) if sq else [])
+    qil_not_terms = (sq.hard_filters.not_terms if sq else [])
     if qil_not_terms:
         before_not = len(stage1_papers)
         stage1_papers = [

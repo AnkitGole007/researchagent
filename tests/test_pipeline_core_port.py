@@ -61,3 +61,37 @@ def test_select_embedding_candidates_signature_matches_app():
     params = list(inspect.signature(pc.select_embedding_candidates).parameters)
     assert "emit" in params
     assert "qil_cache" in params
+
+
+def test_join_where_composes_and_short_circuits():
+    assert pc._join_where(None, None) is None
+    assert pc._join_where("year >= 2020") == "(year >= 2020)"
+    assert pc._join_where("a", None, "b") == "(a) AND (b)"
+
+
+# ─── R6/R7: brief-sourced filters must be visible, not just applied ───────────
+
+def test_query_understanding_surfaces_brief_filters():
+    """A filter narrowing the search that the user can't see is one they can't correct."""
+    from backend.runner import _to_query_understanding, _date_window_label
+    from query_intelligence import HardFilters, StructuredQuery
+
+    sq = StructuredQuery(
+        intent="specific",
+        bm25_keywords=["diffusion"],
+        quality_modifier="influential",
+        source="rules",
+        hard_filters=HardFilters(
+            not_terms=["surveys"], authors=["Hinton"], venues=["NeurIPS"],
+            year_from=2022, year_to=2024,
+        ),
+    )
+    qu = _to_query_understanding(sq)
+    assert qu.date_window == "2022–2024"
+    assert qu.authors == ["Hinton"]
+    assert qu.venues == ["NeurIPS"]
+    assert qu.excluded_terms == ["surveys"]
+
+    assert _date_window_label(HardFilters(year_from=2020)) == "from 2020"
+    assert _date_window_label(HardFilters(year_to=2020)) == "up to 2020"
+    assert _date_window_label(HardFilters()) is None

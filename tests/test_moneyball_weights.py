@@ -1,8 +1,8 @@
 """
 tests/test_moneyball_weights.py
 
-QIL quality_modifier -> Moneyball weight override (docs/qil-improvements-planner.md
-B1, Job 2). Checks the precedence rule in resolve_moneyball_weights: a recognized
+QIL quality_modifier -> Moneyball weight override (B1, Job 2).
+Checks the precedence rule in resolve_moneyball_weights: a recognized
 quality_modifier (influential/emerging/classic) wins outright; "any"/"recent" fall
 through to moneyball_weights.json if present, else DEFAULT_MONEYBALL_WEIGHTS.
 """

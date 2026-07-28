@@ -75,7 +75,7 @@ DEFAULT_MONEYBALL_WEIGHTS = {
     "weight_utility": 0.16,
 }
 
-# QIL quality_modifier -> LanceDB pre-filter (docs/qil-improvements-planner.md B1, Job 1).
+# QIL quality_modifier -> LanceDB pre-filter (B1, Job 1).
 QUALITY_LANCEDB_FILTERS = {
     "recent": "year >= 2023",
     "influential": "citation_count >= 50",
@@ -1470,7 +1470,7 @@ def get_s2_citation_stats(paper: Paper, api_key: Optional[str] = None) -> int:
 
 def resolve_moneyball_weights(quality_modifier: str = "any") -> dict:
     """
-    QIL quality_modifier weight override (docs/qil-improvements-planner.md B1, Job 2)
+    QIL quality_modifier weight override (B1, Job 2)
     takes precedence when set (influential/emerging/classic); "any" and "recent" fall
     through to moneyball_weights.json (trained/calibrated) if present, else the static
     DEFAULT_MONEYBALL_WEIGHTS.

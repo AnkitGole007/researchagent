@@ -358,6 +358,24 @@ function Rail({
                     <span style={{ color:"var(--dim)" }}>{meta.query_understanding.quality_modifier}</span>
                   </div>
                 )}
+                {meta.query_understanding.date_window && (
+                  <div style={{ display:"flex", gap:8, padding:"3px 0" }}>
+                    <span style={{ fontWeight:600, color:"var(--fg)", width:70, flexShrink:0 }}>Years</span>
+                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.date_window}</span>
+                  </div>
+                )}
+                {meta.query_understanding.authors?.length > 0 && (
+                  <div style={{ display:"flex", gap:8, padding:"3px 0" }}>
+                    <span style={{ fontWeight:600, color:"var(--fg)", width:70, flexShrink:0 }}>Authors</span>
+                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.authors.join(", ")}</span>
+                  </div>
+                )}
+                {meta.query_understanding.venues?.length > 0 && (
+                  <div style={{ display:"flex", gap:8, padding:"3px 0" }}>
+                    <span style={{ fontWeight:600, color:"var(--fg)", width:70, flexShrink:0 }}>Venues</span>
+                    <span style={{ color:"var(--dim)" }}>{meta.query_understanding.venues.join(", ")}</span>
+                  </div>
+                )}
                 <div style={{ marginTop:8, fontSize:10, color:"var(--dim)" }}>
                   Parsed via {QIL_SOURCE_LABELS[meta.query_understanding.source] || meta.query_understanding.source}
                 </div>

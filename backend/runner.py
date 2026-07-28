@@ -172,19 +172,34 @@ def _to_paper_out(p: "pc.Paper", rank: int, summary: Optional[str]) -> PaperOut:
     )
 
 
+def _date_window_label(hf) -> Optional[str]:
+    """Human-readable form of QIL's year bounds, or None when unbounded."""
+    if hf.year_from and hf.year_to:
+        return f"{hf.year_from}–{hf.year_to}"
+    if hf.year_from:
+        return f"from {hf.year_from}"
+    if hf.year_to:
+        return f"up to {hf.year_to}"
+    return None
+
+
 def _to_query_understanding(sq) -> Optional[QueryUnderstanding]:
     """Builds the "How your query was read" payload straight from what QIL
     produced — deliberately just the fields that exist (intent, search terms,
-    excluded terms, quality modifier), not a per-paper rubric. See
-    docs/asta-ui-comparison-design.md §3 for why the two are not the same thing."""
+    excluded terms, quality modifier, brief-sourced hard filters), not a
+    per-paper rubric. See docs/asta-ui-comparison-design.md §3 for why the two
+    are not the same thing."""
     if sq is None:
         return None
     return QueryUnderstanding(
         intent=sq.intent,
         search_terms=list(sq.bm25_keywords),
-        excluded_terms=list(sq.hard_filters.get("not_terms", [])),
+        excluded_terms=list(sq.hard_filters.not_terms),
         quality_modifier=sq.quality_modifier,
         source=sq.source,
+        date_window=_date_window_label(sq.hard_filters),
+        authors=list(sq.hard_filters.authors),
+        venues=list(sq.hard_filters.venues),
     )
 
 

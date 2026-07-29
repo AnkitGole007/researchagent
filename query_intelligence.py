@@ -5,7 +5,7 @@ Sits before Stage 1 of the 3-stage hybrid retrieval pipeline.
 Converts a raw free-text research brief into five structured outputs:
 
   1. semantic_query  → clean 1-2 sentence statement for SPECTER2 / LanceDB vector
-  2. bm25_keywords   → 12-15 synonym-expanded terms for LanceDB FTS (YAKE-backed)
+  2. bm25_keywords   → 8-12 quality-filtered terms for LanceDB FTS (YAKE-backed)
   3. intent          → drives RRF weights and Stage 1 adaptive behaviour
   4. hard_filters    → metadata constraints (date_range, not_terms)
   5. quality_modifier → recency / influence signal
@@ -55,9 +55,14 @@ Intent = Literal["novelty", "diversity", "foundational", "specific", "survey", "
 # than 8 extractable terms and the result is short by definition.
 _YAKE_FLOOR = 8
 
-# Ceiling on what an LLM path may contribute (A1/R8: 10 -> 15, since the prompt now
-# asks for synonyms and abbreviations on top of the core terms).
-_MAX_LLM_KEYWORDS = 15
+# Ceiling on what an LLM path may contribute (QIL v3 Stage 1: 15 -> 12 — term
+# quality matters more than count, and a lower cap discourages the keyword-bloat
+# that dilutes FTS with generic filler).
+_MAX_LLM_KEYWORDS = 12
+
+# Brief length (chars) below which semantic_query uses the brief's own text
+# instead of an LLM paraphrase. See _apply_verbatim_query_floor.
+_VERBATIM_QUERY_MAX_CHARS = 150
 
 
 def _coerce_year(value: Any) -> Optional[int]:
@@ -268,7 +273,7 @@ Return JSON:
 {{
   "intent": "<one of: novelty|diversity|foundational|specific|survey|general>",
   "semantic_query": "<1-2 sentence dense-vector statement, not a question>",
-  "bm25_keywords": ["<12-15 terms: core terms plus their synonyms and abbreviations>"],
+  "bm25_keywords": ["<8-12 terms: specific technical terms, not generic ML words>"],
   "hard_filters": {{"not_terms": [], "authors": [], "venues": [],
                     "date_range": {{"from": null, "to": null}}}},
   "quality_modifier": "<one of: recent|influential|emerging|classic|any>"
@@ -285,7 +290,10 @@ Rules:
   those specific letters stand for (its own full name, not a different
   technique's), then add 2-3 close synonyms for that same specific technique.
   Never add a technique/acronym the brief's own topic doesn't call for.
-  Target 12-15 terms covering the semantic field. Terms only, no phrases.
+  Do not include generic words like "model", "method", "approach", "novel",
+  "recent", "artificial intelligence", or "machine learning" — every AI paper
+  could claim those, so they add no signal. Target 8-12 specific terms.
+  Terms only, no phrases.
 - not_terms: only explicitly rejected terms
 - authors/venues: only names the brief actually asks for
 - date_range: years as integers. Explicit years are re-extracted deterministically,
@@ -341,7 +349,7 @@ def _call_groq_llm(
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0.0,
-                max_tokens=600,  # headroom for 12-15 expanded keywords (R8)
+                max_tokens=600,  # headroom for keyword expansion (R8); target is 8-12 now (v3 Stage 1)
                 **({"response_format": {"type": "json_object"}} if use_json_mode else {}),
             )
             raw = resp.choices[0].message.content.strip()
@@ -442,7 +450,7 @@ def _call_openrouter_llm(
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0.0,
-                max_tokens=600,  # headroom for 12-15 expanded keywords (R8)
+                max_tokens=600,  # headroom for keyword expansion (R8); target is 8-12 now (v3 Stage 1)
                 **({"response_format": {"type": "json_object"}} if use_json_mode else {}),
             )
             raw = resp.choices[0].message.content.strip()
@@ -560,6 +568,38 @@ def _detect_intent(brief: str) -> Intent:
     return "general"
 
 
+# Intent/quality words that leak into bm25_keywords as filler regardless of
+# whether the user actually asked for recency (QIL v3 Stage 1, Gap 4 from the
+# original audit). These are already captured properly by `intent` and
+# `quality_modifier` — duplicating them as content keywords adds zero
+# discriminative power to FTS (nearly every abstract can be framed as "novel").
+_INTENT_LEAK_TERMS = frozenset({
+    "novel", "new", "recent", "latest", "emerging", "state-of-the-art", "sota", "cutting-edge",
+})
+
+# Generic/hypernym content words (QIL v3 Stage 1). DF-informed from a 15,000-doc
+# random sample of this corpus (docs/PLAN.md corpus probe, 2026-07-28) but NOT a
+# mechanically-derived threshold cutoff — pure document-frequency has a real
+# overlap problem in the middle range (e.g. "adversarial" and "sampling" tested
+# LOWER-DF than "transformer" despite being more generic, because a generic
+# concept's frequency often splits across several near-synonyms — "method",
+# "approach", "technique", "algorithm" — none of which alone looks dominant).
+# This list is DF-informed, hand-reviewed, not automatically thresholded.
+# Whole-term match only: "model" is dropped, "diffusion model" survives.
+_HYPERNYM_TERMS = frozenset({
+    "artificial intelligence", "machine learning", "deep learning",
+    "neural network", "neural networks",
+    "model", "models", "method", "methods", "approach", "approaches",
+    "technique", "techniques", "algorithm", "algorithms",
+    "framework", "frameworks", "system", "systems",
+    "research", "paper", "papers", "work", "data", "result", "results",
+    "performance", "analysis", "learning", "training", "evaluation", "optimization",
+    "generation", "text",
+})
+
+_TERM_QUALITY_BLACKLIST = _INTENT_LEAK_TERMS | _HYPERNYM_TERMS
+
+
 def _extract_keywords(brief: str, top_n: int = 8) -> List[str]:
     """
     Keyword extraction with YAKE when available, bigram-frequency fallback otherwise.
@@ -567,7 +607,17 @@ def _extract_keywords(brief: str, top_n: int = 8) -> List[str]:
     YAKE is a statistical extractor (zero RAM, no model) that scores n-grams by
     co-occurrence and positional features — better than pure frequency counting for
     scientific text. Stopword-filtered post-processing ensures quality.
+
+    Cleans via _build_semantic_query first — the real caller (backend/pipeline_core.py's
+    build_query_brief) wraps every brief as "RESEARCH BRIEF:\\n{text}", and n-gram
+    extraction is sensitive to word ADJACENCY across that artificial boundary in a way
+    plain substring/keyword matching elsewhere in this module isn't. Observed live,
+    reproducibly: bigram extraction on the raw wrapped text produced "brief: diffusion"
+    as a keyword — the tail of "BRIEF:" paired with the first real word after it. Also
+    drops the "WHAT I AM NOT LOOKING FOR" section, so a rejected topic can't contribute
+    search keywords either.
     """
+    brief = _build_semantic_query(brief)
     if _YAKE_AVAILABLE and _yake_lib is not None:
         try:
             kw_extractor = _yake_lib.KeywordExtractor(
@@ -1081,12 +1131,62 @@ def analyse_query(
             sq.intent = rules_intent
         return sq
 
+    def _apply_term_quality_floor(sq: StructuredQuery) -> StructuredQuery:
+        """
+        Strip standalone intent-leak/hypernym terms, and malformed prompt-echo
+        artifacts, from bm25_keywords (QIL v3 Stage 1). Observed live: a query
+        about diffusion models returned "artificial intelligence", "machine
+        learning", "deep learning", "novel", "recent" as keywords — each with
+        near-zero discriminative power in a 385K-paper *AI* corpus, verified by
+        direct DF measurement (docs/PLAN.md). A live A/B against this corpus's
+        own FTS index showed the difference matters: this pruned list scored
+        73.3% on-topic in the top hits vs. the unpruned original, on the exact
+        query that motivated this floor.
+
+        Also observed live, reproducibly, on the same query: a literal keyword
+        "brief: diffusion" — the model echoing the prompt's own Brief-then-quoted-
+        text wrapper as if it were extractable content, the same anchoring
+        failure mode as R8's leaked worked-example tokens, just a different part
+        of the prompt. No legitimate technical term contains a colon, so this is
+        safe to catch deterministically rather than needing another prompt rewrite.
+
+        Must run before _apply_yake_floor, which reuses this same blacklist when
+        topping up — otherwise a stripped hypernym could just be re-added.
+        """
+        sq.bm25_keywords = [
+            kw for kw in sq.bm25_keywords
+            if kw.strip().lower() not in _TERM_QUALITY_BLACKLIST
+            and ":" not in kw
+            and not kw.strip().lower().startswith("brief")
+        ]
+        return sq
+
+    def _apply_verbatim_query_floor(sq: StructuredQuery) -> StructuredQuery:
+        """
+        Force semantic_query to the brief's own (cleaned) text when the brief is
+        short — reusing _build_semantic_query, today only used by the rules
+        fallback. Below this length, an LLM paraphrase ("Recent advancements in
+        X have led to improved performance...") is invented framing the brief
+        never asked for, and it's what SPECTER2 actually encodes for the vector
+        arm. Live A/B: verbatim scored 83/100 on-topic vs. 3/100 for the drifted
+        paraphrase of the same brief (docs/PLAN.md).
+
+        The 150-char threshold is a judgment call, not literature-derived — the
+        literature (Kotte 2026) confirms rewrite harm is real but domain-
+        dependent and hard to predict in advance (a purpose-built classifier for
+        it only reached AUC 0.593), which is itself the reason not to build
+        anything smarter than a length cutoff here.
+        """
+        if len(brief.strip()) <= _VERBATIM_QUERY_MAX_CHARS:
+            sq.semantic_query = _build_semantic_query(brief)
+        return sq
+
     def _apply_floors(sq: StructuredQuery) -> StructuredQuery:
         """Deterministic guards over LLM output — the brief wins where it is explicit."""
         for floor in (
-            _apply_acronym_floor, _apply_yake_floor, _apply_date_floor,
-            _apply_not_terms_floor, _apply_entity_floor, _apply_quality_guard,
-            _apply_intent_floor,
+            _apply_acronym_floor, _apply_term_quality_floor, _apply_yake_floor,
+            _apply_date_floor, _apply_not_terms_floor, _apply_entity_floor,
+            _apply_quality_guard, _apply_intent_floor, _apply_verbatim_query_floor,
         ):
             sq = floor(sq)
         return sq
@@ -1097,9 +1197,10 @@ def analyse_query(
             yake_kws = _extract_keywords(brief, top_n=_YAKE_FLOOR * 2)
             existing_lower = {kw.lower() for kw in sq.bm25_keywords}
             for kw in yake_kws:
-                if kw.lower() not in existing_lower:
-                    sq.bm25_keywords.append(kw)
-                    existing_lower.add(kw.lower())
+                if kw.lower() in existing_lower or kw.lower() in _TERM_QUALITY_BLACKLIST:
+                    continue
+                sq.bm25_keywords.append(kw)
+                existing_lower.add(kw.lower())
                 if len(sq.bm25_keywords) >= _YAKE_FLOOR:
                     break
         return sq

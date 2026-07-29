@@ -153,6 +153,29 @@ class TestExtractKeywords:
         # At least one scientifically meaningful term should appear
         assert any(term in joined for term in ["contrastive", "learning", "vision", "language", "clip"])
 
+    def test_research_brief_wrapper_does_not_leak_into_keywords(self):
+        """Live bug: the real caller (backend/pipeline_core.py's build_query_brief)
+        wraps every brief as "RESEARCH BRIEF:\\n{text}" before it reaches QIL at all.
+        n-gram extraction is sensitive to word adjacency across that boundary in a
+        way substring matching isn't — bigram extraction on the raw wrapped text
+        produced the literal keyword "brief: diffusion", the tail of "BRIEF:" paired
+        with the first real word after it."""
+        wrapped = "RESEARCH BRIEF:\ndiffusion models for text generation"
+        result = _extract_keywords(wrapped, top_n=16)
+        assert not any(":" in kw for kw in result)
+        assert not any(kw.lower().startswith("brief") for kw in result)
+        assert "diffusion models" in result
+
+    def test_not_looking_for_section_does_not_leak_into_keywords(self):
+        """The excluded topic must not contribute search keywords either — same
+        principle as _apply_not_terms_floor, but for the rules/YAKE extraction path."""
+        wrapped = (
+            "RESEARCH BRIEF:\ndiffusion models for text generation\n\n"
+            "WHAT I AM NOT LOOKING FOR:\nreinforcement learning approaches"
+        )
+        result = _extract_keywords(wrapped, top_n=16)
+        assert not any("reinforcement" in kw.lower() for kw in result)
+
 
 class TestBuildSemanticQuery:
     def test_strips_not_looking_for_section(self):
@@ -408,7 +431,7 @@ class TestSynonymExpansion:
     def test_prompt_asks_for_synonym_expansion(self):
         prompt = _LLM_PROMPT_TEMPLATE.format(brief="x")
         assert "synonym" in prompt.lower()
-        assert "12-15" in prompt
+        assert "8-12" in prompt
 
     def test_prompt_has_no_worked_example_tokens_to_anchor_on(self):
         """
@@ -432,12 +455,13 @@ class TestSynonymExpansion:
         expanded = [
             "LoRA", "low-rank adaptation", "PEFT", "adapter", "parameter efficient",
             "QLoRA", "quantization", "fine-tuning", "instruction tuning", "LLM",
-            "large language model", "transformer", "efficiency",
+            "large language model", "transformer",
         ]
+        assert len(expanded) == qi._MAX_LLM_KEYWORDS, "fixture must exactly fill the cap"
         monkeypatch.setattr(qi, "_call_groq_llm", self._fake_groq(expanded))
         sq = analyse_query("LoRA fine-tuning", groq_api_key="fake-key")
         assert sq.source == "llm_groq"
-        assert sq.bm25_keywords == expanded, "13 expanded terms must pass through intact"
+        assert sq.bm25_keywords == expanded, "terms at exactly the cap must pass through intact"
 
     def test_over_long_list_is_capped_not_dropped(self, monkeypatch):
         monkeypatch.setattr(qi, "_call_groq_llm", self._fake_groq([f"term{i}" for i in range(40)]))
@@ -669,12 +693,23 @@ class TestApplyAcronymFloor:
 
     def test_semantic_query_gets_the_same_correction(self, monkeypatch):
         """semantic_query drives the SPECTER2 vector-search arm — a floor that only
-        touches bm25_keywords leaves the poisoned phrase driving half of retrieval."""
+        touches bm25_keywords leaves the poisoned phrase driving half of retrieval.
+
+        Brief is deliberately long (>_VERBATIM_QUERY_MAX_CHARS) so the v3 Stage 1
+        verbatim-query floor doesn't also fire and mask this floor's own effect —
+        for a short brief the verbatim floor wins outright, which is correct
+        (tested separately), but isn't what this test is checking."""
         monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
             keywords=["DPO", "Differentially Private Optimization"],
             semantic_query="Recent work on DPO (Differentially Private Optimization).",
         ))
-        sq = analyse_query("papers on DPO", groq_api_key="fake-key")
+        brief = (
+            "A detailed survey of preference optimization methods for aligning large "
+            "language models with human feedback, focusing specifically on DPO and "
+            "its variants, compared against reinforcement-learning-based approaches."
+        )
+        assert len(brief) > qi._VERBATIM_QUERY_MAX_CHARS
+        sq = analyse_query(brief, groq_api_key="fake-key")
         assert "Direct Preference Optimization" in sq.semantic_query
         assert "Differentially Private Optimization" not in sq.semantic_query
 
@@ -685,6 +720,114 @@ class TestApplyAcronymFloor:
             assert qi._acronym_letters_match(acronym, canonical), (
                 f"{acronym!r} -> {canonical!r} does not pass its own letter gate"
             )
+
+
+# ─── QIL v3 Stage 1: term-quality floor and verbatim-query floor ──────────────
+
+class TestApplyTermQualityFloor:
+    def test_strips_hypernyms_and_intent_leak_words(self, monkeypatch):
+        """Live bug: a query about diffusion models returned "artificial
+        intelligence", "machine learning", "deep learning", "novel", "recent" as
+        keywords — zero discriminative power in an all-AI 385K-paper corpus."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(keywords=[
+            "diffusion model", "text generation", "artificial intelligence",
+            "machine learning", "deep learning", "novel", "recent", "neural networks",
+        ]))
+        sq = analyse_query("diffusion models for text generation", groq_api_key="fake-key")
+        assert "diffusion model" in sq.bm25_keywords
+        assert "text generation" in sq.bm25_keywords
+        for blacklisted in (
+            "artificial intelligence", "machine learning", "deep learning",
+            "novel", "recent", "neural networks",
+        ):
+            assert blacklisted not in sq.bm25_keywords
+
+    def test_strips_prompt_echo_artifacts(self, monkeypatch):
+        """Live bug: the model reproducibly echoed the prompt's own Brief:\"\"\"...\"\"\"
+        wrapper as a literal keyword, "brief: diffusion" — same anchoring failure
+        mode as R8's leaked worked-example tokens, different part of the prompt."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["diffusion model", "brief: diffusion", "text: generation"],
+        ))
+        sq = analyse_query("diffusion models for text generation", groq_api_key="fake-key")
+        assert "diffusion model" in sq.bm25_keywords
+        assert not any(":" in kw for kw in sq.bm25_keywords)
+        assert not any(kw.lower().startswith("brief") for kw in sq.bm25_keywords)
+
+    def test_whole_term_match_only_compound_survives(self, monkeypatch):
+        """"model" alone is generic; "diffusion model" is specific — a substring
+        match would wrongly strip the compound too."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["model", "diffusion model", "generative model"],
+        ))
+        sq = analyse_query("diffusion models", groq_api_key="fake-key")
+        assert "model" not in sq.bm25_keywords
+        assert "diffusion model" in sq.bm25_keywords
+        assert "generative model" in sq.bm25_keywords
+
+    def test_yake_top_up_also_respects_the_blacklist(self, monkeypatch):
+        """The floor runs before the YAKE top-up — if YAKE's own candidates
+        weren't also filtered, a stripped hypernym could just be re-added."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(keywords=["diffusion model"]))
+        sq = analyse_query(
+            "diffusion model research on novel deep learning methods for text generation",
+            groq_api_key="fake-key",
+        )
+        for blacklisted in ("research", "novel", "deep learning", "methods"):
+            assert blacklisted not in sq.bm25_keywords
+
+    def test_blacklist_entries_are_lowercase_and_singular_plural_paired(self):
+        """Regression guard for the live gap this floor shipped with: "neural
+        network" was blacklisted but "neural networks" wasn't, so the plural
+        silently survived. Every countable-noun entry needs both forms."""
+        # value = actual plural form ("approach" pluralizes to "approaches", not "approachs")
+        countable_singulars = {
+            "method": "methods", "approach": "approaches", "technique": "techniques",
+            "algorithm": "algorithms", "framework": "frameworks", "system": "systems",
+            "paper": "papers", "result": "results", "model": "models",
+        }
+        for singular, plural in countable_singulars.items():
+            assert singular in qi._HYPERNYM_TERMS, f"singular {singular!r} missing from blacklist"
+            assert plural in qi._HYPERNYM_TERMS, f"plural {plural!r} missing from blacklist"
+        # "neural network" is a two-word compound, so the same pairing check
+        # applies to the phrase, not a bare "network"/"networks" entry.
+        assert "neural network" in qi._HYPERNYM_TERMS
+        assert "neural networks" in qi._HYPERNYM_TERMS
+
+
+class TestApplyVerbatimQueryFloor:
+    def test_short_brief_gets_the_brief_not_a_paraphrase(self, monkeypatch):
+        """Live A/B: verbatim scored 83/100 on-topic vs. 3/100 for the drifted
+        paraphrase of the same short brief (docs/PLAN.md)."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            semantic_query="Recent advancements in diffusion models have led to "
+                          "improved performance and efficiency.",
+        ))
+        brief = "diffusion models for text generation"
+        assert len(brief) <= qi._VERBATIM_QUERY_MAX_CHARS
+        sq = analyse_query(brief, groq_api_key="fake-key")
+        assert sq.semantic_query == brief
+
+    def test_long_brief_keeps_the_llm_paraphrase(self, monkeypatch):
+        paraphrase = "A synthesis of self-supervised vision techniques for autonomous driving perception."
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(semantic_query=paraphrase))
+        brief = (
+            "Work by Yoshua Bengio and Yann LeCun published at ICML or ICLR since 2018 "
+            "on self-supervised learning for computer vision applications in autonomous "
+            "driving systems, with particular attention to perception robustness."
+        )
+        assert len(brief) > qi._VERBATIM_QUERY_MAX_CHARS
+        sq = analyse_query(brief, groq_api_key="fake-key")
+        assert sq.semantic_query == paraphrase
+
+    def test_verbatim_query_is_cleaned_not_raw(self, monkeypatch):
+        """Reuses _build_semantic_query — strips the NOT-section, not just a
+        length-gated passthrough of the raw brief."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm())
+        brief = "RESEARCH BRIEF:\nDiffusion models.\n\nWHAT I AM NOT LOOKING FOR:\nSurveys."
+        assert len(brief) <= qi._VERBATIM_QUERY_MAX_CHARS
+        sq = analyse_query(brief, groq_api_key="fake-key")
+        assert sq.semantic_query == "Diffusion models."
 
 
 # ─── Public API: analyse_query ────────────────────────────────────────────────

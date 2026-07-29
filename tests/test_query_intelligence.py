@@ -14,6 +14,7 @@ import os
 import pytest
 
 from query_intelligence import (
+    Criterion,
     HardFilters,
     StructuredQuery,
     analyse_query,
@@ -176,6 +177,26 @@ class TestExtractKeywords:
         result = _extract_keywords(wrapped, top_n=16)
         assert not any("reinforcement" in kw.lower() for kw in result)
 
+    def test_trailing_punctuation_does_not_leak_into_bigrams(self):
+        """Live bug, twice, same root cause, two different punctuation marks:
+        a word immediately followed by the user's own punctuation ("systems:",
+        "architectures,") carried that punctuation into the joined bigram,
+        since the bigram step split on whitespace only and never stripped it."""
+        brief = (
+            "papers about recommendation systems: for example, new model "
+            "architectures, training strategies, evaluation methods."
+        )
+        result = _extract_keywords(brief, top_n=16)
+        assert not any(c in kw for kw in result for c in ":,;.")
+        assert "recommendation systems" in result
+        assert "model architectures" in result
+
+    def test_hyphenated_words_survive_punctuation_stripping(self):
+        """The fix must strip leading/trailing punctuation without breaking
+        internal hyphens — "self-supervised" is one word, not two fragments."""
+        result = _extract_keywords("self-supervised learning for vision tasks.", top_n=10)
+        assert any("self-supervised" in kw for kw in result)
+
 
 class TestBuildSemanticQuery:
     def test_strips_not_looking_for_section(self):
@@ -281,6 +302,33 @@ class TestHardFilters:
     def test_year_clause_cannot_carry_injected_text(self):
         hf = HardFilters.from_raw({"date_range": {"from": "2020; DROP TABLE papers"}})
         assert hf.to_lancedb_filter() == "year >= 2020"
+
+
+# ─── QIL v3 Stage 2: criteria decomposition ───────────────────────────────────
+
+class TestCriterion:
+    def test_valid_criterion_parses(self):
+        c = Criterion.from_raw({"name": "X", "definition": "Y", "strength": "must"})
+        assert c == Criterion(name="X", definition="Y", strength="must")
+
+    def test_missing_definition_is_dropped_not_defaulted(self):
+        # A criterion with an empty definition is worse than no criterion at all.
+        assert Criterion.from_raw({"name": "X"}) is None
+        assert Criterion.from_raw({"definition": "Y"}) is None
+        assert Criterion.from_raw({"name": "", "definition": "Y"}) is None
+
+    def test_non_dict_input_returns_none(self):
+        assert Criterion.from_raw("not a dict") is None
+        assert Criterion.from_raw(None) is None
+        assert Criterion.from_raw(["X", "Y"]) is None
+
+    def test_invalid_strength_defaults_to_should(self):
+        c = Criterion.from_raw({"name": "X", "definition": "Y", "strength": "garbage"})
+        assert c.strength == "should"
+
+    def test_default_strength_is_should(self):
+        c = Criterion.from_raw({"name": "X", "definition": "Y"})
+        assert c.strength == "should"
 
 
 # ─── R7 / B3+B4: author + venue LIKE clauses ──────────────────────────────────
@@ -599,8 +647,8 @@ class TestSynonymExpansion:
 
 # ─── QIL Auditor Stage A: intent-bias and acronym-hallucination floors ────────
 
-def _fake_llm(intent="general", keywords=None, semantic_query="s"):
-    """Stand in for a Groq response with controlled intent/keywords/semantic_query."""
+def _fake_llm(intent="general", keywords=None, semantic_query="s", criteria=None):
+    """Stand in for a Groq response with controlled intent/keywords/semantic_query/criteria."""
     return lambda brief, api_key, model: (
         {
             "intent": intent,
@@ -608,6 +656,7 @@ def _fake_llm(intent="general", keywords=None, semantic_query="s"):
             "bm25_keywords": keywords or ["placeholder"],
             "hard_filters": {"not_terms": [], "authors": [], "venues": []},
             "quality_modifier": "any",
+            "criteria": criteria if criteria is not None else [],
         },
         None,
     )
@@ -776,6 +825,18 @@ class TestApplyTermQualityFloor:
         for blacklisted in ("research", "novel", "deep learning", "methods"):
             assert blacklisted not in sq.bm25_keywords
 
+    def test_yake_top_up_also_rejects_prompt_echo_artifacts(self, monkeypatch):
+        """Live bug: "recommendation systems:" (trailing colon from the user's
+        own punctuation, picked up by YAKE's bigram fallback) survived because
+        the top-up loop only checked the hypernym blacklist, not the same
+        colon/"brief"-prefix check the term-quality floor already applied."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(keywords=["recommendation"]))
+        sq = analyse_query(
+            "papers about recommendation systems: for example, new model architectures",
+            groq_api_key="fake-key",
+        )
+        assert not any(":" in kw for kw in sq.bm25_keywords)
+
     def test_blacklist_entries_are_lowercase_and_singular_plural_paired(self):
         """Regression guard for the live gap this floor shipped with: "neural
         network" was blacklisted but "neural networks" wasn't, so the plural
@@ -864,6 +925,57 @@ class TestAnalyseQuery:
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         sq = analyse_query("Diffusion models for image synthesis.", groq_api_key=None, openrouter_api_key=None)
         assert sq.source in {"llm_groq", "llm_openrouter", "rules"}
+
+    def test_rules_path_never_produces_criteria(self, monkeypatch):
+        """Criteria decomposition needs genuine language understanding a
+        deterministic fallback can't provide — no criteria beats fake ones."""
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        sq = analyse_query("diffusion models", groq_api_key=None, openrouter_api_key=None)
+        assert sq.source == "rules"
+        assert sq.criteria == []
+
+    def test_llm_criteria_pass_through(self, monkeypatch):
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(criteria=[
+            {"name": "Mechanism", "definition": "Proposes a new sparse attention mechanism.", "strength": "must"},
+            {"name": "Benchmark", "definition": "Includes empirical results on long-context tasks.", "strength": "should"},
+        ]))
+        sq = analyse_query("sparse attention for long context", groq_api_key="fake-key")
+        assert sq.criteria == [
+            Criterion(name="Mechanism", definition="Proposes a new sparse attention mechanism.", strength="must"),
+            Criterion(name="Benchmark", definition="Includes empirical results on long-context tasks.", strength="should"),
+        ]
+
+    def test_criteria_capped_at_five(self, monkeypatch):
+        raw_criteria = [
+            {"name": f"C{i}", "definition": f"Definition {i}.", "strength": "should"} for i in range(8)
+        ]
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(criteria=raw_criteria))
+        sq = analyse_query("anything", groq_api_key="fake-key")
+        assert len(sq.criteria) == 5
+
+    def test_malformed_criteria_items_are_dropped_not_fatal(self, monkeypatch):
+        """One bad item in the list must not sink the whole response."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(criteria=[
+            {"name": "Valid", "definition": "A real criterion.", "strength": "must"},
+            {"name": "NoDefinition"},
+            "not even a dict",
+            None,
+        ]))
+        sq = analyse_query("anything", groq_api_key="fake-key")
+        assert sq.criteria == [Criterion(name="Valid", definition="A real criterion.", strength="must")]
+
+    def test_criteria_field_absent_from_llm_response_is_safe(self, monkeypatch):
+        """An 8B model may omit the key entirely — must not raise."""
+        monkeypatch.setattr(qi, "_call_groq_llm", lambda brief, api_key, model: (
+            {
+                "intent": "general", "semantic_query": "s", "bm25_keywords": ["x"],
+                "hard_filters": {}, "quality_modifier": "any",
+            },
+            None,
+        ))
+        sq = analyse_query("anything", groq_api_key="fake-key")
+        assert sq.criteria == []
 
     @pytest.mark.integration
     @pytest.mark.skipif(

@@ -2,17 +2,19 @@
 query_intelligence.py — Task P-00: Query Intelligence Layer
 
 Sits before Stage 1 of the 3-stage hybrid retrieval pipeline.
-Converts a raw free-text research brief into five structured outputs:
+Converts a raw free-text research brief into six structured outputs:
 
   1. semantic_query  → clean 1-2 sentence statement for SPECTER2 / LanceDB vector
   2. bm25_keywords   → 8-12 quality-filtered terms for LanceDB FTS (YAKE-backed)
   3. intent          → drives RRF weights and Stage 1 adaptive behaviour
   4. hard_filters    → metadata constraints (date_range, not_terms)
   5. quality_modifier → recency / influence signal
+  6. criteria        → 0-5 relevance criteria, display-only (QIL v3 Stage 2) —
+                        not yet wired into retrieval or ranking (Stage 3)
 
 Provider chain (stops at first success):
-  1. Groq LLM (llama-3.1-8b-instant) — fast, ~200ms, 15k tok/min headroom
-  2. OpenRouter LLM (openai/gpt-oss-20b:free) — on rate-limit / infra errors
+  1. Groq LLM (qwen/qwen3.6-27b, reasoning disabled) — fast, ~900ms, 15k tok/min headroom
+  2. OpenRouter LLM (google/gemma-4-26b-a4b-it:free) — on rate-limit / infra errors
   3. Rules-based extractor — zero cost, no network, guaranteed fallback
 
 Both LLM legs request `response_format={"type": "json_object"}` and drop it on a
@@ -192,6 +194,42 @@ class HardFilters:
 
 
 @dataclass
+class Criterion:
+    """
+    A single relevance criterion decomposed from the brief (QIL v3 Stage 2).
+
+    Display-only in this stage — surfaced in "How your query was read" so
+    criteria quality is observable before Stage 3 wires them into judging.
+    Retrieval and ranking are unaffected by this field for now.
+
+    Modelled on Asta.ai's observed behaviour and Ai2's own documented Paper
+    Finder mechanism (a query decomposed into sub-criteria, each verified
+    separately per paper — see docs/PLAN.md). Deliberately NOT Ai2's
+    weighted-summing-to-1.0 scheme: a small model reliably picking one of two
+    string labels is a safer bet than reliably summing floats to exactly 1.0.
+    """
+    name: str
+    definition: str
+    strength: Literal["must", "should"] = "should"
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> Optional["Criterion"]:
+        """
+        None on anything unusable — a malformed criterion is dropped, not
+        defaulted, since a criterion with an empty definition is worse than
+        no criterion at all (it would just be a blank line in the UI).
+        """
+        if not isinstance(raw, dict):
+            return None
+        name = str(raw.get("name") or "").strip()
+        definition = str(raw.get("definition") or "").strip()
+        if not name or not definition:
+            return None
+        strength = raw.get("strength")
+        return cls(name=name, definition=definition, strength=strength if strength in ("must", "should") else "should")
+
+
+@dataclass
 class StructuredQuery:
     """
     Structured decomposition of a raw research brief.
@@ -214,6 +252,11 @@ class StructuredQuery:
         :class:`HardFilters`. Was an untyped dict before B5.
     quality_modifier : str
         One of "recent" | "influential" | "emerging" | "classic" | "any".
+    criteria : List[Criterion]
+        0-5 relevance criteria decomposed from the brief (QIL v3 Stage 2).
+        Display-only — see :class:`Criterion`. Empty on the rules path, since
+        criteria decomposition needs genuine language understanding a
+        deterministic fallback can't provide; no criteria beats fake ones.
     raw_brief : str
         Original unmodified brief for logging / debug.
     source : str
@@ -224,6 +267,7 @@ class StructuredQuery:
     bm25_keywords: List[str] = field(default_factory=list)
     hard_filters: HardFilters = field(default_factory=HardFilters)
     quality_modifier: str = "any"
+    criteria: List[Criterion] = field(default_factory=list)
     raw_brief: str = ""
     source: str = "rules"
 
@@ -276,7 +320,9 @@ Return JSON:
   "bm25_keywords": ["<8-12 terms: specific technical terms, not generic ML words>"],
   "hard_filters": {{"not_terms": [], "authors": [], "venues": [],
                     "date_range": {{"from": null, "to": null}}}},
-  "quality_modifier": "<one of: recent|influential|emerging|classic|any>"
+  "quality_modifier": "<one of: recent|influential|emerging|classic|any>",
+  "criteria": [{{"name": "<short label>", "definition": "<one testable sentence>",
+                "strength": "<must|should>"}}]
 }}
 
 Rules:
@@ -286,10 +332,14 @@ Rules:
 - specific: names paper/author/technique
 - diversity: wants broad cross-area coverage
 - general: default
-- bm25_keywords: for each acronym actually named in the brief, write out what
-  those specific letters stand for (its own full name, not a different
-  technique's), then add 2-3 close synonyms for that same specific technique.
-  Never add a technique/acronym the brief's own topic doesn't call for.
+- bm25_keywords: expand only what the brief actually names. For an acronym,
+  write out its own full name (not a different technique's) plus 2-3 close
+  synonyms. For a general topic with no named technique, keep the keywords at
+  the SAME level of generality as the brief — do not invent specific named
+  sub-techniques, algorithms, or adjacent subfields the brief itself doesn't
+  mention, even ones commonly discussed in that area. If the brief lists
+  several possible types of contribution, reflect that same breadth — don't
+  narrow to one specific method the brief didn't name.
   Do not include generic words like "model", "method", "approach", "novel",
   "recent", "artificial intelligence", or "machine learning" — every AI paper
   could claim those, so they add no signal. Target 8-12 specific terms.
@@ -297,7 +347,13 @@ Rules:
 - not_terms: only explicitly rejected terms
 - authors/venues: only names the brief actually asks for
 - date_range: years as integers. Explicit years are re-extracted deterministically,
-  so use this for phrasing a regex can't read (e.g. "post-ChatGPT era" -> 2023)"""
+  so use this for phrasing a regex can't read (e.g. "post-ChatGPT era" -> 2023)
+- criteria: 2-5 distinct, independently-checkable requirements decomposed from the
+  brief. Each is a testable statement about what a relevant paper must contain —
+  not a restatement of the whole topic, and not one blob covering everything.
+  "must" for a requirement the brief states or clearly implies as non-negotiable;
+  "should" for a softer preference. Do not repeat what hard_filters/not_terms/
+  quality_modifier already cover."""
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +363,7 @@ Rules:
 def _call_groq_llm(
     brief: str,
     api_key: str,
-    model: str = "llama-3.1-8b-instant",
+    model: str = "qwen/qwen3.6-27b",
 ) -> Tuple[Optional[dict], Optional[str]]:
     """
     Groq API call with structured JSON output.
@@ -342,6 +398,16 @@ def _call_groq_llm(
     for attempt in range(2):
         try:
             client = Groq(api_key=api_key)
+            extra_kwargs = {}
+            if use_json_mode:
+                extra_kwargs["response_format"] = {"type": "json_object"}
+            if model.startswith("qwen/"):
+                # qwen3.6 emits a <think> block straight into `content` and burns
+                # the whole max_tokens budget on it unless reasoning is disabled —
+                # confirmed live: finish_reason="length" at max_tokens=2000, still
+                # mid-thought, zero JSON. Other Groq models reject this param outright
+                # (400 "not supported with this model"), so it's gated to qwen only.
+                extra_kwargs["reasoning_effort"] = "none"
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -349,8 +415,8 @@ def _call_groq_llm(
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0.0,
-                max_tokens=600,  # headroom for keyword expansion (R8); target is 8-12 now (v3 Stage 1)
-                **({"response_format": {"type": "json_object"}} if use_json_mode else {}),
+                max_tokens=900,  # 600 (R8 keyword expansion) + ~300 for 2-5 criteria (v3 Stage 2)
+                **extra_kwargs,
             )
             raw = resp.choices[0].message.content.strip()
             if raw.startswith("```"):
@@ -409,7 +475,7 @@ def _call_groq_llm(
 def _call_openrouter_llm(
     brief: str,
     api_key: str,
-    model: str = "openai/gpt-oss-20b:free",
+    model: str = "google/gemma-4-26b-a4b-it:free",
 ) -> Tuple[Optional[dict], Optional[str]]:
     """
     OpenRouter API call via OpenAI-compatible SDK.
@@ -450,7 +516,7 @@ def _call_openrouter_llm(
                     {"role": "user",   "content": prompt},
                 ],
                 temperature=0.0,
-                max_tokens=600,  # headroom for keyword expansion (R8); target is 8-12 now (v3 Stage 1)
+                max_tokens=900,  # 600 (R8 keyword expansion) + ~300 for 2-5 criteria (v3 Stage 2)
                 **({"response_format": {"type": "json_object"}} if use_json_mode else {}),
             )
             raw = resp.choices[0].message.content.strip()
@@ -600,6 +666,28 @@ _HYPERNYM_TERMS = frozenset({
 _TERM_QUALITY_BLACKLIST = _INTENT_LEAK_TERMS | _HYPERNYM_TERMS
 
 
+def _is_acceptable_keyword(kw: str) -> bool:
+    """
+    Shared acceptance check for bm25_keywords, used by both the term-quality
+    floor and the YAKE top-up. A hypernym/intent-leak term or a malformed
+    prompt-echo artifact (contains ":", or starts with "brief" — the model
+    echoing the prompt's own Brief-then-quoted-text wrapper) must be rejected
+    regardless of which path produced the candidate.
+
+    Previously duplicated: the term-quality floor had this check, but the
+    YAKE top-up loop only checked the blacklist, not the artifact patterns —
+    observed live, reproducibly, a keyword "recommendation systems:" survived
+    because it arrived via YAKE's own top-up, after the term-quality floor
+    had already run once.
+    """
+    normalized = kw.strip().lower()
+    return (
+        normalized not in _TERM_QUALITY_BLACKLIST
+        and ":" not in kw
+        and not normalized.startswith("brief")
+    )
+
+
 def _extract_keywords(brief: str, top_n: int = 8) -> List[str]:
     """
     Keyword extraction with YAKE when available, bigram-frequency fallback otherwise.
@@ -650,7 +738,14 @@ def _extract_keywords(brief: str, top_n: int = 8) -> List[str]:
     for t in filtered:
         freq[t] = freq.get(t, 0) + 1
 
-    words = text.split()
+    # Strip leading/trailing punctuation per word (keeps internal hyphens, so
+    # "self-supervised" survives intact) before bigram-joining. Without this,
+    # a word immediately followed by user punctuation — "systems:", "methods,"
+    # — carries that punctuation into the joined bigram unfiltered, since a
+    # stopword comparison against the punctuated form never matches. Observed
+    # live, twice, with two different punctuation marks (":" then ",") on the
+    # same brief — the same root cause, not two separate bugs.
+    words = [re.sub(r"^[^a-zA-Z]+|[^a-zA-Z\-]+$", "", w) for w in text.split()]
     bigrams: List[str] = []
     for i in range(len(words) - 1):
         w1, w2 = words[i], words[i + 1]
@@ -940,16 +1035,16 @@ _VALID_QUALITY = {"recent", "influential", "emerging", "classic", "any"}
 def analyse_query(
     brief: str,
     groq_api_key: Optional[str] = None,
-    groq_model: str = "llama-3.1-8b-instant",
+    groq_model: str = "qwen/qwen3.6-27b",
     openrouter_api_key: Optional[str] = None,
-    openrouter_model: str = "openai/gpt-oss-20b:free",
+    openrouter_model: str = "google/gemma-4-26b-a4b-it:free",
 ) -> StructuredQuery:
     """
     Analyse a raw research brief and return a :class:`StructuredQuery`.
 
     Provider chain (stops at first success):
-      1. Groq LLM (llama-3.1-8b-instant) — fast, ~200ms, 15k tok/min headroom
-      2. OpenRouter (openai/gpt-oss-20b:free) — triggered on Groq rate-limit / infra errors
+      1. Groq LLM (qwen/qwen3.6-27b, reasoning disabled) — fast, ~900ms, 15k tok/min headroom
+      2. OpenRouter (google/gemma-4-26b-a4b-it:free) — triggered on Groq rate-limit / infra errors
       3. Rules-based extractor — zero cost, always available
 
     YAKE floor applied after every LLM path: tops bm25_keywords up to _YAKE_FLOOR.
@@ -961,12 +1056,13 @@ def analyse_query(
     groq_api_key : str, optional
         Groq API key. Falls back to GROQ_API_KEY env var.
     groq_model : str
-        Groq model name (default: llama-3.1-8b-instant).
+        Groq model name (default: qwen/qwen3.6-27b). Reasoning is auto-disabled
+        for any "qwen/"-prefixed model — see _call_groq_llm.
     openrouter_api_key : str, optional
         OpenRouter API key. Falls back to OPENROUTER_API_KEY env var.
         Only used when Groq returns a rate-limit or infra error.
     openrouter_model : str
-        OpenRouter model name (default: openai/gpt-oss-20b:free).
+        OpenRouter model name (default: google/gemma-4-26b-a4b-it:free).
     """
     if not brief or not brief.strip():
         logger.debug("[QIL] Empty brief — returning empty StructuredQuery")
@@ -977,12 +1073,18 @@ def analyse_query(
     def _build_sq_from_llm(raw: dict, source: str) -> Optional[StructuredQuery]:
         """Validate and build StructuredQuery from LLM JSON dict."""
         try:
+            criteria_raw = raw.get("criteria") or []
+            criteria = [
+                c for c in (Criterion.from_raw(item) for item in criteria_raw[:5])
+                if c is not None
+            ] if isinstance(criteria_raw, list) else []
             return StructuredQuery(
                 intent=raw.get("intent", "general") if raw.get("intent") in _VALID_INTENTS else "general",
                 semantic_query=str(raw.get("semantic_query", "") or "").strip() or _build_semantic_query(brief),
                 bm25_keywords=list(raw.get("bm25_keywords", []) or [])[:_MAX_LLM_KEYWORDS],
                 hard_filters=HardFilters.from_raw(raw.get("hard_filters")),
                 quality_modifier=raw.get("quality_modifier", "any") if raw.get("quality_modifier") in _VALID_QUALITY else "any",
+                criteria=criteria,
                 raw_brief=brief,
                 source=source,
             )
@@ -1150,15 +1252,11 @@ def analyse_query(
         of the prompt. No legitimate technical term contains a colon, so this is
         safe to catch deterministically rather than needing another prompt rewrite.
 
-        Must run before _apply_yake_floor, which reuses this same blacklist when
-        topping up — otherwise a stripped hypernym could just be re-added.
+        Must run before _apply_yake_floor, which reuses the same acceptance
+        check (_is_acceptable_keyword) when topping up — otherwise a stripped
+        term could just be re-added.
         """
-        sq.bm25_keywords = [
-            kw for kw in sq.bm25_keywords
-            if kw.strip().lower() not in _TERM_QUALITY_BLACKLIST
-            and ":" not in kw
-            and not kw.strip().lower().startswith("brief")
-        ]
+        sq.bm25_keywords = [kw for kw in sq.bm25_keywords if _is_acceptable_keyword(kw)]
         return sq
 
     def _apply_verbatim_query_floor(sq: StructuredQuery) -> StructuredQuery:
@@ -1197,7 +1295,7 @@ def analyse_query(
             yake_kws = _extract_keywords(brief, top_n=_YAKE_FLOOR * 2)
             existing_lower = {kw.lower() for kw in sq.bm25_keywords}
             for kw in yake_kws:
-                if kw.lower() in existing_lower or kw.lower() in _TERM_QUALITY_BLACKLIST:
+                if kw.lower() in existing_lower or not _is_acceptable_keyword(kw):
                     continue
                 sq.bm25_keywords.append(kw)
                 existing_lower.add(kw.lower())

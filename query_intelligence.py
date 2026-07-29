@@ -281,9 +281,10 @@ Rules:
 - specific: names paper/author/technique
 - diversity: wants broad cross-area coverage
 - general: default
-- bm25_keywords: for each core term also give its synonyms, abbreviations and
-  standard aliases, e.g. "LoRA" -> "low-rank adaptation","PEFT","adapter";
-  "RLHF" -> "reward model","human feedback","preference data".
+- bm25_keywords: for each acronym actually named in the brief, write out what
+  those specific letters stand for (its own full name, not a different
+  technique's), then add 2-3 close synonyms for that same specific technique.
+  Never add a technique/acronym the brief's own topic doesn't call for.
   Target 12-15 terms covering the semantic field. Terms only, no phrases.
 - not_terms: only explicitly rejected terms
 - authors/venues: only names the brief actually asks for
@@ -506,12 +507,30 @@ _STOPWORDS = frozenset({
     "especially", "care", "example", "new", "novel", "recent",
 })
 
+# Checked in this order in _detect_intent — first match wins, so the narrower
+# categories go before novelty's broader one. "new"/"recent" are deliberately
+# excluded from novelty: bare enough to false-positive on substrings ("renewable",
+# "newton") even with word boundaries would still be too generic, and real recency
+# is already quality_modifier's job, not intent's.
 _INTENT_SIGNALS: Dict[str, List[str]] = {
-    "novelty":      ["novel", "new", "recent", "latest", "emerging", "state-of-the-art", "sota", "cutting-edge"],
     "foundational": ["foundational", "seminal", "classic", "influential", "survey textbook", "original", "pioneering"],
     "survey":       ["survey", "overview", "comprehensive", "review", "comparison", "benchmark", "evaluation study"],
-    "specific":     [],  # detected via named entities (author names, years, paper titles)
     "diversity":    ["diverse", "broad", "various", "multiple areas", "different approaches", "coverage"],
+    "novelty":      ["novel", "latest", "emerging", "state-of-the-art", "sota", "cutting-edge"],
+    "specific":     [],  # detected via named entities (author names, years, paper titles)
+}
+
+# Word-boundary-anchored per intent, so "peer-reviewed" doesn't match "review" and
+# "renewable"/"newton" can't match a bare signal word (Gap: _detect_intent previously
+# did unbounded substring matching via `s in brief_lower`).
+_INTENT_SIGNAL_PATTERNS: Dict[str, re.Pattern] = {
+    # Trailing "s?" so plurals still match ("surveys", "benchmarks") — a bare \b
+    # boundary alone would exclude them, since "survey" has no boundary before the
+    # "s" in "surveys". Deliberately not a full pluralization engine (misses
+    # "studies" for "study") — this covers the simple-plural case actually needed.
+    intent: re.compile(r"\b(?:" + "|".join(re.escape(s) for s in signals) + r")s?\b", re.IGNORECASE)
+    for intent, signals in _INTENT_SIGNALS.items()
+    if signals
 }
 
 _QUALITY_SIGNALS: Dict[str, List[str]] = {
@@ -522,11 +541,21 @@ _QUALITY_SIGNALS: Dict[str, List[str]] = {
 }
 
 
-def _detect_intent(brief_lower: str) -> Intent:
-    for intent, signals in _INTENT_SIGNALS.items():
-        if any(s in brief_lower for s in signals):
+def _detect_intent(brief: str) -> Intent:
+    """
+    Takes the raw brief (not pre-lowered) — matching is case-insensitive internally,
+    and _extract_authors needs original casing preserved.
+
+    Scans with exclusion clauses stripped (_strip_negation) — otherwise a rejected
+    topic can flip the classification. Observed live: "...exclude surveys" matched
+    the "survey" signal word inside the very clause rejecting it, and returned
+    intent="survey" for a query explicitly asking to NOT get surveys.
+    """
+    positive = _strip_negation(brief)
+    for intent, pattern in _INTENT_SIGNAL_PATTERNS.items():
+        if pattern.search(positive):
             return intent  # type: ignore[return-value]
-    if re.search(r"\b(20\d{2})\b", brief_lower) or re.search(r"\bby [A-Z][a-z]+", brief_lower):
+    if re.search(r"\b(20\d{2})\b", positive) or _extract_authors(positive):
         return "specific"
     return "general"
 
@@ -711,6 +740,49 @@ def _is_grounded_in(value: str, brief_lower: str) -> bool:
     return any(t.lower() in brief_lower for t in tokens) if tokens else False
 
 
+# Acronyms actually observed being mis-expanded by the LLM synonym-expansion feature
+# (R8), or in the same confusable family — RL/alignment acronyms overlap across
+# subfields more than vision/generative ones do. Deliberately NOT a comprehensive
+# ML acronym list: an unlisted acronym is left untouched (Stage A can't verify it —
+# Stage B's escalation call is separate future work), so a bloated table just adds
+# maintenance surface with no benefit. Every entry's canonical value MUST pass
+# _acronym_letters_match against its own key — see test_acronym_table_entries_pass_their_own_gate.
+_ACRONYM_EXPANSIONS: Dict[str, str] = {
+    "RLHF": "Reinforcement Learning from Human Feedback",
+    "PPO": "Proximal Policy Optimization",
+    "DPO": "Direct Preference Optimization",
+    "KTO": "Kahneman-Tversky Optimization",
+    "GRPO": "Group Relative Policy Optimization",
+    "SFT": "Supervised Fine-Tuning",
+}
+
+_LETTER_GATE_STOPWORDS = frozenset({"of", "the", "from", "and", "for", "in", "on", "with", "a", "an"})
+
+
+def _acronym_letters_match(acronym: str, phrase: str) -> bool:
+    """
+    True if `phrase`'s word-initial letters plausibly spell out `acronym`, in order.
+
+    Two modes, either is accepted — no single mode covers every acronym style this
+    corpus uses: "MoE" (Mixture of Experts) needs every word counted, while "RLHF"
+    (Reinforcement Learning FROM Human Feedback) needs connector words skipped.
+    Splits on all non-alphanumeric characters so hyphenated words count separately
+    ("Kahneman-Tversky" -> "Kahneman", "Tversky", needed for KTO to match at all).
+
+    This is the gate that keeps a merely-related keyword (RLHF -> "reward model")
+    from ever being treated as a claimed expansion in the first place — "reward
+    model"'s initials (R, M) don't correspond to RLHF's letters, so it's never even
+    considered, let alone incorrectly "verified".
+    """
+    words = [w for w in re.split(r"[^0-9A-Za-z]+", phrase) if w]
+    if not words:
+        return False
+    all_initials = "".join(w[0] for w in words).upper()
+    skipped_initials = "".join(w[0] for w in words if w.lower() not in _LETTER_GATE_STOPWORDS).upper()
+    target = acronym.upper()
+    return target == all_initials or target == skipped_initials
+
+
 def _build_semantic_query(brief: str) -> str:
     """Strip NOT-looking-for sections, trim stop-phrases, produce a clean 1-2 sentence statement."""
     brief_clean = re.split(r"WHAT I AM NOT LOOKING FOR", brief, flags=re.IGNORECASE)[0]
@@ -744,6 +816,16 @@ _NOT_INLINE_RE = re.compile(
 _NOT_TERM_SPLIT_RE = re.compile(r"[,\n;]+|\band\b|\bor\b", re.IGNORECASE)
 
 
+def _strip_negation(brief: str) -> str:
+    """
+    Drop the NOT-looking-for section and inline exclusion clauses, keeping original
+    casing (needed by _extract_authors). Used by _detect_intent so a rejected topic
+    can't flip its own classification — see _detect_intent's docstring.
+    """
+    positive = _NOT_SECTION_RE.split(brief, maxsplit=1)[0]
+    return _NOT_INLINE_RE.sub("", positive)
+
+
 def _extract_not_terms(brief: str) -> List[str]:
     """
     Extract explicitly rejected terms from a brief.
@@ -771,7 +853,7 @@ def _extract_not_terms(brief: str) -> List[str]:
 def _rules_based_analyse(brief: str) -> StructuredQuery:
     """Pure-Python fallback analyser. No external APIs."""
     brief_lower = brief.lower()
-    intent = _detect_intent(brief_lower)
+    intent = _detect_intent(brief)
 
     quality_modifier = "any"
     for mod, signals in _QUALITY_SIGNALS.items():
@@ -943,11 +1025,68 @@ def analyse_query(
             sq.quality_modifier = "any"
         return sq
 
+    def _apply_acronym_floor(sq: StructuredQuery) -> StructuredQuery:
+        """
+        Correct a wrong acronym expansion in bm25_keywords/semantic_query using
+        _ACRONYM_EXPANSIONS. Observed live: "DPO" expanded to "Differentially
+        Private Optimization" (wrong — Direct Preference Optimization in alignment
+        literature) and "KTO" to "Knowledge Transfer Optimization" (wrong —
+        Kahneman-Tversky Optimization); both become literal LanceDB FTS terms.
+
+        Must run before _apply_yake_floor/_apply_not_terms_floor — both mutate
+        bm25_keywords and would break the acronym-then-expansion adjacency this
+        relies on (empirically observed: the model emits the acronym immediately
+        followed by its expansion attempt, when it attempts one at all).
+
+        Only a listed acronym can trigger a correction — an unlisted one is left
+        untouched, since Stage A has no way to verify it (no escalation call exists
+        yet). Never overwrites a phrase that's already the user's own words in the
+        brief — the brief wins where it's explicit, same principle as every other
+        floor in this chain.
+        """
+        brief_lower = brief.lower()
+        keywords = sq.bm25_keywords
+        for i in range(len(keywords) - 1):
+            acronym = keywords[i].strip().upper()
+            canonical = _ACRONYM_EXPANSIONS.get(acronym)
+            if canonical is None:
+                continue
+            candidate = keywords[i + 1]
+            if candidate.lower() == canonical.lower():
+                continue  # already correct
+            if not _acronym_letters_match(acronym, candidate):
+                continue  # not an expansion attempt at all (e.g. RLHF -> "reward model")
+            if candidate.lower() in brief_lower:
+                continue  # the user's own words win, even if it reads like an attempt
+            keywords[i + 1] = canonical
+            if sq.semantic_query and candidate.lower() in sq.semantic_query.lower():
+                sq.semantic_query = re.sub(
+                    re.escape(candidate), canonical, sq.semantic_query, flags=re.IGNORECASE
+                )
+        return sq
+
+    def _apply_intent_floor(sq: StructuredQuery) -> StructuredQuery:
+        """
+        Override the LLM's intent when the rules-path _detect_intent matches a real
+        signal and disagrees. Observed live: an 8B model defaults to "novelty" on
+        ~70% of test queries regardless of clearer signals — e.g. "give me a broad
+        overview..." (rules correctly says survey) came back "novelty" from the LLM.
+
+        _detect_intent's own "general" default carries no signal, so it never
+        overrides — only a real signal match (survey/foundational/diversity/novelty
+        keyword, or a bare year/named author) is trusted enough to correct the LLM.
+        """
+        rules_intent = _detect_intent(brief)
+        if rules_intent != "general" and rules_intent != sq.intent:
+            sq.intent = rules_intent
+        return sq
+
     def _apply_floors(sq: StructuredQuery) -> StructuredQuery:
         """Deterministic guards over LLM output — the brief wins where it is explicit."""
         for floor in (
-            _apply_yake_floor, _apply_date_floor, _apply_not_terms_floor,
-            _apply_entity_floor, _apply_quality_guard,
+            _apply_acronym_floor, _apply_yake_floor, _apply_date_floor,
+            _apply_not_terms_floor, _apply_entity_floor, _apply_quality_guard,
+            _apply_intent_floor,
         ):
             sq = floor(sq)
         return sq

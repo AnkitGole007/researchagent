@@ -69,6 +69,10 @@ class TestStructuredQuery:
 # ─── Rules-based helpers ──────────────────────────────────────────────────────
 
 class TestDetectIntent:
+    """_detect_intent takes the raw brief now, not a pre-lowered string — it does
+    its own case-insensitive matching internally (word-boundary patterns are
+    compiled with re.IGNORECASE) and needs original casing for _extract_authors."""
+
     @pytest.mark.parametrize("brief,expected_set", [
         ("I want the most novel and recent papers on RL", {"novelty"}),
         ("Looking for survey and overview papers on transformers", {"survey"}),
@@ -77,10 +81,46 @@ class TestDetectIntent:
         ("I'm broadly interested in machine learning", {"diversity", "general"}),
     ])
     def test_intent_signals(self, brief, expected_set):
-        assert _detect_intent(brief.lower()) in expected_set
+        assert _detect_intent(brief) in expected_set
 
     def test_year_triggers_specific(self):
         assert _detect_intent("papers from 2024 on diffusion models") == "specific"
+
+    def test_named_author_triggers_specific(self):
+        # Was dead code before this fix: the old regex required an uppercase
+        # letter class against an always-lowercased string, so it could never
+        # match. Now reuses _extract_authors instead of a second, broken check.
+        assert _detect_intent("papers by Geoffrey Hinton on backprop") == "specific"
+
+    def test_plural_signals_still_match(self):
+        # Word-boundary matching must not exclude simple plurals — "survey" alone
+        # has no boundary before the "s" in "surveys".
+        assert _detect_intent("recent surveys on retrieval augmented generation") == "survey"
+
+    @pytest.mark.parametrize("brief", [
+        "a peer-reviewed paper on transformers",       # "review" must not match inside "reviewed"
+        "machine learning for renewable energy forecasting",  # "new" must not match inside "renewable"
+        "newton method optimization",                  # "new" must not match inside "newton"
+    ])
+    def test_substring_false_positives_fixed(self, brief):
+        # Previously unbounded `s in brief_lower` matched these as real signals.
+        assert _detect_intent(brief) == "general"
+
+    def test_ordering_favours_specific_signal_over_novelty(self):
+        # Previously: novelty was checked first and its bare "recent"/"new"
+        # signals won every tie, even against an explicit "overview" match.
+        assert _detect_intent(
+            "give me a broad overview of approaches to reduce LLM hallucination"
+        ) == "survey"
+
+    @pytest.mark.parametrize("brief", [
+        "papers on GANs and diffusion models, exclude surveys and tutorials",
+        "RESEARCH BRIEF:\nI want papers on X.\n\nWHAT I AM NOT LOOKING FOR:\nSurveys",
+    ])
+    def test_negated_signal_does_not_flip_intent(self, brief):
+        # Previously: "survey" inside the excluded clause flipped intent to
+        # "survey" for a brief explicitly rejecting surveys.
+        assert _detect_intent(brief) != "survey"
 
 
 class TestExtractKeywords:
@@ -370,6 +410,24 @@ class TestSynonymExpansion:
         assert "synonym" in prompt.lower()
         assert "12-15" in prompt
 
+    def test_prompt_has_no_worked_example_tokens_to_anchor_on(self):
+        """
+        Live bug: the prompt used to teach synonym expansion with a worked example
+        ("LoRA" -> "low-rank adaptation"/"PEFT"/"adapter"; "RLHF" -> "reward
+        model"/"human feedback"/"preference data"), and the 8B model echoed those
+        literal tokens into completely unrelated queries regardless of topic —
+        confirmed in 6/20 live-audit briefs, none about fine-tuning or RLHF.
+        The fix removes the worked example entirely, so there's nothing to leak.
+        """
+        prompt = _LLM_PROMPT_TEMPLATE.format(brief="x")
+        for leaked in (
+            "low-rank adaptation", "PEFT", "adapter", "reward model",
+            "human feedback", "preference data",
+        ):
+            assert leaked.lower() not in prompt.lower(), (
+                f"{leaked!r} is a former leaked example token — must not reappear in the prompt"
+            )
+
     def test_expanded_keyword_list_survives_up_to_the_cap(self, monkeypatch):
         expanded = [
             "LoRA", "low-rank adaptation", "PEFT", "adapter", "parameter efficient",
@@ -513,6 +571,120 @@ class TestSynonymExpansion:
         )
         assert sq.source == "rules"
         assert len(sq.bm25_keywords) > 0
+
+
+# ─── QIL Auditor Stage A: intent-bias and acronym-hallucination floors ────────
+
+def _fake_llm(intent="general", keywords=None, semantic_query="s"):
+    """Stand in for a Groq response with controlled intent/keywords/semantic_query."""
+    return lambda brief, api_key, model: (
+        {
+            "intent": intent,
+            "semantic_query": semantic_query,
+            "bm25_keywords": keywords or ["placeholder"],
+            "hard_filters": {"not_terms": [], "authors": [], "venues": []},
+            "quality_modifier": "any",
+        },
+        None,
+    )
+
+
+class TestApplyIntentFloor:
+    def test_overrides_when_rules_signal_is_unambiguous(self, monkeypatch):
+        """Live bug: LLM said novelty for a brief that plainly asks for an overview."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(intent="novelty"))
+        sq = analyse_query(
+            "give me a broad overview of approaches to reduce LLM hallucination",
+            groq_api_key="fake-key",
+        )
+        assert sq.intent == "survey"
+
+    def test_does_not_override_when_rules_path_also_has_no_signal(self, monkeypatch):
+        """If the rules path itself would say "general", there's no stronger ground
+        truth to correct to — the LLM's answer must stand."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(intent="novelty"))
+        sq = analyse_query("some vague research topic with no clear signal", groq_api_key="fake-key")
+        assert sq.intent == "novelty"
+
+    def test_no_change_when_llm_and_rules_agree(self, monkeypatch):
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(intent="survey"))
+        sq = analyse_query("a survey of transformer architectures", groq_api_key="fake-key")
+        assert sq.intent == "survey"
+
+
+class TestApplyAcronymFloor:
+    def test_corrects_dpo_and_kto_live_regression(self, monkeypatch):
+        """Exact live bug: DPO/KTO expanded to fabricated full forms."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["RLHF", "reward model", "DPO", "Differentially Private Optimization",
+                      "KTO", "Knowledge Transfer Optimization", "alignment"],
+            semantic_query="Comparing RLHF, DPO, and KTO for alignment.",
+        ))
+        sq = analyse_query("RLHF vs DPO vs KTO for alignment", groq_api_key="fake-key")
+        assert "Direct Preference Optimization" in sq.bm25_keywords
+        assert "Kahneman-Tversky Optimization" in sq.bm25_keywords
+        assert "Differentially Private Optimization" not in sq.bm25_keywords
+        assert "Knowledge Transfer Optimization" not in sq.bm25_keywords
+
+    def test_related_keyword_is_not_mistaken_for_an_expansion_attempt(self, monkeypatch):
+        """RLHF's real neighbours here are related concepts, not expansion attempts —
+        their initials (R, H) don't correspond to RLHF's letters, so the letter gate
+        must leave them untouched rather than "verifying" them against the table."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["RLHF", "reward model", "human feedback", "preference data"],
+        ))
+        sq = analyse_query("papers on RLHF", groq_api_key="fake-key")
+        assert "reward model" in sq.bm25_keywords
+        assert "human feedback" in sq.bm25_keywords
+
+    def test_already_correct_expansion_is_left_alone(self, monkeypatch):
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["DPO", "Direct Preference Optimization"],
+        ))
+        sq = analyse_query("papers on DPO", groq_api_key="fake-key")
+        # Only the first two are asserted exactly — YAKE tops the rest up to
+        # _YAKE_FLOOR since the fake LLM supplied just 2 keywords.
+        assert sq.bm25_keywords[:2] == ["DPO", "Direct Preference Optimization"]
+
+    def test_unlisted_acronym_is_left_untouched(self, monkeypatch):
+        """Stage A has no escalation call yet — an unlisted acronym can't be
+        verified, so it must not be dropped or altered."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["XYZ", "Some Invented Full Form"],
+        ))
+        sq = analyse_query("papers on XYZ", groq_api_key="fake-key")
+        assert sq.bm25_keywords[:2] == ["XYZ", "Some Invented Full Form"]
+
+    def test_never_overwrites_the_brief_s_own_words(self, monkeypatch):
+        """A differential-privacy researcher's own phrase must not be inverted just
+        because it happens to letter-match DPO's initials."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["DPO", "Differentially Private Optimization"],
+        ))
+        sq = analyse_query(
+            "DPO (Differentially Private Optimization) for federated training",
+            groq_api_key="fake-key",
+        )
+        assert "Differentially Private Optimization" in sq.bm25_keywords
+
+    def test_semantic_query_gets_the_same_correction(self, monkeypatch):
+        """semantic_query drives the SPECTER2 vector-search arm — a floor that only
+        touches bm25_keywords leaves the poisoned phrase driving half of retrieval."""
+        monkeypatch.setattr(qi, "_call_groq_llm", _fake_llm(
+            keywords=["DPO", "Differentially Private Optimization"],
+            semantic_query="Recent work on DPO (Differentially Private Optimization).",
+        ))
+        sq = analyse_query("papers on DPO", groq_api_key="fake-key")
+        assert "Direct Preference Optimization" in sq.semantic_query
+        assert "Differentially Private Optimization" not in sq.semantic_query
+
+    def test_acronym_table_entries_pass_their_own_gate(self):
+        """The one runnable check this guard needs: every seed entry must be
+        verifiable against its own key, or it's a permanent silent no-op."""
+        for acronym, canonical in qi._ACRONYM_EXPANSIONS.items():
+            assert qi._acronym_letters_match(acronym, canonical), (
+                f"{acronym!r} -> {canonical!r} does not pass its own letter gate"
+            )
 
 
 # ─── Public API: analyse_query ────────────────────────────────────────────────

@@ -376,6 +376,25 @@ function Rail({
                     <span style={{ color:"var(--dim)" }}>{meta.query_understanding.venues.join(", ")}</span>
                   </div>
                 )}
+                {meta.query_understanding.criteria?.length > 0 && (
+                  <div style={{ marginTop:8 }}>
+                    <div style={{ fontWeight:600, color:"var(--fg)", padding:"3px 0" }}>Criteria</div>
+                    {meta.query_understanding.criteria.map((c, i) => (
+                      <div key={i} style={{ display:"flex", gap:6, padding:"3px 0", alignItems:"baseline" }}>
+                        <span style={{
+                          fontSize:9, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.04em",
+                          padding:"1px 5px", borderRadius:4, flexShrink:0,
+                          color: c.strength === "must" ? "#fff" : "var(--dim)",
+                          background: c.strength === "must" ? "var(--teal)" : "transparent",
+                          border: c.strength === "must" ? "none" : "1px solid var(--line)",
+                        }}>{c.strength}</span>
+                        <span style={{ color:"var(--dim)" }}>
+                          <strong style={{ color:"var(--fg)", fontWeight:600 }}>{c.name}:</strong> {c.definition}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div style={{ marginTop:8, fontSize:10, color:"var(--dim)" }}>
                   Parsed via {QIL_SOURCE_LABELS[meta.query_understanding.source] || meta.query_understanding.source}
                 </div>

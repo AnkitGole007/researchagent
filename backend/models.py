@@ -55,11 +55,19 @@ class PaperOut(BaseModel):
     summary: Optional[str] = None  # plain-English summary (LLM providers only, top_n papers only)
 
 
+class CriterionOut(BaseModel):
+    """One relevance criterion decomposed from the brief (QIL v3 Stage 2)."""
+
+    name: str
+    definition: str
+    strength: str = "should"  # "must" | "should"
+
+
 class QueryUnderstanding(BaseModel):
     """What QIL (query_intelligence.py) actually produced for this query, shown to
-    the user as "How your query was read" — NOT styled as a per-paper relevance
-    rubric, since we never score individual papers against these fields (unlike
-    Asta's per-criterion evidence). See docs/asta-ui-comparison-design.md §3."""
+    the user as "How your query was read". `criteria` is display-only for now
+    (QIL v3 Stage 2) — papers are not yet scored per-criterion the way Asta's are
+    (that's Stage 3, not built). See docs/asta-ui-comparison-design.md §3."""
 
     intent: str = "general"
     search_terms: List[str] = Field(default_factory=list)
@@ -71,6 +79,7 @@ class QueryUnderstanding(BaseModel):
     date_window: Optional[str] = None  # display form, e.g. "2022–2024" / "from 2020"
     authors: List[str] = Field(default_factory=list)
     venues: List[str] = Field(default_factory=list)
+    criteria: List[CriterionOut] = Field(default_factory=list)
 
 
 class Stage(BaseModel):

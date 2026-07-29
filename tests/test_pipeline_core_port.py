@@ -95,3 +95,32 @@ def test_query_understanding_surfaces_brief_filters():
     assert _date_window_label(HardFilters(year_from=2020)) == "from 2020"
     assert _date_window_label(HardFilters(year_to=2020)) == "up to 2020"
     assert _date_window_label(HardFilters()) is None
+
+
+def test_query_understanding_surfaces_criteria():
+    """QIL v3 Stage 2: criteria are display-only, projected straight through."""
+    from backend.runner import _to_query_understanding
+    from query_intelligence import Criterion, StructuredQuery
+
+    sq = StructuredQuery(
+        intent="specific",
+        bm25_keywords=["sparse attention"],
+        source="llm_groq",
+        criteria=[
+            Criterion(name="Mechanism", definition="Proposes a new sparse attention mechanism.", strength="must"),
+            Criterion(name="Benchmark", definition="Includes long-context benchmarks.", strength="should"),
+        ],
+    )
+    qu = _to_query_understanding(sq)
+    assert len(qu.criteria) == 2
+    assert qu.criteria[0].name == "Mechanism"
+    assert qu.criteria[0].strength == "must"
+    assert qu.criteria[1].strength == "should"
+
+
+def test_query_understanding_criteria_empty_by_default():
+    from backend.runner import _to_query_understanding
+    from query_intelligence import StructuredQuery
+
+    qu = _to_query_understanding(StructuredQuery(source="rules"))
+    assert qu.criteria == []

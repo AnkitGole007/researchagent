@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from . import pipeline_core as pc
-from .models import PaperOut, QueryUnderstanding
+from .models import CriterionOut, PaperOut, QueryUnderstanding
 
 # Persistent QIL cache across requests within this process — same role as
 # app.py's st.session_state["_qil_cache"], just process-scoped instead of
@@ -186,9 +186,10 @@ def _date_window_label(hf) -> Optional[str]:
 def _to_query_understanding(sq) -> Optional[QueryUnderstanding]:
     """Builds the "How your query was read" payload straight from what QIL
     produced — deliberately just the fields that exist (intent, search terms,
-    excluded terms, quality modifier, brief-sourced hard filters), not a
-    per-paper rubric. See docs/asta-ui-comparison-design.md §3 for why the two
-    are not the same thing."""
+    excluded terms, quality modifier, brief-sourced hard filters, criteria),
+    not a per-paper rubric. `criteria` is display-only (QIL v3 Stage 2) — papers
+    aren't scored per-criterion yet, that's Stage 3. See
+    docs/asta-ui-comparison-design.md §3 for why this isn't styled as one."""
     if sq is None:
         return None
     return QueryUnderstanding(
@@ -200,6 +201,10 @@ def _to_query_understanding(sq) -> Optional[QueryUnderstanding]:
         date_window=_date_window_label(sq.hard_filters),
         authors=list(sq.hard_filters.authors),
         venues=list(sq.hard_filters.venues),
+        criteria=[
+            CriterionOut(name=c.name, definition=c.definition, strength=c.strength)
+            for c in sq.criteria
+        ],
     )
 
 

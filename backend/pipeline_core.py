@@ -694,10 +694,12 @@ def get_specter2_model():
         from transformers import AutoTokenizer
         import torch
         torch.set_num_threads(_cpu_count)
-        logging.info("[SPECTER2] torch threads pinned to %d (os.cpu_count())", _cpu_count)
+        print(f"[SPECTER2] torch threads pinned to {_cpu_count} (os.cpu_count())")
 
+        _t0 = time.time()
         tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
         model = AutoAdapterModel.from_pretrained("allenai/specter2_base", torch_dtype=torch.float16)
+        print(f"[SPECTER2] base model + tokenizer load took {time.time() - _t0:.1f}s")
 
         model.load_adapter(
             "allenai/specter2_adhoc_query",
@@ -1001,8 +1003,11 @@ def get_cross_encoder_model():
         # to bge-reranker-v2-m3 - same family, real BEIR nDCG@10 ~56.4 vs ~49.5,
         # and a higher recommended max_length (1024 vs 512) so less of each
         # abstract gets truncated. model_kwargs replaces the deprecated automodel_args.
-        logging.info("[CrossEncoder] Loading BAAI/bge-reranker-v2-m3 for precision re-ranking (first run only)...")
-        return CrossEncoder("BAAI/bge-reranker-v2-m3", model_kwargs={"torch_dtype": torch.float16})
+        print("[CrossEncoder] Loading BAAI/bge-reranker-v2-m3 for precision re-ranking (first run only)...")
+        _t0 = time.time()
+        _model = CrossEncoder("BAAI/bge-reranker-v2-m3", model_kwargs={"torch_dtype": torch.float16})
+        print(f"[CrossEncoder] model construction took {time.time() - _t0:.1f}s")
+        return _model
     except Exception as e:
         print(f"CrossEncoder load error: {e}")
         return None
@@ -1024,7 +1029,10 @@ def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -
         for p in papers
     ]
     try:
+        print(f"[CrossEncoder] predict() starting on {len(pairs)} pairs...")
+        _t0 = time.time()
         scores = model.predict(pairs)
+        print(f"[CrossEncoder] predict() took {time.time() - _t0:.1f}s for {len(pairs)} pairs")
         scored = []
         for p, score in zip(papers, scores):
             score_float = float(score)

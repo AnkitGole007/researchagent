@@ -703,7 +703,11 @@ def get_specter2_model():
 
         _t0 = time.time()
         tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
-        model = AutoAdapterModel.from_pretrained("allenai/specter2_base", torch_dtype=torch.float16)
+        # fp32, not fp16: PyTorch's CPU backend has no optimized fp16 matmul
+        # kernels — measured directly in production, fp16 turned a ~3s
+        # CrossEncoder rerank into 300+s. Cloud Run here is CPU-only, no GPU,
+        # so fp16 has no upside and a severe downside.
+        model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
         print(f"[SPECTER2] base model + tokenizer load took {time.time() - _t0:.1f}s")
 
         model.load_adapter(
@@ -712,12 +716,6 @@ def get_specter2_model():
             load_as="specter2_adhoc_query",
             set_active=True,
         )
-
-        # load_adapter() adds adapter weights in float32 regardless of the base
-        # model's dtype — recast the whole model (base + adapter) so forward
-        # passes don't hit a Half/Float matmul mismatch. .to() can reset the
-        # adapter routing state, so (re)activate AFTER this, not before.
-        model = model.to(torch.float16)
         model.set_active_adapters("specter2_adhoc_query")
 
         try:
@@ -1010,7 +1008,9 @@ def get_cross_encoder_model():
         # abstract gets truncated. model_kwargs replaces the deprecated automodel_args.
         print("[CrossEncoder] Loading BAAI/bge-reranker-v2-m3 for precision re-ranking (first run only)...")
         _t0 = time.time()
-        _model = CrossEncoder("BAAI/bge-reranker-v2-m3", model_kwargs={"torch_dtype": torch.float16})
+        # fp32, not fp16 — see SPECTER2 loader above for why: no optimized
+        # fp16 CPU kernels in PyTorch, CPU-only Cloud Run deployment.
+        _model = CrossEncoder("BAAI/bge-reranker-v2-m3")
         print(f"[CrossEncoder] model construction took {time.time() - _t0:.1f}s")
         return _model
     except Exception as e:

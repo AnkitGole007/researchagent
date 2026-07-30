@@ -45,13 +45,18 @@ os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# Cloud Run containers can report far more CPUs to the OS than the cgroup
-# quota actually grants; PyTorch/OpenMP's auto-detected thread count then
-# oversubscribes real cores badly. Measured directly in production: a
-# CrossEncoder rerank benchmarked at 3.4s in an isolated process was taking
-# 300+s (hitting Cloud Run's request timeout) with no explicit thread pin.
-# Must be set before torch/numpy/MKL are first imported anywhere.
-_cpu_count = os.cpu_count() or 4
+# Cloud Run containers report the HOST's full logical CPU count via
+# os.cpu_count() (measured directly: 8), not the cgroup quota actually granted
+# (this service: 4 vCPU) — PyTorch/OpenMP's thread count then oversubscribes
+# real cores 2x. Measured directly in production: SPECTER2's model+tokenizer
+# load (normally a few seconds) took 322.8s pinned to 8 threads on a 4-vCPU
+# box. os.sched_getaffinity(0) reports the actual cgroup-restricted CPU set
+# (Linux-only, which Cloud Run always is) — must be set before torch/numpy/
+# MKL are first imported anywhere.
+try:
+    _cpu_count = len(os.sched_getaffinity(0))
+except AttributeError:
+    _cpu_count = os.cpu_count() or 4
 os.environ.setdefault("OMP_NUM_THREADS", str(_cpu_count))
 os.environ.setdefault("MKL_NUM_THREADS", str(_cpu_count))
 

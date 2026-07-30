@@ -96,6 +96,12 @@ def connect_lancedb(local_path: Optional[str] = None):
             "endpoint_url": endpoint,
             "aws_access_key_id": access_key,
             "aws_secret_access_key": secret_key,
+            # R2 has no real AWS region; without this the underlying object_store
+            # crate falls back to a hardcoded "us-west-2" default (no IMDS/env
+            # available on Cloud Run), which R2 rejects with InvalidRegionName.
+            # "auto" is one of R2's accepted pseudo-regions.
+            # https://github.com/lancedb/lancedb/issues/1898
+            "aws_region": "auto",
         },
     )
 

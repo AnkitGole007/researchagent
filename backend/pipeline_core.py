@@ -1069,17 +1069,20 @@ def select_embedding_candidates(
                 if not groq_key and llm_config and llm_config.provider == "groq" and llm_config.api_key:
                     groq_key = llm_config.api_key.strip()
                 or_key = _get_secret("OPENROUTER_API_KEY")
+                ollama_key = _get_secret("OLLAMA_API_KEY")
 
                 sq = analyse_query(
                     brief=query_brief,
                     groq_api_key=groq_key or None,
                     openrouter_api_key=or_key or None,
+                    ollama_api_key=ollama_key or None,
                 )
                 qil_cache[_qil_cache_key] = sq
 
             _source_label = {
                 "llm_groq": "LLM/Groq",
                 "llm_openrouter": "LLM/OpenRouter",
+                "llm_ollama": "LLM/Ollama",
                 "rules": "Rules",
             }.get(sq.source, sq.source.upper())
             emit(

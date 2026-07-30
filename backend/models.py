@@ -73,7 +73,7 @@ class QueryUnderstanding(BaseModel):
     search_terms: List[str] = Field(default_factory=list)
     excluded_terms: List[str] = Field(default_factory=list)
     quality_modifier: str = "any"
-    source: str = "rules"  # "llm_groq" | "llm_openrouter" | "rules"
+    source: str = "rules"  # "llm_groq" | "llm_openrouter" | "llm_ollama" | "rules"
     # Brief-sourced hard filters (R6/R7). These narrow the LanceDB search, so they
     # must be visible — a filter the user can't see is one they can't correct.
     date_window: Optional[str] = None  # display form, e.g. "2022–2024" / "from 2020"

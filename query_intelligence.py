@@ -14,11 +14,12 @@ Converts a raw free-text research brief into six structured outputs:
 
 Provider chain (stops at first success):
   1. Groq LLM (qwen/qwen3.6-27b, reasoning disabled) — fast, ~900ms, 15k tok/min headroom
-  2. OpenRouter LLM (google/gemma-4-26b-a4b-it:free) — on rate-limit / infra errors
-  3. Rules-based extractor — zero cost, no network, guaranteed fallback
+  2. OpenRouter LLM (google/gemma-4-26b-a4b-it:free) — on Groq rate-limit / infra errors
+  3. Ollama Cloud LLM (gemma4:31b-cloud) — on OpenRouter rate-limit / infra errors
+  4. Rules-based extractor — zero cost, no network, guaranteed fallback
 
-Both LLM legs request `response_format={"type": "json_object"}` and drop it on a
-400 so a model that doesn't support JSON mode still gets one free-text attempt.
+All three LLM legs request `response_format={"type": "json_object"}` and drop it
+on a 400 so a model that doesn't support JSON mode still gets one free-text attempt.
 
 YAKE keyword floor: tops a thin LLM keyword list up to _YAKE_FLOOR terms.
 """
@@ -260,7 +261,7 @@ class StructuredQuery:
     raw_brief : str
         Original unmodified brief for logging / debug.
     source : str
-        "llm_groq" | "llm_openrouter" | "rules" — indicates which path produced this object.
+        "llm_groq" | "llm_openrouter" | "llm_ollama" | "rules" — indicates which path produced this object.
     """
     intent: Intent = "general"
     semantic_query: str = ""
@@ -558,6 +559,97 @@ def _call_openrouter_llm(
 
         except Exception as e:
             logger.warning("[QIL][OpenRouter] Unexpected error (attempt %d): %s", attempt + 1, e)
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            return None, "other"
+
+    return None, "other"
+
+
+def _call_ollama_llm(
+    brief: str,
+    api_key: str,
+    model: str = "gemma4:31b-cloud",
+) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Ollama Cloud call via the same OpenAI-compatible SDK as OpenRouter, just a
+    different base_url — Ollama Cloud speaks the same chat-completions API.
+    Third and last LLM tier: reached only on OpenRouter rate_limit/infra.
+
+    Returns same (dict | None, error_type | None) contract as _call_groq_llm.
+    """
+    try:
+        from openai import (  # type: ignore
+            OpenAI,
+            RateLimitError,
+            APIConnectionError,
+            APITimeoutError,
+            APIStatusError,
+        )
+    except ImportError:
+        logger.debug("[QIL][Ollama] openai package not installed — skip Ollama path")
+        return None, "other"
+
+    prompt = _LLM_PROMPT_TEMPLATE.format(brief=brief[:3000])
+    use_json_mode = True  # dropped on a 400 — see APIStatusError handler below
+
+    for attempt in range(2):
+        try:
+            client = OpenAI(
+                api_key=api_key,
+                base_url="https://ollama.com/v1",
+                timeout=8.0,  # cloud-hosted, ~2-3s observed — headroom over OpenRouter's 5s
+            )
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _LLM_SYSTEM},
+                    {"role": "user",   "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=900,  # 600 (R8 keyword expansion) + ~300 for 2-5 criteria (v3 Stage 2)
+                **({"response_format": {"type": "json_object"}} if use_json_mode else {}),
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                raw = "\n".join(
+                    l for l in lines if not l.strip().startswith("```")
+                ).strip()
+            return json.loads(raw), None
+
+        except json.JSONDecodeError as e:
+            logger.warning("[QIL][Ollama] JSON parse error (attempt %d): %s", attempt + 1, e)
+            return None, "parse"
+
+        except RateLimitError as e:
+            logger.warning("[QIL][Ollama] Rate limit: %s", e)
+            return None, "rate_limit"
+
+        except (APIConnectionError, APITimeoutError) as e:
+            logger.warning("[QIL][Ollama] Connection/timeout (attempt %d): %s", attempt + 1, e)
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            return None, "infra"
+
+        except APIStatusError as e:
+            if e.status_code >= 500:
+                logger.warning("[QIL][Ollama] 5xx %d (attempt %d): %s", e.status_code, attempt + 1, e)
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                return None, "infra"
+            if e.status_code == 400 and use_json_mode:
+                logger.warning("[QIL][Ollama] 400 with JSON mode — retrying without it: %s", e)
+                use_json_mode = False
+                continue
+            logger.warning("[QIL][Ollama] API error %d: %s", e.status_code, e)
+            return None, "other"
+
+        except Exception as e:
+            logger.warning("[QIL][Ollama] Unexpected error (attempt %d): %s", attempt + 1, e)
             if attempt == 0:
                 time.sleep(1)
                 continue
@@ -1038,6 +1130,8 @@ def analyse_query(
     groq_model: str = "qwen/qwen3.6-27b",
     openrouter_api_key: Optional[str] = None,
     openrouter_model: str = "google/gemma-4-26b-a4b-it:free",
+    ollama_api_key: Optional[str] = None,
+    ollama_model: str = "gemma4:31b-cloud",
 ) -> StructuredQuery:
     """
     Analyse a raw research brief and return a :class:`StructuredQuery`.
@@ -1045,7 +1139,16 @@ def analyse_query(
     Provider chain (stops at first success):
       1. Groq LLM (qwen/qwen3.6-27b, reasoning disabled) — fast, ~900ms, 15k tok/min headroom
       2. OpenRouter (google/gemma-4-26b-a4b-it:free) — triggered on Groq rate-limit / infra errors
-      3. Rules-based extractor — zero cost, always available
+      3. Ollama Cloud (gemma4:31b-cloud) — triggered on OpenRouter rate-limit / infra errors
+      4. Rules-based extractor — zero cost, always available
+
+    Ollama Cloud is an alternate fallback tier, not a replacement for OpenRouter:
+    it's only reached if OpenRouter itself is degraded, mirroring how OpenRouter
+    is only reached if Groq is degraded. See docs/ollama-cloud-models-comparison.md
+    for why this specific model — it was the only Ollama Cloud candidate that beat
+    the current OpenRouter fallback on both latency (~2.3s vs 9-16s) and semantic
+    similarity in that comparison, and is accessible on Ollama's free tier (unlike
+    qwen3.5, which is Pro-subscription-gated).
 
     YAKE floor applied after every LLM path: tops bm25_keywords up to _YAKE_FLOOR.
 
@@ -1063,6 +1166,11 @@ def analyse_query(
         Only used when Groq returns a rate-limit or infra error.
     openrouter_model : str
         OpenRouter model name (default: google/gemma-4-26b-a4b-it:free).
+    ollama_api_key : str, optional
+        Ollama Cloud API key. Falls back to OLLAMA_API_KEY env var.
+        Only used when OpenRouter returns a rate-limit or infra error.
+    ollama_model : str
+        Ollama Cloud model name (default: gemma4:31b-cloud).
     """
     if not brief or not brief.strip():
         logger.debug("[QIL] Empty brief — returning empty StructuredQuery")
@@ -1305,6 +1413,7 @@ def analyse_query(
 
     # ── Groq path ─────────────────────────────────────────────────────────────
     groq_key = (groq_api_key or os.getenv("GROQ_API_KEY", "")).strip()
+    _try_openrouter = True  # no Groq key at all -> still try OpenRouter directly
     if groq_key:
         raw, err = _call_groq_llm(brief, groq_key, groq_model)
         if raw is not None:
@@ -1315,14 +1424,18 @@ def analyse_query(
                 logger.info("[QIL] Groq: intent=%s quality=%s keywords=%s (%.0f ms)",
                             sq.intent, sq.quality_modifier, sq.bm25_keywords[:3], elapsed)
                 return sq
-        elif err in ("rate_limit", "infra"):
+        # Only escalate on rate_limit/infra — a parse/other error means this
+        # model's own output was bad, not that the provider is degraded, so
+        # retrying a different provider is unlikely to be the fix that matters.
+        _try_openrouter = err in ("rate_limit", "infra")
+        if _try_openrouter:
             logger.info("[QIL] Groq %s — escalating to OpenRouter", err)
-            # intentional fall-through to OpenRouter
 
     # ── OpenRouter path ────────────────────────────────────────────────────────
     # Only reached on Groq rate_limit / infra. Not triggered on parse errors.
     or_key = (openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")).strip()
-    if or_key:
+    _try_ollama = True  # no OpenRouter key at all -> still try Ollama Cloud directly
+    if _try_openrouter and or_key:
         raw, err = _call_openrouter_llm(brief, or_key, openrouter_model)
         if raw is not None:
             sq = _build_sq_from_llm(raw, source="llm_openrouter")
@@ -1330,6 +1443,27 @@ def analyse_query(
                 sq = _apply_floors(sq)
                 elapsed = (time.perf_counter() - t0) * 1000
                 logger.info("[QIL] OpenRouter: intent=%s quality=%s keywords=%s (%.0f ms)",
+                            sq.intent, sq.quality_modifier, sq.bm25_keywords[:3], elapsed)
+                return sq
+        _try_ollama = err in ("rate_limit", "infra")
+        if _try_ollama:
+            logger.info("[QIL] OpenRouter %s — escalating to Ollama Cloud", err)
+    elif not _try_openrouter:
+        _try_ollama = False  # Groq failed with parse/other -> go straight to rules
+
+    # ── Ollama Cloud path ──────────────────────────────────────────────────────
+    # Alternate fallback tier, only reached on OpenRouter rate_limit / infra —
+    # not a replacement for OpenRouter, same escalation-only relationship
+    # OpenRouter has with Groq. See docs/ollama-cloud-models-comparison.md.
+    ollama_key = (ollama_api_key or os.getenv("OLLAMA_API_KEY", "")).strip()
+    if _try_ollama and ollama_key:
+        raw, err = _call_ollama_llm(brief, ollama_key, ollama_model)
+        if raw is not None:
+            sq = _build_sq_from_llm(raw, source="llm_ollama")
+            if sq is not None:
+                sq = _apply_floors(sq)
+                elapsed = (time.perf_counter() - t0) * 1000
+                logger.info("[QIL] Ollama: intent=%s quality=%s keywords=%s (%.0f ms)",
                             sq.intent, sq.quality_modifier, sq.bm25_keywords[:3], elapsed)
                 return sq
 

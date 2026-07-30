@@ -49,7 +49,7 @@ const FOCUS_LABELS = { primary: "Relevant", secondary: "Somewhat Relevant", "off
 
 // QIL's `source` field, for the "How your query was read" panel (§3) — not
 // technical jargon, just which pass produced the query breakdown.
-const QIL_SOURCE_LABELS = { llm_groq: "Groq", llm_openrouter: "OpenRouter", rules: "keyword rules" };
+const QIL_SOURCE_LABELS = { llm_groq: "Groq", llm_openrouter: "OpenRouter", llm_ollama: "Ollama", rules: "keyword rules" };
 // Phase 1 split-pane layout (docs/asta-ui-comparison-design.md §10): results
 // are paginated in flat rank order, independent of primary/secondary grouping.
 const PAGE_SIZE = 10;

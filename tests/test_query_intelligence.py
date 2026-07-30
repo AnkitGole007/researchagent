@@ -7,7 +7,7 @@ Tests cover:
   - LLM path: JSON parsing guard + schema validation gate
   - analyse_query() public API: returns StructuredQuery with correct shape
   - YAKE keyword floor: bm25_keywords ≥ 5 after both paths
-  - Multi-provider chain: source field values "llm_groq" | "llm_openrouter" | "rules"
+  - Multi-provider chain: source field values "llm_groq" | "llm_openrouter" | "llm_ollama" | "rules"
   - Backward-compat: empty brief returns safe StructuredQuery
 """
 import os
@@ -446,6 +446,7 @@ class TestYakeFloor:
         extractable terms — YAKE is statistical, so a very short brief can't."""
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
         brief = "Transformers attention mechanisms NLP tasks 2024."
         sq = analyse_query(brief, groq_api_key=None, openrouter_api_key=None)
         assert len(sq.bm25_keywords) >= _YAKE_FLOOR
@@ -454,6 +455,7 @@ class TestYakeFloor:
         """YAKE supplements without adding exact duplicates."""
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
         brief = "Contrastive self-supervised learning for vision-language models like CLIP."
         sq = analyse_query(brief, groq_api_key=None, openrouter_api_key=None)
         lower_kws = [k.lower() for k in sq.bm25_keywords]
@@ -636,6 +638,7 @@ class TestSynonymExpansion:
         """No regression: YAKE-only path still works when no key is present."""
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
         sq = analyse_query(
             "Contrastive self-supervised learning for vision-language models.",
             groq_api_key=None,
@@ -902,6 +905,7 @@ class TestAnalyseQuery:
     def test_no_api_key_uses_rules(self, monkeypatch):
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
         sq = analyse_query(
             "I am looking for papers on RLHF and instruction tuning.",
             groq_api_key=None,
@@ -923,14 +927,62 @@ class TestAnalyseQuery:
     def test_source_values_are_valid(self, monkeypatch):
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
         sq = analyse_query("Diffusion models for image synthesis.", groq_api_key=None, openrouter_api_key=None)
-        assert sq.source in {"llm_groq", "llm_openrouter", "rules"}
+        assert sq.source in {"llm_groq", "llm_openrouter", "llm_ollama", "rules"}
+
+    def test_escalates_to_ollama_on_openrouter_rate_limit(self, monkeypatch):
+        """Ollama Cloud is an alternate fallback tier, one step past OpenRouter —
+        only reached once OpenRouter itself is degraded, same relationship
+        OpenRouter has with Groq."""
+        monkeypatch.setattr(qi, "_call_groq_llm", lambda brief, api_key, model: (None, "rate_limit"))
+        monkeypatch.setattr(qi, "_call_openrouter_llm", lambda brief, api_key, model: (None, "rate_limit"))
+        monkeypatch.setattr(qi, "_call_ollama_llm", _fake_llm(keywords=["diffusion models"]))
+        sq = analyse_query(
+            "diffusion models for text generation",
+            groq_api_key="fake-key",
+            openrouter_api_key="fake-key",
+            ollama_api_key="fake-key",
+        )
+        assert sq.source == "llm_ollama"
+
+    def test_openrouter_parse_error_skips_ollama_falls_to_rules(self, monkeypatch):
+        """Mirrors Groq's own parse-error handling: a parse failure means 'this
+        model's output was bad', not 'the provider is degraded' — escalating
+        further wouldn't help, so it should go straight to rules, same as a
+        Groq parse error skips OpenRouter entirely."""
+        def _boom(brief, api_key, model):
+            raise AssertionError("Ollama should not be called on an OpenRouter parse error")
+
+        monkeypatch.setattr(qi, "_call_groq_llm", lambda brief, api_key, model: (None, "rate_limit"))
+        monkeypatch.setattr(qi, "_call_openrouter_llm", lambda brief, api_key, model: (None, "parse"))
+        monkeypatch.setattr(qi, "_call_ollama_llm", _boom)
+        sq = analyse_query(
+            "diffusion models for text generation",
+            groq_api_key="fake-key",
+            openrouter_api_key="fake-key",
+            ollama_api_key="fake-key",
+        )
+        assert sq.source == "rules"
+
+    def test_ollama_failure_falls_to_rules(self, monkeypatch):
+        monkeypatch.setattr(qi, "_call_groq_llm", lambda brief, api_key, model: (None, "rate_limit"))
+        monkeypatch.setattr(qi, "_call_openrouter_llm", lambda brief, api_key, model: (None, "rate_limit"))
+        monkeypatch.setattr(qi, "_call_ollama_llm", lambda brief, api_key, model: (None, "other"))
+        sq = analyse_query(
+            "diffusion models for text generation",
+            groq_api_key="fake-key",
+            openrouter_api_key="fake-key",
+            ollama_api_key="fake-key",
+        )
+        assert sq.source == "rules"
 
     def test_rules_path_never_produces_criteria(self, monkeypatch):
         """Criteria decomposition needs genuine language understanding a
         deterministic fallback can't provide — no criteria beats fake ones."""
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
         sq = analyse_query("diffusion models", groq_api_key=None, openrouter_api_key=None)
         assert sq.source == "rules"
         assert sq.criteria == []

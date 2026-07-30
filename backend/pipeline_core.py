@@ -45,6 +45,16 @@ os.environ.setdefault("TRANSFORMERS_TIMEOUT", "120")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# Cloud Run containers can report far more CPUs to the OS than the cgroup
+# quota actually grants; PyTorch/OpenMP's auto-detected thread count then
+# oversubscribes real cores badly. Measured directly in production: a
+# CrossEncoder rerank benchmarked at 3.4s in an isolated process was taking
+# 300+s (hitting Cloud Run's request timeout) with no explicit thread pin.
+# Must be set before torch/numpy/MKL are first imported anywhere.
+_cpu_count = os.cpu_count() or 4
+os.environ.setdefault("OMP_NUM_THREADS", str(_cpu_count))
+os.environ.setdefault("MKL_NUM_THREADS", str(_cpu_count))
+
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
 except ImportError:
@@ -683,6 +693,8 @@ def get_specter2_model():
         from adapters import AutoAdapterModel
         from transformers import AutoTokenizer
         import torch
+        torch.set_num_threads(_cpu_count)
+        logging.info("[SPECTER2] torch threads pinned to %d (os.cpu_count())", _cpu_count)
 
         tokenizer = AutoTokenizer.from_pretrained("allenai/specter2_base")
         model = AutoAdapterModel.from_pretrained("allenai/specter2_base", torch_dtype=torch.float16)
@@ -983,6 +995,8 @@ def get_cross_encoder_model():
     try:
         from sentence_transformers import CrossEncoder
         import torch
+        torch.set_num_threads(_cpu_count)
+        logging.info("[CrossEncoder] torch threads pinned to %d (os.cpu_count())", _cpu_count)
         # A2 (docs/relevance-strategy-comparison.md): swapped from bge-reranker-base
         # to bge-reranker-v2-m3 - same family, real BEIR nDCG@10 ~56.4 vs ~49.5,
         # and a higher recommended max_length (1024 vs 512) so less of each

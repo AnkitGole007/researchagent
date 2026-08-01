@@ -1002,15 +1002,15 @@ def get_cross_encoder_model():
         import torch
         torch.set_num_threads(_cpu_count)
         logging.info("[CrossEncoder] torch threads pinned to %d (os.cpu_count())", _cpu_count)
-        # A2 (docs/relevance-strategy-comparison.md): swapped from bge-reranker-base
-        # to bge-reranker-v2-m3 - same family, real BEIR nDCG@10 ~56.4 vs ~49.5,
-        # and a higher recommended max_length (1024 vs 512) so less of each
-        # abstract gets truncated. model_kwargs replaces the deprecated automodel_args.
-        print("[CrossEncoder] Loading BAAI/bge-reranker-v2-m3 for precision re-ranking (first run only)...")
+        # Swapped from bge-reranker-v2-m3 (568M) to gte-reranker-modernbert-base
+        # (150M) — measured directly: bge-v2-m3 took 187s for 200 pairs on this
+        # Cloud Run box (CPU-only, no GPU), pushing every real search past the
+        # 300s request timeout. gte-modernbert measured ~3x faster (fp32, same
+        # 200-pair shape) with better published quality (MTEB(eng,v2) 0.5843 vs
+        # 0.5526, NanoBEIR 0.7017 vs 0.6971) and ~800MB less peak RSS.
+        print("[CrossEncoder] Loading Alibaba-NLP/gte-reranker-modernbert-base for precision re-ranking (first run only)...")
         _t0 = time.time()
-        # fp32, not fp16 — see SPECTER2 loader above for why: no optimized
-        # fp16 CPU kernels in PyTorch, CPU-only Cloud Run deployment.
-        _model = CrossEncoder("BAAI/bge-reranker-v2-m3")
+        _model = CrossEncoder("Alibaba-NLP/gte-reranker-modernbert-base")
         print(f"[CrossEncoder] model construction took {time.time() - _t0:.1f}s")
         return _model
     except Exception as e:

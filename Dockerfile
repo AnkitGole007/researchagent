@@ -25,7 +25,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder; \
 from transformers import AutoTokenizer; \
 from adapters import AutoAdapterModel; \
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); \
-CrossEncoder('BAAI/bge-reranker-v2-m3'); \
+CrossEncoder('Alibaba-NLP/gte-reranker-modernbert-base'); \
 tok = AutoTokenizer.from_pretrained('allenai/specter2_base'); \
 m = AutoAdapterModel.from_pretrained('allenai/specter2_base'); \
 m.load_adapter('allenai/specter2_adhoc_query', source='hf', load_as='specter2_adhoc_query'); \

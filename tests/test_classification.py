@@ -73,7 +73,7 @@ class TestScibertClassifyCEPath:
         assert all(p.focus_label == "primary" for p in result)
 
     def test_mid_ce_score_is_secondary(self):
-        papers = make_papers(5, cross_encoder_score=0.35)
+        papers = make_papers(5, cross_encoder_score=0.64)
         result = scibert_classify_papers(papers)
         assert all(p.focus_label == "secondary" for p in result)
 
@@ -101,7 +101,7 @@ class TestScibertClassifyCEPath:
     def test_mixed_ce_scores_correct_labels(self):
         papers = [
             make_papers(1, cross_encoder_score=0.90)[0],  # primary
-            make_papers(1, cross_encoder_score=0.40)[0],  # secondary
+            make_papers(1, cross_encoder_score=0.64)[0],  # secondary
             make_papers(1, cross_encoder_score=0.05)[0],  # off-topic
         ]
         result = scibert_classify_papers(papers)

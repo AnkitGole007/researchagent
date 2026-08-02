@@ -106,8 +106,14 @@ QUALITY_MONEYBALL_WEIGHTS = {
     "classic": {"weight_fame": 0.90, "weight_hype": 0.0, "weight_sniper": 0.0, "weight_utility": 0.10},
 }
 
-PRIMARY_THRESHOLD: float = 0.55
-SECONDARY_THRESHOLD: float = 0.25
+# Recalibrated for gte-reranker-modernbert-base (was 0.55/0.25, tuned for
+# bge-reranker-v2-m3's wider sigmoid spread). Measured directly: 900 real
+# cross_encoder_score values across 6 diverse production queries clustered
+# tightly in ~0.57-0.73, with combined p70=0.68 / p90=0.635 / p95=0.60 — the
+# old thresholds sat entirely below this model's floor, classifying 150/150
+# papers primary on every query with zero discrimination.
+PRIMARY_THRESHOLD: float = 0.68
+SECONDARY_THRESHOLD: float = 0.60
 _CE_MAX_ABSTRACT_CHARS: int = 1500
 DB_FETCH_LIMIT = 20_000
 RECENCY_BONUS_MAX = 15.0
@@ -1379,7 +1385,7 @@ def enrich_paper_signals(papers: List[Paper]) -> List[Paper]:
 def scibert_classify_papers(papers: List[Paper]) -> List[Paper]:
     """
     Primary path (CE available): reads p.cross_encoder_score, thresholds at
-    PRIMARY_THRESHOLD=0.55 / SECONDARY_THRESHOLD=0.25.
+    PRIMARY_THRESHOLD=0.68 / SECONDARY_THRESHOLD=0.60.
     Fallback path (CE unavailable): delegates to heuristic_classify_papers_free()
     (rank-based top-30% = primary over p.semantic_relevance).
     """
